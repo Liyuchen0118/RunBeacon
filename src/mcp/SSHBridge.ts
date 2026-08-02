@@ -1,0 +1,287 @@
+/**
+ * Bridge between MCP server and SSHSessionHandler
+ * This replaces the broken ConsoleManager SSH handling
+ */
+
+import {
+  SSHSessionHandler,
+  SSHSessionOptions,
+} from '../core/SSHSessionHandler.js';
+import { Logger } from '../utils/logger.js';
+import { readFileSync } from 'fs';
+
+export class SSHBridge {
+  private sshHandler: SSHSessionHandler;
+  private logger: Logger;
+  private sessionMap: Map<string, string>; // MCP sessionId -> SSH sessionId
+
+  constructor() {
+    this.logger = new Logger('SSHBridge');
+    this.sshHandler = new SSHSessionHandler();
+    this.sessionMap = new Map();
+
+    // Setup event listeners
+    this.sshHandler.on('output', (data) => {
+      this.logger.debug(
+        `Output from session ${data.sessionId}: ${data.data.substring(0, 100)}...`
+      );
+    });
+
+    this.sshHandler.on('error', (data) => {
+      this.logger.error(`Error in session ${data.sessionId}:`, data.error);
+    });
+
+    this.sshHandler.on('sessionClosed', (sessionId) => {
+      // Clean up mapping
+      for (const [mcp, ssh] of this.sessionMap.entries()) {
+        if (ssh === sessionId) {
+          this.sessionMap.delete(mcp);
+          break;
+        }
+      }
+    });
+  }
+
+  /**
+   * Create an SSH session
+   */
+  async createSession(options: any): Promise<string> {
+    try {
+      // Resolve the private key. Callers may supply the key inline via
+      // `privateKey` OR as a filesystem path via `privateKeyPath`. The
+      // underlying ssh2 client needs the key CONTENT, so read the file when a
+      // path is provided (or when `privateKey` itself points at a file on
+      // disk). Previously `privateKeyPath` was ignored entirely, so key-only
+      // callers reached ssh2 with no credentials -> "All configured
+      // authentication methods failed".
+      const resolvedPrivateKey = this.resolvePrivateKey(options);
+
+      // Convert MCP options to SSH options
+      const sshOptions: SSHSessionOptions = {
+        host: options.sshOptions?.host || options.host,
+        port: options.sshOptions?.port || options.port || 22,
+        username: options.sshOptions?.username || options.username,
+        password: this.resolveSecret(options, 'password', 'passwordEnvVar'),
+        privateKey: resolvedPrivateKey,
+        passphrase: this.resolveSecret(
+          options,
+          'passphrase',
+          'passphraseEnvVar'
+        ),
+        tryKeyboard: options.sshOptions?.tryKeyboard !== false,
+        keepAliveInterval: options.sshOptions?.keepAliveInterval || 10000,
+        readyTimeout: options.sshOptions?.readyTimeout || 30000,
+        term: options.term || 'xterm-256color',
+        cols: options.cols || 80,
+        rows: options.rows || 24,
+      };
+
+      // Create SSH session
+      const sshSessionId = await this.sshHandler.createSession(sshOptions);
+
+      // Generate MCP session ID
+      const mcpSessionId = `mcp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+      // Map MCP session to SSH session
+      this.sessionMap.set(mcpSessionId, sshSessionId);
+
+      this.logger.info(
+        `Created MCP session ${mcpSessionId} -> SSH session ${sshSessionId}`
+      );
+      return mcpSessionId;
+    } catch (error) {
+      this.logger.error('Failed to create SSH session:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Resolve a private key value from MCP options into key CONTENT suitable for
+   * the ssh2 client. Accepts an inline key (`privateKey`) or a path
+   * (`privateKeyPath`); if `privateKey` itself looks like a filesystem path
+   * rather than PEM/OpenSSH content, it is read from disk.
+   */
+  private resolvePrivateKey(options: any): string | undefined {
+    const keyEnvVar: string | undefined =
+      options.sshOptions?.privateKeyEnvVar || options.privateKeyEnvVar;
+    if (keyEnvVar) {
+      const keyFromEnvironment = process.env[keyEnvVar];
+      if (!keyFromEnvironment) {
+        throw new Error(
+          `SSH private-key environment variable is not set: ${keyEnvVar}`
+        );
+      }
+      return keyFromEnvironment.replace(/\\n/g, '\n');
+    }
+
+    const inlineKey: string | undefined =
+      options.sshOptions?.privateKey || options.privateKey;
+    const keyPath: string | undefined =
+      options.sshOptions?.privateKeyPath || options.privateKeyPath;
+
+    // Explicit path wins.
+    if (keyPath) {
+      try {
+        return readFileSync(keyPath, 'utf8');
+      } catch (error) {
+        this.logger.error(`Failed to read private key at ${keyPath}:`, error);
+        throw new Error(`Failed to read private key file: ${keyPath}`);
+      }
+    }
+
+    if (!inlineKey) {
+      return undefined;
+    }
+
+    // If the inline value is actual key material, use it as-is.
+    if (inlineKey.includes('BEGIN') && inlineKey.includes('PRIVATE KEY')) {
+      return inlineKey;
+    }
+
+    // Otherwise it may be a path passed in the privateKey field; read it.
+    try {
+      return readFileSync(inlineKey, 'utf8');
+    } catch {
+      // Not a readable path -- fall back to treating it as raw key content.
+      return inlineKey;
+    }
+  }
+
+  private resolveSecret(
+    options: any,
+    valueProperty: 'password' | 'passphrase',
+    envProperty: 'passwordEnvVar' | 'passphraseEnvVar'
+  ): string | undefined {
+    const environmentVariable =
+      options.sshOptions?.[envProperty] || options[envProperty];
+    if (environmentVariable) {
+      const value = process.env[environmentVariable];
+      if (value === undefined) {
+        throw new Error(
+          `SSH ${valueProperty} environment variable is not set: ${environmentVariable}`
+        );
+      }
+      return value;
+    }
+    return options.sshOptions?.[valueProperty] || options[valueProperty];
+  }
+
+  /**
+   * Execute a command in the session
+   */
+  async executeCommand(
+    sessionId: string,
+    command: string,
+    args?: string[]
+  ): Promise<void> {
+    const sshSessionId = this.sessionMap.get(sessionId);
+    if (!sshSessionId) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    const fullCommand =
+      args && args.length > 0 ? `${command} ${args.join(' ')}` : command;
+    await this.sshHandler.executeCommand(sshSessionId, fullCommand);
+  }
+
+  /**
+   * Send input to the session
+   */
+  async sendInput(sessionId: string, input: string): Promise<void> {
+    const sshSessionId = this.sessionMap.get(sessionId);
+    if (!sshSessionId) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    await this.sshHandler.sendInput(sshSessionId, input);
+  }
+
+  /**
+   * Send a key to the session
+   */
+  async sendKey(sessionId: string, key: string): Promise<void> {
+    const sshSessionId = this.sessionMap.get(sessionId);
+    if (!sshSessionId) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    await this.sshHandler.sendKey(sshSessionId, key);
+  }
+
+  /**
+   * Get output from the session
+   */
+  getOutput(sessionId: string, limit?: number): string {
+    const sshSessionId = this.sessionMap.get(sessionId);
+    if (!sshSessionId) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    const outputLines = this.sshHandler.getOutput(sshSessionId, limit);
+    return outputLines.join('');
+  }
+
+  /**
+   * Get session information
+   */
+  getSessionInfo(sessionId: string): any {
+    const sshSessionId = this.sessionMap.get(sessionId);
+    if (!sshSessionId) {
+      return null;
+    }
+
+    const info = this.sshHandler.getSessionInfo(sshSessionId);
+    return {
+      ...info,
+      mcpSessionId: sessionId,
+      sshSessionId: sshSessionId,
+    };
+  }
+
+  /**
+   * List all sessions
+   */
+  listSessions(): any[] {
+    const sessions = [];
+    for (const [mcpId, sshId] of this.sessionMap.entries()) {
+      const info = this.sshHandler.getSessionInfo(sshId);
+      if (info) {
+        sessions.push({
+          id: mcpId,
+          sshSessionId: sshId,
+          command: info.commandHistory?.at(-1) || '',
+          status: 'running',
+          type: 'ssh',
+          streaming: false,
+          createdAt: info.created,
+          lastActivity: info.lastActivity,
+        });
+      }
+    }
+    return sessions;
+  }
+
+  /**
+   * Stop a session
+   */
+  async stopSession(sessionId: string): Promise<void> {
+    const sshSessionId = this.sessionMap.get(sessionId);
+    if (!sshSessionId) {
+      this.logger.warn(`Session ${sessionId} not found`);
+      return;
+    }
+
+    await this.sshHandler.closeSession(sshSessionId);
+    this.sessionMap.delete(sessionId);
+    this.logger.info(`Stopped MCP session ${sessionId}`);
+  }
+
+  /**
+   * Clean up all sessions
+   */
+  async destroy(): Promise<void> {
+    this.logger.info('Destroying SSH bridge');
+    await this.sshHandler.destroy();
+    this.sessionMap.clear();
+  }
+}

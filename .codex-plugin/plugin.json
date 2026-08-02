@@ -1,0 +1,24 @@
+{
+  "name": "remote-job-monitor",
+  "version": "0.1.0",
+  "description": "Run local and SSH jobs with event-driven completion waits and a token-free live dashboard.",
+  "author": {
+    "name": "Remote Job Monitor contributors"
+  },
+  "license": "MIT",
+  "keywords": ["mcp", "ssh", "jobs", "monitoring", "codex"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Remote Job Monitor",
+    "shortDescription": "Await long-running local and SSH jobs without model polling.",
+    "longDescription": "Tracks local and SSH command lifecycles, streams bounded output, waits for completion inside the MCP server, and renders a live MCP Apps dashboard without repeated model turns.",
+    "developerName": "Remote Job Monitor contributors",
+    "category": "Developer Tools",
+    "capabilities": ["MCP", "Hooks", "Interactive", "SSH"],
+    "defaultPrompt": [
+      "Track this long-running command and continue when it finishes.",
+      "Open the live dashboard for my remote jobs."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

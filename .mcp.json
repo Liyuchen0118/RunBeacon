@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "remote-job-monitor": {
+      "command": "node",
+      "args": ["./dist/mcp/lifecycle-server.js"],
+      "env": {
+        "MCP_SERVER_MODE": "true"
+      },
+      "startup_timeout_sec": 20,
+      "tool_timeout_sec": 86400
+    }
+  }
+}

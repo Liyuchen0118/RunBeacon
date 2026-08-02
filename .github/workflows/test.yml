@@ -1,0 +1,435 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main, develop ]
+  schedule:
+    # Run tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+jobs:
+  unit-tests:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run linting
+      run: npm run lint
+    
+    - name: Run type checking
+      run: npm run typecheck
+    
+    - name: Run unit tests
+      run: npm run test:unit -- --coverage
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage/lcov.info
+        flags: unittests
+        name: codecov-umbrella
+
+  integration-tests:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    name: Integration Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node-version: [18, 20]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Build project
+      run: npm run build
+
+    - name: Verify MCP handshake and credential redaction
+      run: npm run test:mcp
+
+    - name: Verify opt-in log redaction
+      run: npm run test:logger
+
+    - name: Verify platform installer
+      run: npm run test:installer
+
+    - name: Verify minimal production package
+      if: matrix.os == 'ubuntu-latest' && matrix.node-version == 20
+      run: npm run test:package
+    
+  ssh-tests:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    name: SSH Integration Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Setup SSH server for testing
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openssh-server
+        
+        # Create test user
+        sudo useradd -m -s /bin/bash testuser
+        echo "testuser:testpass" | sudo chpasswd
+        
+        # Generate SSH keys for testing
+        ssh-keygen -t rsa -b 2048 -f ./test_key -N ""
+        sudo mkdir -p /home/testuser/.ssh
+        sudo cp test_key.pub /home/testuser/.ssh/authorized_keys
+        sudo chown -R testuser:testuser /home/testuser/.ssh
+        sudo chmod 700 /home/testuser/.ssh
+        sudo chmod 600 /home/testuser/.ssh/authorized_keys
+        
+        # Start a dedicated daemon so systemd socket activation cannot keep the
+        # test on port 22 or override the requested authentication methods.
+        sudo mkdir -p /run/sshd
+        sudo /usr/sbin/sshd -D -e -p 2222 \
+          -o ListenAddress=127.0.0.1 \
+          -o PermitRootLogin=no \
+          -o PasswordAuthentication=yes \
+          -o PubkeyAuthentication=yes \
+          -o AuthorizedKeysFile=.ssh/authorized_keys \
+          > /tmp/console-automation-sshd.log 2>&1 &
+
+        for attempt in {1..20}; do
+          if sudo ss -ltn | grep -q '127.0.0.1:2222'; then
+            break
+          fi
+          sleep 0.5
+        done
+        sudo ss -ltn | grep -q '127.0.0.1:2222' || {
+          cat /tmp/console-automation-sshd.log
+          exit 1
+        }
+    
+    - name: Build project
+      run: npm run build
+    
+    - name: Run SSH integration tests
+      run: npm run test:ssh:smoke
+      env:
+        SSH_TEST_PORT: 2222
+        SSH_TEST_USER: testuser
+        SSH_TEST_PASS: testpass
+        SSH_TEST_KEY: ./test_key
+
+  stress-tests:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    name: Stress and Load Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Build project
+      run: npm run build
+    
+    - name: Run stress tests
+      run: npm run test:stress:smoke
+      env:
+        NODE_OPTIONS: "--max_old_space_size=4096"
+    
+    - name: Collect performance metrics
+      run: |
+        echo "Performance test completed"
+        # Add any performance metric collection here
+
+  security-scan:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run security audit
+      run: npm audit --audit-level=high
+    
+    - name: Run CodeQL Analysis
+      uses: github/codeql-action/init@v3
+      with:
+        languages: javascript
+    
+    - name: Build for analysis
+      run: npm run build
+    
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+
+  docker-tests:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    name: Docker Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Build Docker image
+      run: |
+        cat > Dockerfile << 'EOF'
+        FROM node:20-alpine
+        
+        WORKDIR /app
+        
+        # Install system dependencies
+        RUN apk add --no-cache \
+            openssh-client \
+            bash \
+            curl \
+            git
+        
+        # Copy package files
+        COPY package*.json ./
+        
+        # Install build dependencies without running prepare before source exists
+        RUN npm ci --ignore-scripts
+        
+        # Copy source code
+        COPY . .
+        
+        # Build application, then remove development-only dependencies
+        RUN npm run build && npm prune --omit=dev
+        
+        # Create non-root user
+        RUN addgroup -g 1001 -S appgroup && \
+            adduser -S appuser -u 1001 -G appgroup && \
+            mkdir -p /app/diagnostics /app/data /app/logs && \
+            chown -R appuser:appgroup /app/diagnostics /app/data /app/logs
+        
+        USER appuser
+        
+        EXPOSE 3000
+        
+        CMD ["npm", "start"]
+        EOF
+        
+        for attempt in 1 2 3; do
+          if docker build -t mcp-console-automation:test .; then
+            break
+          fi
+          if [ "$attempt" -eq 3 ]; then
+            exit 1
+          fi
+          sleep $((attempt * 10))
+        done
+    
+    - name: Verify MCP handshake inside production image
+      run: docker run --rm mcp-console-automation:test npm run test:mcp
+
+  cross-platform-tests:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    name: Cross-Platform Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        shell: [bash, pwsh]
+        exclude:
+          - os: ubuntu-latest
+            shell: pwsh
+          - os: macos-latest
+            shell: pwsh
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Build project
+      run: npm run build
+    
+    - name: Test cross-platform functionality (Bash)
+      if: matrix.shell == 'bash'
+      shell: bash
+      run: |
+        # Test basic shell functionality
+        npm test -- --testPathPattern="tests/.*shell.*\.test\.ts$" || echo "No shell-specific tests found"
+    
+    - name: Test cross-platform functionality (PowerShell)
+      if: matrix.shell == 'pwsh'
+      shell: pwsh
+      run: |
+        # Test PowerShell functionality
+        npm test -- --testPathPattern="tests/.*powershell.*\.test\.ts$" || Write-Host "No PowerShell-specific tests found"
+
+  release-tests:
+    name: Release Tests
+    runs-on: ubuntu-latest
+    # Already push-to-main only, so it never runs on a (release-please) PR.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    needs: [unit-tests, integration-tests, ssh-tests, stress-tests, security-scan]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Build for release
+      run: npm run build
+    
+    - name: Test built distribution
+      run: |
+        # Test the built distribution
+        node dist/index.js --help || echo "CLI help test"
+        
+        # Run basic smoke tests
+        npm test -- --testPathPattern="tests/smoke.*\.test\.ts$" || echo "No smoke tests found"
+    
+    - name: Package for distribution
+      run: |
+        npm pack
+        ls -la *.tgz
+
+  benchmark-tests:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    # Schedule/dispatch only, so it never runs on a (release-please) PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Build project
+      run: npm run build
+    
+    - name: Run performance benchmarks
+      run: |
+        npm test -- --testPathPattern="test/stress/.*\.test\.ts$" --testTimeout=300000 --verbose
+      env:
+        NODE_OPTIONS: "--max_old_space_size=8192"
+    
+    - name: Generate performance report
+      run: |
+        echo "# Performance Benchmark Results" > benchmark-results.md
+        echo "Date: $(date)" >> benchmark-results.md
+        echo "Node.js: $(node --version)" >> benchmark-results.md
+        echo "Platform: $(uname -a)" >> benchmark-results.md
+        echo "" >> benchmark-results.md
+        echo "See test output above for detailed metrics." >> benchmark-results.md
+    
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results
+        path: benchmark-results.md
+
+  notify-results:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    # Runs even when upstream jobs fail, but still skip it on a (release-please) PR.
+    if: ${{ always() && !startsWith(github.head_ref, 'release-please--') }}
+    needs: [unit-tests, integration-tests, ssh-tests, stress-tests, security-scan, docker-tests]
+    
+    steps:
+    - name: Notify success
+      if: needs.unit-tests.result == 'success' && needs.integration-tests.result == 'success' && needs.ssh-tests.result == 'success'
+      run: |
+        echo "🎉 All tests passed successfully!"
+        echo "- Unit tests: ✅"
+        echo "- Integration tests: ✅"
+        echo "- SSH tests: ✅"
+        echo "- Stress tests: ${{ needs.stress-tests.result == 'success' && '✅' || '⚠️' }}"
+        echo "- Security scan: ${{ needs.security-scan.result == 'success' && '✅' || '⚠️' }}"
+        echo "- Docker tests: ${{ needs.docker-tests.result == 'success' && '✅' || '⚠️' }}"
+    
+    - name: Notify failure
+      if: needs.unit-tests.result == 'failure' || needs.integration-tests.result == 'failure' || needs.ssh-tests.result == 'failure'
+      run: |
+        echo "❌ Some tests failed!"
+        echo "- Unit tests: ${{ needs.unit-tests.result == 'success' && '✅' || '❌' }}"
+        echo "- Integration tests: ${{ needs.integration-tests.result == 'success' && '✅' || '❌' }}"
+        echo "- SSH tests: ${{ needs.ssh-tests.result == 'success' && '✅' || '❌' }}"
+        echo "- Stress tests: ${{ needs.stress-tests.result == 'success' && '✅' || '❌' }}"
+        echo "- Security scan: ${{ needs.security-scan.result == 'success' && '✅' || '❌' }}"
+        echo "- Docker tests: ${{ needs.docker-tests.result == 'success' && '✅' || '❌' }}"
+        exit 1

@@ -1,0 +1,19 @@
+{
+  "description": "Route raw SSH commands through Remote Job Monitor so their lifecycle remains observable.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/route-ssh.cjs\"",
+            "commandWindows": "node \"%PLUGIN_ROOT%\\hooks\\route-ssh.cjs\"",
+            "timeout": 5,
+            "statusMessage": "Checking SSH job routing"
+          }
+        ]
+      }
+    ]
+  }
+}
