@@ -2,7 +2,7 @@ name: Codex Auto-Fix on Failure
 
 on:
   workflow_run:
-    workflows: ["CI", "Quality Gates", "Commit Lint"]
+    workflows: ['CI', 'Quality Gates', 'Commit Lint']
     types: [completed]
 
 permissions:
@@ -21,25 +21,32 @@ jobs:
       FAILED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - name: Check OpenAI API Key Set
+        id: key-check
         run: |
           if [ -z "$OPENAI_API_KEY" ]; then
-            echo "OPENAI_API_KEY secret is not set. Skipping auto-fix." >&2
-            exit 1
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "OPENAI_API_KEY secret is not set. Skipping auto-fix."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
           fi
       - name: Checkout Failing Ref
+        if: steps.key-check.outputs.available == 'true'
         uses: actions/checkout@v4
         with:
           ref: ${{ env.FAILED_HEAD_SHA }}
           fetch-depth: 0
       - name: Setup Node.js
+        if: steps.key-check.outputs.available == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
       - name: Install dependencies
+        if: steps.key-check.outputs.available == 'true'
         run: |
           if [ -f package-lock.json ]; then npm ci; else npm i; fi
       - name: Run Codex
+        if: steps.key-check.outputs.available == 'true'
         uses: openai/codex-action@main
         id: codex
         with:
@@ -51,18 +58,18 @@ jobs:
             Do not refactor unrelated code or files. Keep changes small and surgical.
           sandbox: workspace-write
       - name: Verify tests
+        if: steps.key-check.outputs.available == 'true'
         run: npm test --silent
       - name: Create pull request with fixes
-        if: success()
+        if: steps.key-check.outputs.available == 'true' && success()
         uses: peter-evans/create-pull-request@v6
         with:
-          commit-message: "fix(ci): auto-fix failing tests via codex"
+          commit-message: 'fix(ci): auto-fix failing tests via codex'
           branch: codex/auto-fix-${{ github.event.workflow_run.run_id }}
           base: ${{ env.FAILED_HEAD_BRANCH }}
-          title: "Auto-fix failing CI via Codex"
+          title: 'Auto-fix failing CI via Codex'
           body: |
             Codex automatically generated this PR in response to a CI failure on workflow `${{ env.FAILED_WORKFLOW_NAME }}`.
             Failed run: ${{ env.FAILED_RUN_URL }}
             Head branch: `${{ env.FAILED_HEAD_BRANCH }}`
             This PR contains minimal changes intended solely to make the CI pass.
-
