@@ -354,11 +354,14 @@ jobs:
 
       - name: Test built distribution
         run: |
-          # Test the built distribution
-          node dist/index.js --help || echo "CLI help test"
+          # MCP entry points are long-running stdio servers, so validate their
+          # syntax without starting an unbounded process.
+          node --check dist/index.js
+          node --check dist/mcp/server.js
+          node --check dist/mcp/lifecycle-server.js
 
-          # Run basic smoke tests
-          npm test -- --testPathPattern="tests/smoke.*\.test\.ts$" || echo "No smoke tests found"
+          # Exercise a real bounded client/server lifecycle.
+          npm run test:lifecycle:mcp
 
       - name: Package for distribution
         run: |
