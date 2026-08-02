@@ -21,7 +21,7 @@ process.stdin.on('end', () => {
           hookEventName: 'PreToolUse',
           permissionDecision: 'deny',
           permissionDecisionReason:
-            'Raw SSH execution is not lifecycle-tracked. Use the Remote Job Monitor job_start MCP tool with target.kind="ssh", then call job_wait once. Disable this plugin hook only when an explicitly untracked interactive SSH session is required.',
+            'Raw SSH execution is not lifecycle-tracked. Use the RunBeacon job_start MCP tool with target.kind="ssh", then call job_wait once. Disable this plugin hook only when an explicitly untracked interactive SSH session is required.',
         },
       })
     );

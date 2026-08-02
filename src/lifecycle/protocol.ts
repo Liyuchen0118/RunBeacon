@@ -1,0 +1,14 @@
+export const RUNBEACON_VERSION = '0.1.1';
+export const DAEMON_PROTOCOL_VERSION = 1;
+
+export interface DaemonPing {
+  ready: true;
+  pid: number;
+  version: string;
+  protocolVersion: number;
+  persistence: {
+    healthy: boolean;
+    lastError?: string;
+    lastSuccessAt?: string;
+  };
+}

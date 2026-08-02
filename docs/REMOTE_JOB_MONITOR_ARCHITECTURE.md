@@ -62,7 +62,9 @@ The local daemon RPC uses a random token stored with owner-only permissions unde
 
 ## Persistence boundary
 
-The resident daemon lets jobs survive MCP shim and Codex task restarts. Redacted metadata is persisted atomically. Output persistence is disabled unless `RJM_PERSIST_OUTPUT=true`, because logs commonly contain secrets.
+The resident daemon lets jobs survive MCP shim and Codex task restarts. State transitions are persisted immediately while high-frequency output updates are coalesced. Arbitrary metadata and output-derived progress messages are excluded by default; metadata requires `RJM_PERSIST_METADATA=true` and is sanitized before persistence. Output persistence is disabled unless `RJM_PERSIST_OUTPUT=true`, because logs commonly contain secrets. Terminal history is bounded by `RJM_MAX_RETAINED_JOBS` (default 1000).
+
+The MCP shim and daemon perform an explicit lifecycle protocol-version handshake. A mismatched resident daemon is rejected instead of silently serving an updated plugin with old lifecycle semantics.
 
 If the daemon process itself crashes or the machine reboots, local child processes and SSH channels cannot be reattached generically. Previously active records are marked `orphaned` on recovery instead of falsely reported as running.
 
@@ -82,5 +84,6 @@ If the daemon process itself crashes or the machine reboots, local child process
 - `npx jest src/tests/LifecycleManager.test.ts --runInBand --coverage=false`: lifecycle, timeout, SSH safety, Hook, and UI tests.
 - `npm run test:lifecycle:mcp`: real MCP client/server and UI-resource smoke test.
 - `npm run test:lifecycle:daemon`: second-client reattachment to a resident daemon.
+- The lifecycle MCP and daemon smoke tests run on Windows, Linux, and macOS in CI.
 - `validate_plugin.py`: Codex plugin manifest validation.
 - `quick_validate.py`: bundled skill validation.

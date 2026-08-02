@@ -1,5 +1,5 @@
 {
-  "description": "Route raw SSH commands through Remote Job Monitor so their lifecycle remains observable.",
+  "description": "Route raw SSH commands through RunBeacon so their lifecycle remains observable.",
   "hooks": {
     "PreToolUse": [
       {

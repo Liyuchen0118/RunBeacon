@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -72,6 +72,172 @@ describe('LifecycleManager', () => {
 
     const persisted = readFileSync(statePath, 'utf8');
     expect(persisted).not.toContain('DO_NOT_PERSIST_THIS_OUTPUT');
+  });
+
+  test('does not persist arbitrary metadata or output-derived progress messages by default', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const marker = 'SYNTHETIC_SECRET_MARKER_9481';
+    const started = manager.start({
+      command: process.execPath,
+      args: ['-e', `console.log('50% ${marker}')`],
+      shell: false,
+      label: 'safe-label',
+      progressPattern: '(\\d+)% .*',
+      metadata: { token: marker, note: marker },
+    });
+    await manager.waitForTerminal(started.id, 5_000);
+
+    const persisted = readFileSync(statePath, 'utf8');
+    expect(persisted).not.toContain(marker);
+    expect(persisted).not.toContain('metadata');
+  });
+
+  test('sanitizes opted-in metadata using sensitive-key and command redaction', async () => {
+    const manager = new LifecycleManager({
+      statePath,
+      persistMetadata: true,
+    });
+    const marker = 'SYNTHETIC_TOKEN_3127';
+    const password = 'SYNTHETIC_PASSWORD_6184';
+    const started = manager.start({
+      command: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+      shell: false,
+      label: 'metadata-redaction',
+      metadata: {
+        apiToken: marker,
+        note: `deploy --password ${password}`,
+      },
+    });
+    await manager.waitForTerminal(started.id, 5_000);
+
+    const persisted = readFileSync(statePath, 'utf8');
+    expect(persisted).not.toContain(marker);
+    expect(persisted).not.toContain(password);
+    expect(persisted).toContain('[REDACTED]');
+  });
+
+  test('drops previously persisted output and metadata when recovery opt-ins are disabled', async () => {
+    const marker = 'RECOVERY_PRIVATE_MARKER_7719';
+    const writer = new LifecycleManager({
+      statePath,
+      persistOutput: true,
+      persistMetadata: true,
+    });
+    const started = writer.start({
+      command: process.execPath,
+      args: ['-e', `console.log('75% ${marker}')`],
+      shell: false,
+      label: 'recovery-policy',
+      progressPattern: '(\\d+)% .*',
+      metadata: { note: marker },
+    });
+    await writer.waitForTerminal(started.id, 5_000);
+    expect(readFileSync(statePath, 'utf8')).toContain(marker);
+
+    const recovered = new LifecycleManager({ statePath });
+    const snapshot = recovered.snapshot(started.id, 50);
+    expect(snapshot.tail).toEqual([]);
+    expect(snapshot.metadata).toBeUndefined();
+    expect(snapshot.progress?.message).toBeUndefined();
+    expect(readFileSync(statePath, 'utf8')).not.toContain(marker);
+  });
+
+  test('deduplicates job starts with a caller-provided idempotency key', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const input = {
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => process.exit(0), 50)'],
+      shell: false,
+      idempotencyKey: 'deploy-release-123',
+    };
+    const first = manager.start(input);
+    const retried = manager.start(input);
+
+    expect(retried.id).toBe(first.id);
+    await manager.waitForTerminal(first.id, 5_000);
+  });
+
+  test('releases an event-driven wait when its abort signal fires', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const started = manager.start({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => process.exit(0), 5000)'],
+      shell: false,
+    });
+    const controller = new AbortController();
+    const waiting = manager.waitForTerminal(
+      started.id,
+      10_000,
+      20,
+      controller.signal
+    );
+    controller.abort();
+
+    await expect(waiting).rejects.toThrow(/aborted/);
+    manager.cancel(started.id);
+    await manager.waitForTerminal(started.id, 5_000);
+  });
+
+  test('preserves split UTF-8 output and keeps the in-memory ring bounded', async () => {
+    const manager = new LifecycleManager({
+      statePath,
+      maxOutputBytes: 64 * 1024,
+    });
+    const script = [
+      "const value = Buffer.from('中文进度 100% 完成\\n')",
+      "process.stdout.write('x'.repeat(128 * 1024))",
+      'setTimeout(() => process.stdout.write(value.subarray(0, 1)), 20)',
+      'setTimeout(() => process.stdout.write(value.subarray(1)), 40)',
+      'setTimeout(() => process.exit(0), 70)',
+    ].join(';');
+    const started = manager.start({
+      command: process.execPath,
+      args: ['-e', script],
+      shell: false,
+    });
+    const completed = await manager.waitForTerminal(started.id, 5_000, 500);
+
+    expect(completed.job.state).toBe('succeeded');
+    expect(completed.job.outputBytes).toBeLessThanOrEqual(64 * 1024);
+    expect(completed.job.outputTruncated).toBe(true);
+    expect(completed.job.progress?.percentage).toBe(100);
+    expect(completed.job.tail.map((chunk) => chunk.data).join('')).toContain(
+      '中文进度 100% 完成'
+    );
+  });
+
+  test('retains only the configured number of terminal jobs', async () => {
+    const manager = new LifecycleManager({
+      statePath,
+      maxRetainedJobs: 2,
+    });
+    for (let index = 0; index < 3; index += 1) {
+      const started = manager.start({
+        command: process.execPath,
+        args: ['-e', 'process.exit(0)'],
+        shell: false,
+        label: `retention-${index}`,
+      });
+      await manager.waitForTerminal(started.id, 5_000);
+    }
+
+    expect(manager.list(0, 100)).toHaveLength(2);
+    expect(new LifecycleManager({ statePath }).list(0, 100)).toHaveLength(2);
+  });
+
+  test('ignores malformed persisted job records during recovery', () => {
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        savedAt: new Date().toISOString(),
+        jobs: [{ id: 'broken-record' }],
+      })
+    );
+
+    const manager = new LifecycleManager({ statePath });
+    expect(manager.list()).toEqual([]);
   });
 
   test('requires SSH host verification unless explicitly overridden', () => {

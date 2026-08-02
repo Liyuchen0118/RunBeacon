@@ -37,11 +37,36 @@ try {
   assert.equal(completed.job.state, 'succeeded');
   assert.equal(completed.job.progress?.percentage, 100);
 
+  const cancellable = await secondClient.start({
+    command: process.execPath,
+    args: ['-e', 'setTimeout(() => process.exit(0), 5000)'],
+    shell: false,
+    label: 'abort-propagation-smoke',
+    idempotencyKey: 'daemon-smoke-abort-propagation',
+  });
+  const controller = new AbortController();
+  const abandonedWait = secondClient.waitForTerminal(
+    cancellable.id,
+    10_000,
+    10,
+    controller.signal
+  );
+  controller.abort();
+  await assert.rejects(abandonedWait, /aborted/);
+  await secondClient.cancel(cancellable.id);
+  const cancelled = await secondClient.waitForTerminal(
+    cancellable.id,
+    10_000,
+    10
+  );
+  assert.equal(cancelled.job.state, 'cancelled');
+
   process.stdout.write(
     `${JSON.stringify({
       residentDaemon: 'passed',
       secondClientReattach: 'passed',
       eventWait: 'passed',
+      abortPropagation: 'passed',
     })}\n`
   );
 } finally {

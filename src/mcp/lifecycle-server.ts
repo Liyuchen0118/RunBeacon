@@ -21,6 +21,7 @@ import {
 } from '../lifecycle/DashboardApp.js';
 import { safeErrorMessage } from '../lifecycle/security.js';
 import { StartJobInput } from '../lifecycle/types.js';
+import { RUNBEACON_VERSION } from '../lifecycle/protocol.js';
 
 process.env.MCP_SERVER_MODE = 'true';
 
@@ -36,6 +37,10 @@ if (process.env.RJM_INLINE_MANAGER === 'true') {
     maxConcurrentJobs: Number(process.env.RJM_MAX_CONCURRENT_JOBS || 4),
     maxOutputBytes: Number(process.env.RJM_MAX_OUTPUT_BYTES || 1024 * 1024),
     persistOutput: process.env.RJM_PERSIST_OUTPUT === 'true',
+    persistMetadata: process.env.RJM_PERSIST_METADATA === 'true',
+    persistenceDebounceMs: Number(process.env.RJM_PERSIST_DEBOUNCE_MS || 250),
+    maxRetainedJobs: Number(process.env.RJM_MAX_RETAINED_JOBS || 1000),
+    cancellationGraceMs: Number(process.env.RJM_CANCEL_GRACE_MS || 5000),
   });
 } else {
   const daemon = new DaemonClient(
@@ -92,6 +97,13 @@ const tools: Tool[] = [
           type: 'string',
           description: 'Local command or complete remote shell command.',
         },
+        idempotencyKey: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 200,
+          description:
+            'Stable caller-provided key that returns the existing job instead of launching a duplicate after a retry.',
+        },
         args: {
           type: 'array',
           items: { type: 'string' },
@@ -127,7 +139,11 @@ const tools: Tool[] = [
           description:
             'Optional regex; capture group 1 must contain a percentage.',
         },
-        metadata: { type: 'object' },
+        metadata: {
+          type: 'object',
+          description:
+            'In-memory caller metadata. It is not persisted unless RJM_PERSIST_METADATA=true, and sensitive-key values are redacted when persistence is enabled.',
+        },
       },
       required: ['command'],
     },
@@ -195,6 +211,7 @@ const tools: Tool[] = [
       type: 'object',
       properties: {
         tailLines: { type: 'integer', minimum: 0, maximum: 50, default: 8 },
+        limit: { type: 'integer', minimum: 1, maximum: 500, default: 100 },
       },
     },
     annotations: {
@@ -224,7 +241,7 @@ const tools: Tool[] = [
   {
     name: 'job_dashboard',
     description:
-      'Render the live Remote Job Monitor dashboard. The UI refreshes by calling job_list directly, so updates do not create model turns or consume model tokens.',
+      'Render the live RunBeacon dashboard. The UI refreshes by calling job_list directly, so updates do not create model turns or consume model tokens.',
     inputSchema: { type: 'object', properties: {} },
     annotations: {
       title: 'Open Job Dashboard',
@@ -240,7 +257,7 @@ const tools: Tool[] = [
 ];
 
 const server = new Server(
-  { name: 'remote-job-monitor', version: '0.1.0' },
+  { name: 'remote-job-monitor', version: RUNBEACON_VERSION },
   { capabilities: { tools: {}, resources: {} } }
 );
 
@@ -249,7 +266,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
   resources: [
     {
       uri: DASHBOARD_RESOURCE_URI,
-      name: 'Remote Job Monitor Dashboard',
+      name: 'RunBeacon Dashboard',
       description: 'Live, token-free task lifecycle dashboard.',
       mimeType: MCP_APP_MIME_TYPE,
     },
@@ -277,7 +294,7 @@ function reply(structuredContent: Record<string, unknown>, message: string) {
   } as any;
 }
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const args = (request.params.arguments ?? {}) as Record<string, any>;
   try {
     switch (request.params.name) {
@@ -292,7 +309,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await manager.waitForTerminal(
           String(args.jobId),
           args.timeoutMs,
-          args.tailLines
+          args.tailLines,
+          extra.signal
         );
         const message = result.timedOut
           ? `Server-side wait timed out; job ${result.job.id} is ${result.job.state}.`
@@ -304,7 +322,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return reply({ job }, `Job ${job.id} is ${job.state}.`);
       }
       case 'job_list': {
-        const jobs = await manager.list(args.tailLines);
+        const jobs = await manager.list(args.tailLines, args.limit);
         return reply({ jobs }, `${jobs.length} tracked job(s).`);
       }
       case 'job_cancel': {

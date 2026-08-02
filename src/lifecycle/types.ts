@@ -53,6 +53,8 @@ export type JobTarget = LocalJobTarget | SshJobTarget;
 
 export interface StartJobInput {
   command: string;
+  /** Stable caller-provided key that prevents duplicate starts after retries. */
+  idempotencyKey?: string;
   args?: string[];
   cwd?: string;
   env?: Record<string, string>;
@@ -74,6 +76,7 @@ export interface PublicJobTarget {
 
 export interface JobRecord {
   id: string;
+  idempotencyKey?: string;
   label: string;
   displayCommand: string;
   target: PublicJobTarget;
@@ -88,6 +91,7 @@ export interface JobRecord {
   signal?: string | null;
   error?: string;
   cancelRequested?: boolean;
+  cancellationVerified?: boolean;
   progress?: JobProgress;
   lastOutputAt?: string;
   lastProgressAt?: string;

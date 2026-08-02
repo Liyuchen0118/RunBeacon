@@ -1,3 +1,5 @@
+import { RUNBEACON_VERSION } from './protocol.js';
+
 export const DASHBOARD_RESOURCE_URI = 'ui://remote-job-monitor/dashboard.html';
 export const MCP_APP_MIME_TYPE = 'text/html;profile=mcp-app';
 
@@ -7,7 +9,7 @@ export function createDashboardHtml(): string {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Remote Job Monitor</title>
+  <title>RunBeacon</title>
   <style>
     :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
     body { margin: 0; padding: 16px; background: Canvas; color: CanvasText; }
@@ -34,7 +36,7 @@ export function createDashboardHtml(): string {
   </style>
 </head>
 <body>
-  <header><h1>Remote Job Monitor</h1><span id="connection">Connecting...</span></header>
+  <header><h1>RunBeacon</h1><span id="connection">Connecting...</span></header>
   <main id="jobs"><div class="empty">Loading tracked jobs...</div></main>
   <script>
     (() => {
@@ -104,7 +106,9 @@ export function createDashboardHtml(): string {
               '<div class="meta">' + escapeHtml(targetLabel(job.target)) + ' | ' + escapeHtml(job.id.slice(0,8)) + ' | elapsed ' + duration(job.assessment?.elapsedMs) + ' | ' + escapeHtml(job.assessment?.health || '') + '</div>' +
               '<div class="meta">' + escapeHtml(job.assessment?.summary || '') + '</div></div>' +
               '<span class="state ' + escapeHtml(job.state) + '">' + escapeHtml(job.state) + '</span>' +
-            '</div>' + progressBar + output + cancel + '</section>';
+            '</div>' + progressBar +
+            (job.error ? '<div class="meta">' + escapeHtml(job.error) + '</div>' : '') +
+            output + cancel + '</section>';
         }).join('');
       }
 
@@ -137,7 +141,7 @@ export function createDashboardHtml(): string {
       });
 
       ready = request('ui/initialize', {
-        appInfo:{ name:'remote-job-monitor-dashboard', version:'0.1.0' },
+        appInfo:{ name:'runbeacon-dashboard', version:'${RUNBEACON_VERSION}' },
         appCapabilities:{},
         protocolVersion:'2026-01-26'
       }).then(() => notify('ui/notifications/initialized', {}));

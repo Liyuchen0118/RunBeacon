@@ -33,6 +33,7 @@ const transport = new StdioClientTransport({
 try {
   await client.connect(transport);
   assert.equal(client.getServerVersion()?.name, 'remote-job-monitor');
+  assert.equal(client.getServerVersion()?.version, '0.1.1');
 
   const { tools } = await client.listTools();
   const toolNames = new Set(tools.map((tool) => tool.name));

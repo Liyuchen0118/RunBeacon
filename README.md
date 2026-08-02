@@ -2,6 +2,8 @@
 
 RunBeacon turns long-running local and SSH commands into tracked jobs for Codex. The Codex plugin keeps the stable ID `remote-job-monitor`: Codex starts a job once, calls `job_wait` once, and resumes when the resident daemon reports a terminal event. A live MCP Apps dashboard refreshes by calling the MCP server directly, so dashboard updates and intermediate status checks do not create model turns.
 
+Version 0.1.1 adds idempotent starts, abort-safe event waits, bounded history and output, coalesced state persistence, UTF-8-safe streaming, local process-tree cancellation, explicit daemon protocol compatibility, and stricter metadata/progress persistence defaults.
+
 ## What is implemented
 
 - Resident cross-platform daemon over a local named pipe or Unix socket

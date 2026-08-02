@@ -72,6 +72,12 @@ jobs:
       - name: Build project
         run: npm run build
 
+      - name: Verify RunBeacon MCP lifecycle
+        run: npm run test:lifecycle:mcp
+
+      - name: Verify RunBeacon resident daemon reattachment
+        run: npm run test:lifecycle:daemon
+
       - name: Verify MCP handshake and credential redaction
         run: npm run test:mcp
 

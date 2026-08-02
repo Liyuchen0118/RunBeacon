@@ -7,6 +7,11 @@ import {
   getDaemonPaths,
 } from './DaemonPaths.js';
 import { JobSnapshot, StartJobInput, WaitResult } from './types.js';
+import {
+  DAEMON_PROTOCOL_VERSION,
+  DaemonPing,
+  RUNBEACON_VERSION,
+} from './protocol.js';
 
 interface RpcRequest {
   id: string;
@@ -26,13 +31,17 @@ export interface LifecycleService {
   waitForTerminal(
     jobId: string,
     timeoutMs?: number,
-    tailLines?: number
+    tailLines?: number,
+    signal?: AbortSignal
   ): Promise<WaitResult>;
   snapshot(
     jobId: string,
     tailLines?: number
   ): Promise<JobSnapshot> | JobSnapshot;
-  list(tailLines?: number): Promise<JobSnapshot[]> | JobSnapshot[];
+  list(
+    tailLines?: number,
+    limit?: number
+  ): Promise<JobSnapshot[]> | JobSnapshot[];
   cancel(jobId: string): Promise<JobSnapshot> | JobSnapshot;
 }
 
@@ -51,9 +60,10 @@ export class DaemonClient implements LifecycleService {
 
   async ensureReady(): Promise<void> {
     try {
-      await this.request('ping', {}, 1_000);
+      await this.ping();
       return;
-    } catch {
+    } catch (error) {
+      if (error instanceof IncompatibleDaemonError) throw error;
       // Start the resident daemon below.
     }
 
@@ -76,31 +86,32 @@ export class DaemonClient implements LifecycleService {
     for (let attempt = 0; attempt < 50; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 100));
       try {
-        await this.request('ping', {}, 1_000);
+        await this.ping();
         return;
       } catch (error) {
+        if (error instanceof IncompatibleDaemonError) throw error;
         lastError = error;
       }
     }
-    throw new Error(
-      `Remote Job Monitor daemon did not start: ${String(lastError)}`
-    );
+    throw new Error(`RunBeacon daemon did not start: ${String(lastError)}`);
   }
 
   start(input: StartJobInput): Promise<JobSnapshot> {
-    return this.request('start', { input: input as any });
+    return this.request('start', { input });
   }
 
   waitForTerminal(
     jobId: string,
     timeoutMs?: number,
-    tailLines?: number
+    tailLines?: number,
+    signal?: AbortSignal
   ): Promise<WaitResult> {
     const requestTimeout = Math.max(5_000, (timeoutMs ?? 86_400_000) + 5_000);
     return this.request(
       'wait',
       { jobId, timeoutMs, tailLines },
-      requestTimeout
+      requestTimeout,
+      signal
     );
   }
 
@@ -108,8 +119,8 @@ export class DaemonClient implements LifecycleService {
     return this.request('snapshot', { jobId, tailLines });
   }
 
-  list(tailLines?: number): Promise<JobSnapshot[]> {
-    return this.request('list', { tailLines });
+  list(tailLines?: number, limit?: number): Promise<JobSnapshot[]> {
+    return this.request('list', { tailLines, limit });
   }
 
   cancel(jobId: string): Promise<JobSnapshot> {
@@ -120,11 +131,25 @@ export class DaemonClient implements LifecycleService {
     return this.request('shutdown', {}, 2_000);
   }
 
+  private async ping(): Promise<DaemonPing> {
+    const result = await this.request<DaemonPing>('ping', {}, 1_000);
+    if (result.protocolVersion !== DAEMON_PROTOCOL_VERSION) {
+      throw new IncompatibleDaemonError(
+        `RunBeacon daemon protocol mismatch: expected ${DAEMON_PROTOCOL_VERSION}, received ${String(result.protocolVersion)}. Stop the old daemon after its active jobs finish, then restart Codex.`
+      );
+    }
+    return result;
+  }
+
   private request<T>(
     method: string,
     args: Record<string, unknown>,
-    timeoutMs = 10_000
+    timeoutMs = 10_000,
+    signal?: AbortSignal
   ): Promise<T> {
+    if (signal?.aborted) {
+      return Promise.reject(new Error(`Daemon request ${method} was aborted`));
+    }
     return new Promise<T>((resolve, reject) => {
       const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
       const socket = createConnection(this.paths.socketPath);
@@ -134,6 +159,7 @@ export class DaemonClient implements LifecycleService {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener('abort', abortListener);
         socket.destroy();
         if (error) reject(error);
         else resolve(result as T);
@@ -143,6 +169,9 @@ export class DaemonClient implements LifecycleService {
         timeoutMs
       );
       timer.unref?.();
+      const abortListener = () =>
+        finish(new Error(`Daemon request ${method} was aborted`));
+      signal?.addEventListener('abort', abortListener, { once: true });
 
       socket.setEncoding('utf8');
       socket.once('connect', () => {
@@ -169,5 +198,12 @@ export class DaemonClient implements LifecycleService {
         if (!settled) finish(new Error('Daemon closed the connection'));
       });
     });
+  }
+}
+
+class IncompatibleDaemonError extends Error {
+  constructor(message: string) {
+    super(`${message} Client version: ${RUNBEACON_VERSION}.`);
+    this.name = 'IncompatibleDaemonError';
   }
 }
