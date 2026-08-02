@@ -12,7 +12,9 @@ process.stdin.on('end', () => {
     if (event.tool_name !== 'Bash') return;
     const command = String(event.tool_input?.command || '');
     const launchesSsh =
-      /(?:^|[;&|]\s*|\bsudo\s+)(?:ssh|scp|sftp|plink)(?:\.exe)?\b/i.test(command);
+      /(?:^|[;&|]\s*|\bsudo\s+)(?:ssh|scp|sftp|plink)(?:\.exe)?\b/i.test(
+        command
+      );
     if (!launchesSsh) return;
 
     process.stdout.write(
@@ -21,7 +23,7 @@ process.stdin.on('end', () => {
           hookEventName: 'PreToolUse',
           permissionDecision: 'deny',
           permissionDecisionReason:
-            'Raw SSH execution is not lifecycle-tracked. Use the RunBeacon job_start MCP tool with target.kind="ssh", then call job_wait once. Disable this plugin hook only when an explicitly untracked interactive SSH session is required.',
+            'RunBeacon is the default route for remote execution. Raw SSH is not lifecycle-tracked; use job_start with target.kind="ssh", then call job_wait once. Disable this plugin hook only when an explicitly untracked interactive SSH session is required.',
         },
       })
     );

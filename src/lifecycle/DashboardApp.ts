@@ -109,7 +109,11 @@ export function createDashboardHtml(): string {
           const github = job.metadata?.kind === 'github_publish'
             ? '<div class="github">GitHub | remote ' + escapeHtml(job.metadata.remote || 'origin') +
               ' | branch ' + escapeHtml(job.metadata.branch || 'current') +
-              ' | Actions ' + (job.metadata.watchActions === false ? 'not monitored' : 'monitored') + '</div>'
+              ' | Actions ' + (job.metadata.watchActions === false ? 'not monitored' : 'monitored') +
+              (job.metadata.credentialProfile ? ' | credential ' + escapeHtml(job.metadata.credentialProfile) : '') + '</div>'
+            : '';
+          const credential = job.metadata?.credentialProfile && job.metadata?.kind !== 'github_publish'
+            ? '<div class="github">Credential profile | ' + escapeHtml(job.metadata.credentialProfile) + '</div>'
             : '';
           const output = tail ? '<pre>' + escapeHtml(tail) + '</pre>' : '';
           const cancel = isTerminal(job.state) ? ''
@@ -120,7 +124,7 @@ export function createDashboardHtml(): string {
               '<div class="meta">' + escapeHtml(targetLabel(job.target)) + ' | ' + escapeHtml(job.id.slice(0,8)) + ' | elapsed ' + duration(job.assessment?.elapsedMs) + ' | ' + escapeHtml(job.assessment?.health || '') + '</div>' +
               '<div class="meta">' + escapeHtml(job.assessment?.summary || '') + '</div></div>' +
               '<span class="state ' + escapeHtml(job.state) + '">' + escapeHtml(job.state) + '</span>' +
-            '</div>' + github + progressBar + progressInfo +
+            '</div>' + github + credential + progressBar + progressInfo +
             (job.error ? '<div class="meta">' + escapeHtml(job.error) + '</div>' : '') +
             output + cancel + '</section>';
         }).join('');

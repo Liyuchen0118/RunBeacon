@@ -1,6 +1,7 @@
 import {
   classifyGitPushFailure,
   isSuccessfulActionsConclusion,
+  parseGitCredentialOutput,
   parseGitHubRepository,
 } from '../lifecycle/GitHubPublish.js';
 
@@ -51,4 +52,12 @@ describe('GitHub publishing helpers', () => {
       expect(isSuccessfulActionsConclusion(conclusion)).toBe(false);
     }
   );
+
+  test('parses Git credential helper output without changing token contents', () => {
+    expect(
+      parseGitCredentialOutput(
+        'protocol=https\r\nhost=github.com\r\nusername=oauth\r\npassword=token=with=equals\r\n'
+      )
+    ).toEqual({ username: 'oauth', password: 'token=with=equals' });
+  });
 });

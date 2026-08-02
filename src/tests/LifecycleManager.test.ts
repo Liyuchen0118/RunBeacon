@@ -326,4 +326,51 @@ describe('lifecycle safety and UI helpers', () => {
     });
     expect(unrelated.stdout).toBe('');
   });
+
+  test('plugin prompt hook selects RunBeacon only for remote execution intent', () => {
+    const hook = join(process.cwd(), 'hooks', 'route-remote-prompt.cjs');
+    const remote = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        prompt: '请登录远程服务器并运行训练脚本，然后等待完成',
+      }),
+      encoding: 'utf8',
+    });
+    const decision = JSON.parse(remote.stdout);
+    expect(decision.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
+    expect(decision.hookSpecificOutput.additionalContext).toMatch(
+      /RunBeacon job_start MCP tool first/
+    );
+
+    const conceptual = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        prompt: '请解释 SSH 密钥认证的原理',
+      }),
+      encoding: 'utf8',
+    });
+    expect(conceptual.stdout).toBe('');
+  });
+
+  test('plugin prompt hook recognizes Chinese execution intent without matching explanations', () => {
+    const hook = join(process.cwd(), 'hooks', 'route-remote-prompt.cjs');
+    const remote = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        prompt: '请登录远程服务器并运行训练脚本，然后等待完成',
+      }),
+      encoding: 'utf8',
+    });
+    const decision = JSON.parse(remote.stdout);
+    expect(decision.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
+
+    const conceptual = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        prompt: '请解释 SSH 密钥认证的原理',
+      }),
+      encoding: 'utf8',
+    });
+    expect(conceptual.stdout).toBe('');
+  });
 });

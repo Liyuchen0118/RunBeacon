@@ -1,7 +1,7 @@
 {
   "name": "remote-job-monitor",
-  "version": "0.2.0+codex.20260802100124",
-  "description": "Track local, SSH, and GitHub publish jobs with event-driven waits and a token-free live dashboard.",
+  "version": "0.3.0+codex.20260802123706",
+  "description": "Default tracked routing for local, passwordless SSH, and GitHub publish jobs with a token-free dashboard.",
   "author": {
     "name": "RunBeacon contributors"
   },
@@ -16,8 +16,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "RunBeacon",
-    "shortDescription": "Await jobs and GitHub publishing without model polling.",
-    "longDescription": "Tracks local and SSH command lifecycles plus Git commit, push, and Actions phases; waits inside the MCP server and renders a live dashboard without repeated model turns.",
+    "shortDescription": "Default tracked route for SSH, remote jobs, and publishing.",
+    "longDescription": "Automatically prefers tracked RunBeacon jobs for non-interactive remote execution. Passwordless profiles reference ssh-agent, private-key paths, and Git Credential Manager without storing secrets. RunBeacon owns local and SSH command lifecycles plus Git commit, push, and Actions phases, waits inside the MCP server, and renders a live dashboard without repeated model turns.",
     "developerName": "RunBeacon contributors",
     "category": "Developer Tools",
     "capabilities": [
@@ -28,7 +28,7 @@
       "GitHub"
     ],
     "defaultPrompt": [
-      "Track this long-running command and continue when it finishes.",
+      "Run this command on my SSH server through RunBeacon and continue when it finishes.",
       "Open the live dashboard for my remote jobs.",
       "Push my staged commit and monitor GitHub Actions in the dashboard."
     ]

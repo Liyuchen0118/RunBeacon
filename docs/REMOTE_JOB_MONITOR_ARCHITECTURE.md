@@ -15,6 +15,7 @@ flowchart LR
   Local --> GitRunner["GitHub publish runner"]
   GitRunner --> GitHub["Git push / Actions REST API"]
   Dashboard["MCP Apps dashboard"] -->|"direct tools/call"| Shim
+  PromptHook["UserPromptSubmit Hook"] -->|"prefer tracked SSH"| Codex
   Hook["PreToolUse Hook"] -->|"deny raw SSH"| Codex
   Daemon --> Store["redacted jobs.json"]
 ```
@@ -27,7 +28,9 @@ flowchart LR
 - `src/lifecycle/DashboardApp.ts`: portable MCP Apps HTML resource.
 - `src/daemon/github-publish-runner.ts`: staged-commit, non-force push, and background GitHub Actions monitoring.
 - `src/lifecycle/GitHubPublish.ts`: GitHub remote parsing and failure classification.
+- `src/lifecycle/CredentialProfileStore.ts`: owner-only, secret-free SSH/GitHub connection references.
 - `hooks/route-ssh.cjs`: prevents Codex Bash from bypassing tracking.
+- `hooks/route-remote-prompt.cjs`: detects operational remote prompts and injects RunBeacon as the default execution route.
 
 ## Lifecycle
 
@@ -87,6 +90,10 @@ Authentication order is supplied per job:
 Require `hostKeySha256` by default. `allowUnverifiedHostKey` is an explicit insecure override and should only be used with user awareness.
 
 The local daemon RPC uses a random token stored with owner-only permissions under `PLUGIN_DATA`. On Windows it uses a named pipe; on macOS/Linux it uses an owner-only Unix socket.
+
+Passwordless profiles are stored separately as `credential-profiles.json` with owner-only permissions. SSH profiles contain only host, port, username, an agent socket/pipe or private-key path, and host-key verification policy. A profile never accepts passwords, passphrases, tokens, authorization headers, or private-key contents. `job_start` can select a profile explicitly or uniquely match one by host and username.
+
+GitHub profiles point to the standard Git credential helper rather than duplicating its secret store. Pushes use Git normally. The Actions runner invokes `git credential fill` with terminal interaction disabled, keeps the returned password/token only in memory, suppresses both helper output streams, and falls back to anonymous API access when no credential is available.
 
 An optional `githubToken` is sent through daemon RPC and the child environment only. It is not placed in runner arguments, labels, metadata, output, or `jobs.json`. Public repositories do not require a token. Git credential discovery for the push is delegated to Git with terminal prompting disabled, so a missing credential fails visibly instead of hanging an unattended job.
 

@@ -5,6 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   classifyGitPushFailure,
   isSuccessfulActionsConclusion,
+  parseGitCredentialOutput,
   parseGitHubRepository,
 } from '../lifecycle/GitHubPublish.js';
 import { redactPersistedText } from '../lifecycle/security.js';
@@ -120,7 +121,9 @@ async function watchActions(
   sha: string,
   input: RunnerOptions
 ): Promise<void> {
-  const token = process.env.RUNBEACON_GITHUB_TOKEN?.trim();
+  const token =
+    process.env.RUNBEACON_GITHUB_TOKEN?.trim() ||
+    (await resolveGitHubTokenFromCredentialManager());
   const pollIntervalMs = token
     ? Math.max(10_000, input.pollIntervalMs)
     : Math.max(60_000, input.pollIntervalMs);
@@ -201,13 +204,55 @@ async function fetchWorkflowRuns(
   if (!response.ok) {
     if (response.status === 404) {
       throw new Error(
-        'GitHub Actions API returned 404. For a private repository, provide githubToken.'
+        'GitHub Actions API returned 404. For a private repository, sign in through Git Credential Manager or provide a memory-only githubToken.'
       );
     }
     throw new Error(`GitHub Actions API failed with HTTP ${response.status}`);
   }
   const body = (await response.json()) as { workflow_runs?: WorkflowRun[] };
   return (body.workflow_runs ?? []).filter((run) => run.head_sha === sha);
+}
+
+async function resolveGitHubTokenFromCredentialManager(): Promise<
+  string | undefined
+> {
+  if (process.env.RUNBEACON_GITHUB_CREDENTIAL_SOURCE === 'none') {
+    return undefined;
+  }
+  return new Promise((resolvePromise) => {
+    const child = spawn('git', ['credential', 'fill'], {
+      windowsHide: true,
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: '0',
+        GCM_INTERACTIVE: 'never',
+      },
+      shell: false,
+    });
+    let stdout = '';
+    let settled = false;
+    const finish = (token?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      child.kill();
+      resolvePromise(token);
+    };
+    const timeout = setTimeout(() => finish(), 10_000);
+    timeout.unref?.();
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout = `${stdout}${chunk.toString('utf8')}`.slice(-64 * 1024);
+    });
+    // Never forward credential-helper stdout or stderr: stdout can contain a token.
+    child.stderr.resume();
+    child.stdin.on('error', () => finish());
+    child.once('error', () => finish());
+    child.once('close', (code) => {
+      if (code !== 0) finish();
+      else finish(parseGitCredentialOutput(stdout).password?.trim());
+    });
+    child.stdin.end('protocol=https\nhost=github.com\n\n');
+  });
 }
 
 async function requireGit(

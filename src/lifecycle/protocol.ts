@@ -1,4 +1,4 @@
-export const RUNBEACON_VERSION = '0.2.0';
+export const RUNBEACON_VERSION = '0.3.0';
 export const DAEMON_PROTOCOL_VERSION = 2;
 
 export interface DaemonPing {

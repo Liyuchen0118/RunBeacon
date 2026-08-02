@@ -2,7 +2,9 @@
 
 RunBeacon turns long-running local and SSH commands into tracked jobs for Codex. The Codex plugin keeps the stable ID `remote-job-monitor`: Codex starts a job once, calls `job_wait` once, and resumes when the resident daemon reports a terminal event. A live MCP Apps dashboard refreshes by calling the MCP server directly, so dashboard updates and intermediate status checks do not create model turns.
 
-Version 0.2.0 adds a GitHub publishing pipeline and dashboard: RunBeacon can commit already-staged changes, push without force, discover GitHub Actions runs, and monitor them in the background without model polling.
+For non-interactive remote execution, RunBeacon is the default route. Its skill description makes Codex prefer `job_start` for server/SSH requests, a `UserPromptSubmit` Hook adds the routing policy when a prompt contains remote-execution intent, and a `PreToolUse` Hook blocks raw `ssh`, `scp`, `sftp`, or `plink` commands that would bypass lifecycle tracking. Plugin Hooks must be reviewed and trusted by the user after installation.
+
+Version 0.3.0 makes RunBeacon the default route for operational remote prompts and adds passwordless credential reference profiles. SSH profiles use `ssh-agent` or private-key paths, while GitHub publishing reuses Git Credential Manager for both pushes and private Actions API access. No password, passphrase, key contents, or token is stored by RunBeacon.
 
 ## What is implemented
 
@@ -13,7 +15,9 @@ Version 0.2.0 adds a GitHub publishing pipeline and dashboard: RunBeacon can com
 - MCP Apps dashboard whose refresh loop consumes no model tokens
 - Dashboard-tracked Git commit, push, and GitHub Actions phases through `github_publish_start`
 - `PreToolUse` Hook that blocks untracked raw `ssh`, `scp`, `sftp`, and `plink`
+- `UserPromptSubmit` Hook that selects RunBeacon for operational remote-server requests
 - Memory-only inline SSH passwords/passphrases and pinned host-key support
+- Passwordless `credential_profile_*` tools for SSH agent/private-key references and Git Credential Manager
 - Persistent redacted job metadata; command output persistence is off by default
 - Reattachment from a new MCP client to jobs owned by the resident daemon
 
@@ -58,6 +62,33 @@ Call `github_publish_start` with a repository directory. If `commitMessage` is s
 The attached MCP App shows `preflight`, `commit`, `push`, `pushed`, `actions-discovery`, `actions`, and terminal phases. For a public repository, Actions discovery works anonymously at a rate-limit-safe interval. A private repository can use the memory-only `githubToken` argument; the token is passed only to the runner environment and is never added to the command, job metadata, output, or persistent state.
 
 Use `job_wait` once with the returned job ID when Codex should automatically continue to the next reasoning step after publishing. Merely watching the dashboard requires no model turns.
+
+## Passwordless credential profiles
+
+RunBeacon profiles store connection references, never secrets. Create an SSH profile with `credential_profile_save` using a host, username, pinned host-key fingerprint, and either `agent: "auto"` or `privateKeyPath`. Then pass only `credentialProfile` to `job_start`; when a target contains a matching host and user but no inline authentication, RunBeacon also selects the unique matching SSH profile automatically.
+
+```json
+{
+  "id": "production",
+  "kind": "ssh",
+  "host": "server.example.com",
+  "username": "deploy",
+  "agent": "auto",
+  "hostKeySha256": "SHA256:..."
+}
+```
+
+After the key is loaded into the OS `ssh-agent`, a tracked command needs only `command` and `credentialProfile: "production"`.
+
+For GitHub, sign in once through Git Credential Manager:
+
+```powershell
+git credential-manager github login --device --no-ui
+```
+
+Save `{ "id": "github-main", "kind": "github", "host": "github.com" }` and pass `credentialProfile: "github-main"` to `github_publish_start`. Git itself obtains the push credential, and the background Actions watcher calls `git credential fill` with interaction disabled. Credential-helper output is kept in runner memory, never forwarded to logs or the model, and never written to job state. The profile does not perform the initial OS login; `ssh-add` or Git Credential Manager login is a one-time user action.
+
+`credential_profile_list` returns only safe references. `credential_profile_delete` removes the RunBeacon reference but does not delete OS credentials, agent keys, or key files.
 
 ## Development quick start
 

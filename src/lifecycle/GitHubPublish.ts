@@ -61,3 +61,19 @@ export function isSuccessfulActionsConclusion(
     conclusion === 'skipped'
   );
 }
+
+export function parseGitCredentialOutput(output: string): {
+  username?: string;
+  password?: string;
+} {
+  const credential: { username?: string; password?: string } = {};
+  for (const line of output.split(/\r?\n/)) {
+    const separator = line.indexOf('=');
+    if (separator <= 0) continue;
+    const key = line.slice(0, separator);
+    const value = line.slice(separator + 1);
+    if (key === 'username') credential.username = value;
+    if (key === 'password') credential.password = value;
+  }
+  return credential;
+}

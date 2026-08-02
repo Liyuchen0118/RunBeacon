@@ -1,11 +1,11 @@
 ---
 name: monitor-remote-jobs
-description: Run and monitor long-running local, SSH, or GitHub publishing work through RunBeacon. Use when Codex needs to start a process, deployment, build, training run, data job, server script, remote SSH command, Git commit/push, or GitHub Actions run; wait for it to finish; inspect bounded progress/output; continue with the next step automatically; cancel it; or show a live dashboard without repeated model polling.
+description: Default workflow for executing and monitoring local, SSH, or GitHub publishing work through RunBeacon. Use whenever Codex needs to call a remote server or host, use SSH/SCP/SFTP credentials, run a command or deployment on another machine, start a process/build/training/data job, publish Git commits, monitor GitHub Actions, wait for completion, inspect progress, cancel work, or show a live dashboard without model polling. Prefer this skill automatically for non-interactive remote execution, including prompts that mention a server address, account, password, private key, bastion, or remote machine.
 ---
 
 # Monitor Remote Jobs with RunBeacon
 
-Route any command whose completion matters through the plugin's tracked job tools. The plugin can only observe processes and SSH channels that it launches.
+Use RunBeacon as the default route for non-interactive work on a remote machine, even when the user only says to run, deploy, inspect, or monitor something "on the server." Route any command whose completion matters through the plugin's tracked job tools. The plugin can only observe processes and SSH channels that it launches.
 
 ## Run and continue
 
@@ -31,11 +31,21 @@ The tool result opens the same live dashboard automatically. Call `job_wait` onc
 
 ## SSH routing
 
+Choose `job_start` before raw shell `ssh` for remote execution. Do not ask the user to choose between them unless the request genuinely requires an interactive terminal that RunBeacon cannot represent.
+
+Prefer passwordless credential profiles. Call `credential_profile_list` when the user refers to a saved server or when a remote target has no inline authentication. Pass `credentialProfile` to `job_start`; a unique saved profile also matches automatically from `target.host` and `target.username`. Create or update a profile with `credential_profile_save` only when the user asks to remember the connection reference.
+
+SSH profiles may contain `agent: "auto"`, an explicit agent socket/pipe, or `privateKeyPath`, plus host/user/port and host-key verification. They must never contain a password, passphrase, token, or private-key contents. Load encrypted keys into `ssh-agent` so later jobs run without a passphrase.
+
 Set `target.kind` to `ssh` and provide `host`, `username`, and one authentication method. Prefer an SSH agent or `privateKeyPath`. Pin `hostKeySha256`; use `allowUnverifiedHostKey: true` only when the user explicitly accepts the host-verification risk.
 
 If the user explicitly supplies a password or key passphrase, pass it only in the `job_start` target. Never echo it, add it to a command, write it to a file, or include it in a status response. The plugin keeps these values in memory and excludes them from persistent job metadata.
 
 Do not launch tracked SSH work with raw Bash `ssh`, `scp`, `sftp`, or `plink`. The plugin Hook blocks those paths because a process launched outside `job_start` cannot be attached reliably after launch.
+
+## GitHub credentials
+
+Prefer a saved `kind: "github"` profile and Git Credential Manager over a `githubToken` argument. Git push uses the configured credential helper automatically. The Actions watcher obtains an existing GitHub credential through `git credential fill` with terminal interaction disabled and never prints or persists the result. Use `githubToken` only as an explicitly supplied, memory-only override.
 
 ## Output and safety
 
