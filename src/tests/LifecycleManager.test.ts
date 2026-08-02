@@ -39,6 +39,7 @@ describe('LifecycleManager', () => {
     expect(result.job.state).toBe('succeeded');
     expect(result.job.exitCode).toBe(0);
     expect(result.job.progress?.percentage).toBe(100);
+    expect(result.job.progress?.message).toBe('100% done');
     expect(result.job.assessment.phase).toBe('finished');
     expect(result.job.assessment.health).toBe('terminal');
     expect(result.job.assessment.elapsedMs).toBeGreaterThan(0);
@@ -285,6 +286,9 @@ describe('lifecycle safety and UI helpers', () => {
     expect(redactCommand('deploy --password hunter2 --api-key=abc')).toBe(
       'deploy --password [REDACTED] --api-key=[REDACTED]'
     );
+    expect(redactCommand('git push https://secret@github.com/acme/repo')).toBe(
+      'git push https://[REDACTED]@github.com/acme/repo'
+    );
   });
 
   test('dashboard uses the MCP Apps bridge and direct tool calls', () => {
@@ -293,6 +297,9 @@ describe('lifecycle safety and UI helpers', () => {
     expect(html).toContain("request('tools/call'");
     expect(html).toContain("callTool('job_list'");
     expect(html).toContain('no model polling');
+    expect(html).toContain('data?.job');
+    expect(html).toContain('job.progress.phase');
+    expect(html).toContain("job.metadata?.kind === 'github_publish'");
   });
 
   test('plugin hook blocks raw SSH but leaves unrelated Bash commands alone', () => {

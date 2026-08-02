@@ -29,6 +29,9 @@ export function createDashboardHtml(): string {
     .cancelled { background:#64748b22; color:#64748b; }
     .bar { margin-top:10px; height:7px; background:color-mix(in srgb, CanvasText 12%, transparent); border-radius:999px; overflow:hidden; }
     .fill { height:100%; background:#2563eb; transition:width .2s ease; }
+    .progress-info { display:flex; align-items:center; gap:7px; margin-top:7px; font-size:12px; overflow-wrap:anywhere; }
+    .phase { border-radius:999px; padding:2px 7px; background:#2563eb18; color:#2563eb; font-weight:700; white-space:nowrap; }
+    .github { margin-top:7px; font-size:12px; padding:6px 8px; border-radius:7px; background:color-mix(in srgb, #2563eb 8%, transparent); }
     pre { max-height:150px; overflow:auto; margin:10px 0 0; padding:9px; border-radius:8px; background:color-mix(in srgb, CanvasText 7%, transparent); font:11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
     button { border:1px solid color-mix(in srgb, CanvasText 20%, transparent); background:transparent; color:inherit; border-radius:7px; padding:5px 9px; cursor:pointer; }
     button:hover { background:color-mix(in srgb, CanvasText 8%, transparent); }
@@ -70,6 +73,7 @@ export function createDashboardHtml(): string {
         if (message.method === 'ui/notifications/tool-result') {
           const data = structured(message.params);
           if (data?.jobs) render(data.jobs);
+          else if (data?.job) render([data.job]);
         }
       }, { passive:true });
 
@@ -97,6 +101,16 @@ export function createDashboardHtml(): string {
           const tail = (job.tail || []).map((chunk) => '[' + chunk.stream + '] ' + chunk.data).join('').slice(-8000);
           const progressBar = progress === null ? ''
             : '<div class="bar" title="' + progress + '%"><div class="fill" style="width:' + Math.max(0,Math.min(100,progress)) + '%"></div></div>';
+          const progressInfo = !job.progress ? ''
+            : '<div class="progress-info">' +
+                (job.progress.phase ? '<span class="phase">' + escapeHtml(job.progress.phase) + '</span>' : '') +
+                '<span>' + escapeHtml(job.progress.message || (progress === null ? '' : progress + '%')) + '</span>' +
+              '</div>';
+          const github = job.metadata?.kind === 'github_publish'
+            ? '<div class="github">GitHub | remote ' + escapeHtml(job.metadata.remote || 'origin') +
+              ' | branch ' + escapeHtml(job.metadata.branch || 'current') +
+              ' | Actions ' + (job.metadata.watchActions === false ? 'not monitored' : 'monitored') + '</div>'
+            : '';
           const output = tail ? '<pre>' + escapeHtml(tail) + '</pre>' : '';
           const cancel = isTerminal(job.state) ? ''
             : '<div style="margin-top:9px"><button data-cancel="' + escapeHtml(job.id) + '">Cancel</button></div>';
@@ -106,7 +120,7 @@ export function createDashboardHtml(): string {
               '<div class="meta">' + escapeHtml(targetLabel(job.target)) + ' | ' + escapeHtml(job.id.slice(0,8)) + ' | elapsed ' + duration(job.assessment?.elapsedMs) + ' | ' + escapeHtml(job.assessment?.health || '') + '</div>' +
               '<div class="meta">' + escapeHtml(job.assessment?.summary || '') + '</div></div>' +
               '<span class="state ' + escapeHtml(job.state) + '">' + escapeHtml(job.state) + '</span>' +
-            '</div>' + progressBar +
+            '</div>' + github + progressBar + progressInfo +
             (job.error ? '<div class="meta">' + escapeHtml(job.error) + '</div>' : '') +
             output + cancel + '</section>';
         }).join('');

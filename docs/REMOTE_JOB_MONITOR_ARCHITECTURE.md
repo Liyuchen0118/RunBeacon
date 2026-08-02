@@ -12,6 +12,8 @@ flowchart LR
   Shim -->|"authenticated local RPC"| Daemon["resident lifecycle daemon"]
   Daemon --> Local["local child process"]
   Daemon --> SSH["SSH channel via ssh2"]
+  Local --> GitRunner["GitHub publish runner"]
+  GitRunner --> GitHub["Git push / Actions REST API"]
   Dashboard["MCP Apps dashboard"] -->|"direct tools/call"| Shim
   Hook["PreToolUse Hook"] -->|"deny raw SSH"| Codex
   Daemon --> Store["redacted jobs.json"]
@@ -23,6 +25,8 @@ flowchart LR
 - `src/lifecycle/LifecycleManager.ts`: queue, execution, events, output ring, progress, cancellation, and assessment.
 - `src/lifecycle/JobStore.ts`: atomic redacted metadata persistence.
 - `src/lifecycle/DashboardApp.ts`: portable MCP Apps HTML resource.
+- `src/daemon/github-publish-runner.ts`: staged-commit, non-force push, and background GitHub Actions monitoring.
+- `src/lifecycle/GitHubPublish.ts`: GitHub remote parsing and failure classification.
 - `hooks/route-ssh.cjs`: prevents Codex Bash from bypassing tracking.
 
 ## Lifecycle
@@ -44,7 +48,31 @@ stateDiagram-v2
 
 ## Dashboard behavior
 
-`job_dashboard` is the only render tool with `_meta.ui.resourceUri`. The returned HTML initializes the MCP Apps bridge and calls `job_list` directly every 1.5 seconds. This is deliberate: the UI gets bounded live state while the model remains asleep. Clients without MCP Apps support can still use every data tool.
+`job_dashboard` and `github_publish_start` attach the same `_meta.ui.resourceUri`. The returned HTML initializes the MCP Apps bridge and calls `job_list` directly every 1.5 seconds. GitHub publish cards display remote, branch, Actions-monitoring mode, percentage, phase, full progress message, and bounded output. This is deliberate: the UI gets bounded live state while the model remains asleep. Clients without MCP Apps support can still use every data tool.
+
+## GitHub publish lifecycle
+
+`github_publish_start` starts a normal tracked local job whose executable is the bundled publish runner. The runner validates the Git repository and branch, optionally commits the existing index, runs `git push --progress` without force, and then queries the GitHub Actions REST API by pushed commit SHA.
+
+```mermaid
+stateDiagram-v2
+  [*] --> preflight
+  preflight --> commit: commitMessage and staged changes
+  preflight --> push: no commit requested
+  commit --> push
+  push --> pushed
+  pushed --> complete: Actions disabled
+  pushed --> actions-discovery: Actions enabled
+  actions-discovery --> complete: no run discovered
+  actions-discovery --> actions: run discovered
+  actions --> complete: all accepted conclusions
+  actions --> actions-failed: failed conclusion
+  actions --> actions-timeout: deadline reached
+```
+
+Each runner phase emits one structured progress line such as `70% [actions] build: in_progress`. `LifecycleManager` parses this into percentage, phase, and a bounded message. Git's own transfer percentages are excluded by the runner-specific progress pattern, preventing object-upload progress from being mistaken for end-to-end completion.
+
+The model may call `job_wait` once to continue after the terminal event. All repeated Actions API checks happen inside the runner. Anonymous access is limited to one request per 60 seconds; authenticated access uses the configured interval with a 10-second floor.
 
 ## SSH and credentials
 
@@ -59,6 +87,8 @@ Authentication order is supplied per job:
 Require `hostKeySha256` by default. `allowUnverifiedHostKey` is an explicit insecure override and should only be used with user awareness.
 
 The local daemon RPC uses a random token stored with owner-only permissions under `PLUGIN_DATA`. On Windows it uses a named pipe; on macOS/Linux it uses an owner-only Unix socket.
+
+An optional `githubToken` is sent through daemon RPC and the child environment only. It is not placed in runner arguments, labels, metadata, output, or `jobs.json`. Public repositories do not require a token. Git credential discovery for the push is delegated to Git with terminal prompting disabled, so a missing credential fails visibly instead of hanging an unattended job.
 
 ## Persistence boundary
 
@@ -83,6 +113,8 @@ If the daemon process itself crashes or the machine reboots, local child process
 - `npm run build`: TypeScript build.
 - `npx jest src/tests/LifecycleManager.test.ts --runInBand --coverage=false`: lifecycle, timeout, SSH safety, Hook, and UI tests.
 - `npm run test:lifecycle:mcp`: real MCP client/server and UI-resource smoke test.
+- `src/tests/GitHubPublish.test.ts`: GitHub remote parsing, push failure classification, and accepted Actions conclusions.
+- The lifecycle MCP smoke test creates a temporary worktree and local bare remote, then exercises staged commit and push through `github_publish_start` without external credentials.
 - `npm run test:lifecycle:daemon`: second-client reattachment to a resident daemon.
 - The lifecycle MCP and daemon smoke tests run on Windows, Linux, and macOS in CI.
 - `validate_plugin.py`: Codex plugin manifest validation.

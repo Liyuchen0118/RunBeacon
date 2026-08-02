@@ -29,6 +29,9 @@ const pluginData =
   process.env.PLUGIN_DATA ||
   process.env.CLAUDE_PLUGIN_DATA ||
   join(homedir(), '.remote-job-monitor');
+const githubPublishRunner = fileURLToPath(
+  new URL('../daemon/github-publish-runner.js', import.meta.url)
+);
 
 let manager: LifecycleService;
 if (process.env.RJM_INLINE_MANAGER === 'true') {
@@ -86,6 +89,86 @@ const sshTargetSchema = {
 };
 
 const tools: Tool[] = [
+  {
+    name: 'github_publish_start',
+    description:
+      'Start a dashboard-tracked GitHub publish: optionally commit already-staged changes, push without force, then monitor GitHub Actions in the background. This never runs git add. Use job_wait once if the workflow should continue automatically after publishing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cwd: {
+          type: 'string',
+          minLength: 1,
+          description: 'Working tree or a directory inside it.',
+        },
+        remote: {
+          type: 'string',
+          default: 'origin',
+          description: 'Git remote to push without force.',
+        },
+        branch: {
+          type: 'string',
+          description: 'Destination branch. Defaults to the current branch.',
+        },
+        commitMessage: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 10_000,
+          description:
+            'When present, commit only changes that are already staged. The tool never runs git add.',
+        },
+        watchActions: {
+          type: 'boolean',
+          default: true,
+          description:
+            'Discover and monitor GitHub Actions after the push. Disable for non-GitHub remotes.',
+        },
+        githubToken: {
+          type: 'string',
+          description:
+            'Optional GitHub token for private repositories or higher API limits. Kept in memory only and never logged or persisted.',
+        },
+        actionsTimeoutMs: {
+          type: 'integer',
+          minimum: 10_000,
+          maximum: 82_800_000,
+          default: 1_800_000,
+        },
+        discoveryTimeoutMs: {
+          type: 'integer',
+          minimum: 1_000,
+          maximum: 600_000,
+          default: 120_000,
+        },
+        pollIntervalMs: {
+          type: 'integer',
+          minimum: 1_000,
+          maximum: 300_000,
+          default: 15_000,
+          description:
+            'Background API interval. Anonymous GitHub API access is automatically limited to at least 60 seconds.',
+        },
+        idempotencyKey: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 200,
+          description:
+            'Stable key that prevents a retry from creating another commit or push job.',
+        },
+      },
+      required: ['cwd'],
+    },
+    annotations: {
+      title: 'Publish to GitHub',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    _meta: {
+      ui: { resourceUri: DASHBOARD_RESOURCE_URI },
+    },
+  } as Tool,
   {
     name: 'job_start',
     description:
@@ -298,6 +381,68 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const args = (request.params.arguments ?? {}) as Record<string, any>;
   try {
     switch (request.params.name) {
+      case 'github_publish_start': {
+        const cwd = String(args.cwd ?? '').trim();
+        if (!cwd) throw new Error('cwd is required');
+        const remote = String(args.remote ?? 'origin');
+        const watchActions = args.watchActions !== false;
+        const branch = optionalString(args.branch);
+        const commitMessage = optionalString(args.commitMessage);
+        const actionsTimeoutMs = numericArgument(
+          args.actionsTimeoutMs,
+          1_800_000
+        );
+        const discoveryTimeoutMs = numericArgument(
+          args.discoveryTimeoutMs,
+          120_000
+        );
+        const pollIntervalMs = numericArgument(args.pollIntervalMs, 15_000);
+        const runnerArgs = [
+          githubPublishRunner,
+          '--cwd',
+          cwd,
+          '--remote',
+          remote,
+          '--watch-actions',
+          String(watchActions),
+          '--actions-timeout-ms',
+          String(actionsTimeoutMs),
+          '--discovery-timeout-ms',
+          String(discoveryTimeoutMs),
+          '--poll-interval-ms',
+          String(pollIntervalMs),
+        ];
+        if (branch) runnerArgs.push('--branch', branch);
+        if (commitMessage) runnerArgs.push('--commit-message', commitMessage);
+
+        const githubToken = optionalString(args.githubToken);
+        const job = await manager.start({
+          command: process.execPath,
+          args: runnerArgs,
+          shell: false,
+          label: `GitHub publish ${remote}/${branch ?? 'current branch'}`,
+          timeoutMs: Math.min(
+            24 * 60 * 60_000,
+            actionsTimeoutMs + discoveryTimeoutMs + 15 * 60_000
+          ),
+          idempotencyKey: optionalString(args.idempotencyKey),
+          progressPattern:
+            '^(\\d{1,3}(?:\\.\\d+)?)%\\s+\\[[A-Za-z][A-Za-z0-9_-]{0,63}\\].*$',
+          env: githubToken
+            ? { RUNBEACON_GITHUB_TOKEN: githubToken }
+            : undefined,
+          metadata: {
+            kind: 'github_publish',
+            remote,
+            branch: branch ?? 'current',
+            watchActions,
+          },
+        });
+        return reply(
+          { job },
+          `GitHub publish job ${job.id} started. The dashboard tracks commit, push, and Actions without model polling; call job_wait once if you need to continue automatically.`
+        );
+      }
       case 'job_start': {
         const job = await manager.start(args as StartJobInput);
         return reply(
@@ -343,6 +488,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     };
   }
 });
+
+function optionalString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function numericArgument(value: unknown, fallback: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new Error('Expected a numeric argument');
+  return Math.round(parsed);
+}
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

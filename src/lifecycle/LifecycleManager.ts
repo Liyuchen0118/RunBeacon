@@ -550,6 +550,7 @@ export class LifecycleManager extends EventEmitter {
     input: StartJobInput
   ): void {
     let percentage: number | undefined;
+    let phase: string | undefined;
     let message: string | undefined;
     try {
       if (input.progressPattern) {
@@ -569,15 +570,18 @@ export class LifecycleManager extends EventEmitter {
         const match = matches.at(-1);
         if (match?.[0]) {
           percentage = Number(match[1]);
-          message = match[0].trim();
+          message = data.trim().slice(0, 240);
         }
       }
+      const phaseMatch = /\[([A-Za-z][A-Za-z0-9_-]{0,63})\]/.exec(data);
+      if (phaseMatch) phase = phaseMatch[1];
     } catch {
       // A malformed optional progress pattern must not interrupt the job.
     }
     if (percentage === undefined) return;
     job.progress = {
       percentage: Math.max(0, Math.min(100, percentage)),
+      phase,
       message,
       updatedAt: new Date().toISOString(),
     };

@@ -2,7 +2,7 @@
 
 RunBeacon turns long-running local and SSH commands into tracked jobs for Codex. The Codex plugin keeps the stable ID `remote-job-monitor`: Codex starts a job once, calls `job_wait` once, and resumes when the resident daemon reports a terminal event. A live MCP Apps dashboard refreshes by calling the MCP server directly, so dashboard updates and intermediate status checks do not create model turns.
 
-Version 0.1.1 adds idempotent starts, abort-safe event waits, bounded history and output, coalesced state persistence, UTF-8-safe streaming, local process-tree cancellation, explicit daemon protocol compatibility, and stricter metadata/progress persistence defaults.
+Version 0.2.0 adds a GitHub publishing pipeline and dashboard: RunBeacon can commit already-staged changes, push without force, discover GitHub Actions runs, and monitor them in the background without model polling.
 
 ## What is implemented
 
@@ -11,6 +11,7 @@ Version 0.1.1 adds idempotent starts, abort-safe event waits, bounded history an
 - Local process and SSH channel ownership, output capture, cancellation, and timeout handling
 - Lifecycle assessment with active/stalled state, elapsed time, progress, and linear ETA
 - MCP Apps dashboard whose refresh loop consumes no model tokens
+- Dashboard-tracked Git commit, push, and GitHub Actions phases through `github_publish_start`
 - `PreToolUse` Hook that blocks untracked raw `ssh`, `scp`, `sftp`, and `plink`
 - Memory-only inline SSH passwords/passphrases and pinned host-key support
 - Persistent redacted job metadata; command output persistence is off by default
@@ -40,6 +41,24 @@ sequenceDiagram
 
 The dashboard still refreshes locally every 1.5 seconds, but those calls run between the MCP App and the MCP server. They do not invoke the model and do not spend model tokens. The model-facing path is event-driven.
 
+## GitHub publishing dashboard
+
+Call `github_publish_start` with a repository directory. If `commitMessage` is supplied, RunBeacon commits only changes that are already staged, then performs a normal non-force push. It never runs `git add`, so file selection remains an explicit user or Codex action.
+
+```json
+{
+  "cwd": "C:\\work\\my-repository",
+  "remote": "origin",
+  "commitMessage": "feat: add dashboard",
+  "watchActions": true,
+  "idempotencyKey": "publish-dashboard-v1"
+}
+```
+
+The attached MCP App shows `preflight`, `commit`, `push`, `pushed`, `actions-discovery`, `actions`, and terminal phases. For a public repository, Actions discovery works anonymously at a rate-limit-safe interval. A private repository can use the memory-only `githubToken` argument; the token is passed only to the runner environment and is never added to the command, job metadata, output, or persistent state.
+
+Use `job_wait` once with the returned job ID when Codex should automatically continue to the next reasoning step after publishing. Merely watching the dashboard requires no model turns.
+
 ## Development quick start
 
 ```powershell
@@ -56,7 +75,7 @@ See [RunBeacon architecture](docs/REMOTE_JOB_MONITOR_ARCHITECTURE.md) for lifecy
 
 ## Important boundary
 
-The plugin can reliably monitor only commands that it launches through `job_start`. A Hook can stop raw SSH before it starts, but no plugin can reconstruct a complete process lifecycle after an arbitrary command has already detached outside the plugin. Inline SSH passwords supplied by the user are accepted for a single tracked job, held in daemon memory, and never persisted; SSH agent or key-path authentication is preferred.
+The plugin can reliably monitor only commands that it launches through `job_start` or `github_publish_start`. A Hook can stop raw SSH before it starts, but no plugin can reconstruct a complete process lifecycle after an arbitrary command has already detached outside the plugin. Inline SSH passwords supplied by the user are accepted for a single tracked job, held in daemon memory, and never persisted; SSH agent or key-path authentication is preferred.
 
 ---
 

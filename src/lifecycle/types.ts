@@ -18,6 +18,7 @@ export interface JobOutputChunk {
 
 export interface JobProgress {
   percentage?: number;
+  phase?: string;
   message?: string;
   updatedAt: string;
 }
