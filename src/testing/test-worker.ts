@@ -3,7 +3,11 @@
  */
 
 import { parentPort, workerData } from 'worker_threads';
-import { TestDefinition, TestResult, AssertionResult } from '../types/test-framework.js';
+import {
+  TestDefinition,
+  TestResult,
+  AssertionResult,
+} from '../types/test-framework.js';
 
 interface WorkerMessage {
   type: 'execute' | 'shutdown';
@@ -97,7 +101,10 @@ class TestWorker {
   /**
    * Run the actual test
    */
-  private async runTest(test: TestDefinition, startTime: number): Promise<TestResult> {
+  private async runTest(
+    test: TestDefinition,
+    startTime: number
+  ): Promise<TestResult> {
     // Execute setup hook if present
     if (test.setup) {
       await this.executeHook(test.setup.fn, test.setup.timeout || 5000);
@@ -152,7 +159,10 @@ class TestWorker {
   /**
    * Execute a test hook
    */
-  private async executeHook(fn: () => Promise<void> | void, timeout: number): Promise<void> {
+  private async executeHook(
+    fn: () => Promise<void> | void,
+    timeout: number
+  ): Promise<void> {
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => {
         reject(new Error(`Hook timed out after ${timeout}ms`));

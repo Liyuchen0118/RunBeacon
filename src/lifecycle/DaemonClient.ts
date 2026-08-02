@@ -1,7 +1,11 @@
 import { spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
 import { fileURLToPath } from 'node:url';
-import { DaemonPaths, ensureDaemonToken, getDaemonPaths } from './DaemonPaths.js';
+import {
+  DaemonPaths,
+  ensureDaemonToken,
+  getDaemonPaths,
+} from './DaemonPaths.js';
 import { JobSnapshot, StartJobInput, WaitResult } from './types.js';
 
 interface RpcRequest {
@@ -24,7 +28,10 @@ export interface LifecycleService {
     timeoutMs?: number,
     tailLines?: number
   ): Promise<WaitResult>;
-  snapshot(jobId: string, tailLines?: number): Promise<JobSnapshot> | JobSnapshot;
+  snapshot(
+    jobId: string,
+    tailLines?: number
+  ): Promise<JobSnapshot> | JobSnapshot;
   list(tailLines?: number): Promise<JobSnapshot[]> | JobSnapshot[];
   cancel(jobId: string): Promise<JobSnapshot> | JobSnapshot;
 }
@@ -75,7 +82,9 @@ export class DaemonClient implements LifecycleService {
         lastError = error;
       }
     }
-    throw new Error(`Remote Job Monitor daemon did not start: ${String(lastError)}`);
+    throw new Error(
+      `Remote Job Monitor daemon did not start: ${String(lastError)}`
+    );
   }
 
   start(input: StartJobInput): Promise<JobSnapshot> {
@@ -145,7 +154,9 @@ export class DaemonClient implements LifecycleService {
         const newline = buffer.indexOf('\n');
         if (newline < 0) return;
         try {
-          const response = JSON.parse(buffer.slice(0, newline)) as RpcResponse<T>;
+          const response = JSON.parse(
+            buffer.slice(0, newline)
+          ) as RpcResponse<T>;
           if (response.id !== id) throw new Error('Mismatched daemon response');
           if (response.error) finish(new Error(response.error));
           else finish(undefined, response.result);

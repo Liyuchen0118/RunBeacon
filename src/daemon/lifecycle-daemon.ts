@@ -62,11 +62,19 @@ async function handle(socket: Socket, request: RpcRequest): Promise<void> {
         respond(
           socket,
           request.id,
-          await manager.waitForTerminal(args.jobId, args.timeoutMs, args.tailLines)
+          await manager.waitForTerminal(
+            args.jobId,
+            args.timeoutMs,
+            args.tailLines
+          )
         );
         break;
       case 'snapshot':
-        respond(socket, request.id, manager.snapshot(args.jobId, args.tailLines));
+        respond(
+          socket,
+          request.id,
+          manager.snapshot(args.jobId, args.tailLines)
+        );
         break;
       case 'list':
         respond(socket, request.id, manager.list(args.tailLines));
@@ -79,7 +87,12 @@ async function handle(socket: Socket, request: RpcRequest): Promise<void> {
         setTimeout(() => process.exit(0), 25).unref();
         break;
       default:
-        respond(socket, request.id, undefined, `Unknown daemon method: ${request.method}`);
+        respond(
+          socket,
+          request.id,
+          undefined,
+          `Unknown daemon method: ${request.method}`
+        );
     }
   } catch (error) {
     respond(socket, request.id, undefined, safeErrorMessage(error));

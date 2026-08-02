@@ -53,9 +53,15 @@ export class LifecycleManager extends EventEmitter {
   constructor(options: LifecycleManagerOptions) {
     super();
     this.maxConcurrentJobs = Math.max(1, options.maxConcurrentJobs ?? 4);
-    this.maxOutputBytes = Math.max(64 * 1024, options.maxOutputBytes ?? 1024 * 1024);
+    this.maxOutputBytes = Math.max(
+      64 * 1024,
+      options.maxOutputBytes ?? 1024 * 1024
+    );
     this.stalledAfterMs = Math.max(10_000, options.stalledAfterMs ?? 120_000);
-    this.store = new JobStore(options.statePath, options.persistOutput ?? false);
+    this.store = new JobStore(
+      options.statePath,
+      options.persistOutput ?? false
+    );
 
     for (const loaded of this.store.load()) {
       if (loaded.state === 'running' || loaded.state === 'queued') {
@@ -234,14 +240,22 @@ export class LifecycleManager extends EventEmitter {
       if (job.cancelRequested) this.finish(job, 'cancelled');
       else if (result.timedOut) this.finish(job, 'timed_out', 'Job timed out.');
       else if (result.exitCode === 0) this.finish(job, 'succeeded');
-      else this.finish(job, 'failed', `Process exited with code ${result.exitCode}.`);
+      else
+        this.finish(
+          job,
+          'failed',
+          `Process exited with code ${result.exitCode}.`
+        );
     } catch (error) {
       if (job.cancelRequested) this.finish(job, 'cancelled');
       else this.finish(job, 'failed', safeErrorMessage(error));
     }
   }
 
-  private runLocal(job: JobRecord, input: StartJobInput): Promise<ExecutionResult> {
+  private runLocal(
+    job: JobRecord,
+    input: StartJobInput
+  ): Promise<ExecutionResult> {
     return new Promise((resolve, reject) => {
       let settled = false;
       let timedOut = false;
@@ -268,8 +282,12 @@ export class LifecycleManager extends EventEmitter {
 
       job.pid = child.pid;
       this.changed(job);
-      child.stdout?.on('data', (data) => this.append(job, 'stdout', String(data), input));
-      child.stderr?.on('data', (data) => this.append(job, 'stderr', String(data), input));
+      child.stdout?.on('data', (data) =>
+        this.append(job, 'stdout', String(data), input)
+      );
+      child.stderr?.on('data', (data) =>
+        this.append(job, 'stderr', String(data), input)
+      );
       child.once('error', (error) => settle(undefined, error));
       child.once('close', (code, signal) =>
         settle({ exitCode: code, signal, timedOut })
@@ -287,7 +305,10 @@ export class LifecycleManager extends EventEmitter {
     });
   }
 
-  private runSsh(job: JobRecord, input: StartJobInput): Promise<ExecutionResult> {
+  private runSsh(
+    job: JobRecord,
+    input: StartJobInput
+  ): Promise<ExecutionResult> {
     return new Promise((resolve, reject) => {
       const target = input.target;
       if (!target || target.kind !== 'ssh') {
@@ -396,7 +417,11 @@ export class LifecycleManager extends EventEmitter {
     this.changed(job);
   }
 
-  private updateProgress(job: JobRecord, data: string, input: StartJobInput): void {
+  private updateProgress(
+    job: JobRecord,
+    data: string,
+    input: StartJobInput
+  ): void {
     let percentage: number | undefined;
     let message: string | undefined;
     try {
@@ -457,7 +482,9 @@ export class LifecycleManager extends EventEmitter {
 
   private assess(job: JobRecord) {
     const now = Date.now();
-    const started = job.startedAt ? Date.parse(job.startedAt) : Date.parse(job.createdAt);
+    const started = job.startedAt
+      ? Date.parse(job.startedAt)
+      : Date.parse(job.createdAt);
     const finished = job.finishedAt ? Date.parse(job.finishedAt) : now;
     const lastActivity = Date.parse(
       job.lastOutputAt || job.lastProgressAt || job.startedAt || job.createdAt

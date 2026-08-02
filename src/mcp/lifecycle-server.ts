@@ -13,10 +13,7 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { LifecycleManager } from '../lifecycle/LifecycleManager.js';
-import {
-  DaemonClient,
-  LifecycleService,
-} from '../lifecycle/DaemonClient.js';
+import { DaemonClient, LifecycleService } from '../lifecycle/DaemonClient.js';
 import {
   createDashboardHtml,
   DASHBOARD_RESOURCE_URI,
@@ -70,12 +67,14 @@ const sshTargetSchema = {
     agent: { type: 'string', description: 'SSH_AUTH_SOCK path.' },
     hostKeySha256: {
       type: 'string',
-      description: 'Pinned SSH host-key fingerprint, with or without SHA256: prefix.',
+      description:
+        'Pinned SSH host-key fingerprint, with or without SHA256: prefix.',
     },
     allowUnverifiedHostKey: {
       type: 'boolean',
       default: false,
-      description: 'Explicit insecure override when no pinned host key is available.',
+      description:
+        'Explicit insecure override when no pinned host key is available.',
     },
   },
   required: ['kind', 'host', 'username'],
@@ -89,30 +88,44 @@ const tools: Tool[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: 'Local command or complete remote shell command.' },
+        command: {
+          type: 'string',
+          description: 'Local command or complete remote shell command.',
+        },
         args: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Local command arguments. For SSH, include arguments in command.',
+          description:
+            'Local command arguments. For SSH, include arguments in command.',
         },
         cwd: { type: 'string', description: 'Local working directory.' },
         env: {
           type: 'object',
           additionalProperties: { type: 'string' },
-          description: 'Local environment overrides. Values are never persisted.',
+          description:
+            'Local environment overrides. Values are never persisted.',
         },
-        shell: { type: 'boolean', default: true, description: 'Use a local shell.' },
+        shell: {
+          type: 'boolean',
+          default: true,
+          description: 'Use a local shell.',
+        },
         label: { type: 'string' },
         timeoutMs: { type: 'integer', minimum: 1, default: 86400000 },
         target: {
           oneOf: [
-            { type: 'object', properties: { kind: { type: 'string', enum: ['local'] } }, required: ['kind'] },
+            {
+              type: 'object',
+              properties: { kind: { type: 'string', enum: ['local'] } },
+              required: ['kind'],
+            },
             sshTargetSchema,
           ],
         },
         progressPattern: {
           type: 'string',
-          description: 'Optional regex; capture group 1 must contain a percentage.',
+          description:
+            'Optional regex; capture group 1 must contain a percentage.',
         },
         metadata: { type: 'object' },
       },
@@ -139,7 +152,8 @@ const tools: Tool[] = [
           minimum: 1,
           maximum: 86400000,
           default: 86400000,
-          description: 'Maximum server-side wait; no polling by the model occurs.',
+          description:
+            'Maximum server-side wait; no polling by the model occurs.',
         },
         tailLines: { type: 'integer', minimum: 0, maximum: 500, default: 120 },
       },
@@ -155,7 +169,8 @@ const tools: Tool[] = [
   },
   {
     name: 'job_snapshot',
-    description: 'Read one tracked job and a bounded output tail. Use only for explicit status requests; prefer job_wait for completion.',
+    description:
+      'Read one tracked job and a bounded output tail. Use only for explicit status requests; prefer job_wait for completion.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -174,7 +189,8 @@ const tools: Tool[] = [
   },
   {
     name: 'job_list',
-    description: 'List tracked jobs with bounded output tails. The dashboard calls this directly without model tokens.',
+    description:
+      'List tracked jobs with bounded output tails. The dashboard calls this directly without model tokens.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -305,9 +321,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   } catch (error) {
     return {
       isError: true,
-      content: [
-        { type: 'text', text: safeErrorMessage(error) } as TextContent,
-      ],
+      content: [{ type: 'text', text: safeErrorMessage(error) } as TextContent],
     };
   }
 });

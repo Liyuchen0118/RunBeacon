@@ -17,7 +17,10 @@ export interface DaemonPaths {
 
 export function getDaemonPaths(dataDirInput: string): DaemonPaths {
   const dataDir = resolve(dataDirInput);
-  const suffix = createHash('sha256').update(dataDir).digest('hex').slice(0, 16);
+  const suffix = createHash('sha256')
+    .update(dataDir)
+    .digest('hex')
+    .slice(0, 16);
   return {
     dataDir,
     socketPath:

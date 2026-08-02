@@ -26,7 +26,13 @@ export interface TestRecording {
 }
 
 export interface RecordingStep {
-  type: 'create_session' | 'send_input' | 'send_key' | 'wait_for_output' | 'assert' | 'snapshot';
+  type:
+    | 'create_session'
+    | 'send_input'
+    | 'send_key'
+    | 'wait_for_output'
+    | 'assert'
+    | 'snapshot';
   timestamp: number;
   data: any;
   output?: string;
@@ -68,7 +74,13 @@ export interface CodeGenerationOptions {
 // ============================================================================
 
 export interface Assertion {
-  type: 'output_contains' | 'output_matches' | 'exit_code' | 'no_errors' | 'state_equals' | 'custom';
+  type:
+    | 'output_contains'
+    | 'output_matches'
+    | 'exit_code'
+    | 'no_errors'
+    | 'state_equals'
+    | 'custom';
   expected: any;
   actual?: any;
   result?: 'pass' | 'fail';
@@ -309,7 +321,14 @@ export interface SeedData {
 // SHARED TYPES (Used across multiple phases)
 // ============================================================================
 
-export type TestStatus = 'pending' | 'running' | 'pass' | 'fail' | 'skip' | 'timeout' | 'error';
+export type TestStatus =
+  | 'pending'
+  | 'running'
+  | 'pass'
+  | 'fail'
+  | 'skip'
+  | 'timeout'
+  | 'error';
 
 export interface TestContext {
   sessionId?: string;
