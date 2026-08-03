@@ -395,7 +395,7 @@ jobs:
 
       - name: Run performance benchmarks
         run: |
-          npm test -- --testPathPattern="test/stress/.*\.test\.ts$" --testTimeout=300000 --verbose
+          npm test -- --testPathPattern="test/stress/.*\.test\.ts$" --testNamePattern="Performance Benchmarks" --testTimeout=300000 --verbose
         env:
           NODE_OPTIONS: '--max_old_space_size=8192'
 
