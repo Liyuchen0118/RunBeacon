@@ -1,8 +1,11 @@
 import { ChildProcess, spawn } from 'child_process';
+import { createHash } from 'crypto';
 import * as https from 'https';
-import * as http from 'http';
 import * as fs from 'fs/promises';
-import * as path from 'path';
+import {
+  checkServerIdentity as checkTlsServerIdentity,
+  rootCertificates,
+} from 'tls';
 import { BaseProtocol } from '../core/BaseProtocol.js';
 import {
   ProtocolCapabilities,
@@ -32,7 +35,23 @@ interface XenConfig {
   connectionType?: 'xe' | 'xapi' | 'xl' | 'ssh';
   sshKeyFile?: string;
   timeout?: number;
+  caFile?: string;
+  serverCertSha256?: string;
 }
+
+interface XapiResponse {
+  result?: {
+    Status?: string;
+    Value?: unknown;
+    ErrorDescription?: unknown;
+  };
+  error?: { message?: string };
+}
+
+const XAPI_DEFAULT_TIMEOUT_MS = 30_000;
+const XAPI_MIN_TIMEOUT_MS = 1_000;
+const XAPI_MAX_TIMEOUT_MS = 120_000;
+const XAPI_MAX_RESPONSE_BYTES = 1024 * 1024;
 
 /**
  * VM (Virtual Machine) information
@@ -295,7 +314,10 @@ export class XenProtocol extends BaseProtocol {
   }
 
   private parseXenOptions(options: SessionOptions): XenConfig {
-    const config: XenConfig = { ...this.defaultConfig };
+    const config: XenConfig = {
+      ...this.defaultConfig,
+      timeout: options.timeout ?? this.defaultConfig.timeout,
+    };
 
     // Parse from args if provided
     if (options.args) {
@@ -333,6 +355,22 @@ export class XenProtocol extends BaseProtocol {
           case '--nossl':
             config.useSSL = false;
             break;
+          case '--ca-file':
+            config.caFile = nextArg;
+            i++;
+            break;
+          case '--server-cert-sha256':
+            config.serverCertSha256 = this.normalizeServerCertSha256(nextArg);
+            i++;
+            break;
+          case '--timeout':
+            config.timeout = Number.parseInt(nextArg, 10);
+            i++;
+            break;
+          case '--connection-type':
+            config.connectionType = this.parseConnectionType(nextArg);
+            i++;
+            break;
           case '--key':
             config.sshKeyFile = nextArg;
             i++;
@@ -342,11 +380,24 @@ export class XenProtocol extends BaseProtocol {
     }
 
     // Parse from environment variables
-    if (options.env) {
-      if (options.env.XEN_HOST) config.host = options.env.XEN_HOST;
-      if (options.env.XEN_USER) config.username = options.env.XEN_USER;
-      if (options.env.XEN_PASSWORD) config.password = options.env.XEN_PASSWORD;
-      if (options.env.XEN_PORT) config.port = parseInt(options.env.XEN_PORT);
+    const environment = { ...process.env, ...options.env };
+    if (environment.XEN_HOST) config.host = environment.XEN_HOST;
+    if (environment.XEN_USER) config.username = environment.XEN_USER;
+    if (environment.XEN_PASSWORD) config.password = environment.XEN_PASSWORD;
+    if (environment.XEN_PORT) config.port = parseInt(environment.XEN_PORT);
+    if (environment.XEN_CA_FILE) config.caFile = environment.XEN_CA_FILE;
+    if (environment.XEN_SERVER_CERT_SHA256) {
+      config.serverCertSha256 = this.normalizeServerCertSha256(
+        environment.XEN_SERVER_CERT_SHA256
+      );
+    }
+    if (environment.XEN_TIMEOUT_MS) {
+      config.timeout = Number.parseInt(environment.XEN_TIMEOUT_MS, 10);
+    }
+    if (environment.XEN_CONNECTION_TYPE) {
+      config.connectionType = this.parseConnectionType(
+        environment.XEN_CONNECTION_TYPE
+      );
     }
 
     // Determine connection type based on available tools
@@ -558,6 +609,7 @@ export class XenProtocol extends BaseProtocol {
     if (!config.host) {
       throw new Error('XAPI connection requires a host');
     }
+    this.validateXapiConfig(config);
 
     // Login to XAPI
     const apiSession = await this.xapiLogin(config);
@@ -644,48 +696,19 @@ export class XenProtocol extends BaseProtocol {
   }
 
   private async xapiLogin(config: XenConfig): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const protocol = config.useSSL ? https : http;
-      const postData = JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'session.login_with_password',
-        params: [config.username || 'root', config.password || ''],
-        id: 1,
-      });
-
-      const options = {
-        hostname: config.host,
-        port: config.port || 443,
-        path: '/jsonrpc',
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(postData),
-        },
-        rejectUnauthorized: false, // Allow self-signed certificates
-      };
-
-      const req = protocol.request(options, (res) => {
-        let data = '';
-        res.on('data', (chunk) => (data += chunk));
-        res.on('end', () => {
-          try {
-            const response = JSON.parse(data);
-            if (response.result && response.result.Status === 'Success') {
-              resolve(response.result.Value);
-            } else {
-              reject(new Error(response.error?.message || 'Login failed'));
-            }
-          } catch (error) {
-            reject(error);
-          }
-        });
-      });
-
-      req.on('error', reject);
-      req.write(postData);
-      req.end();
+    const response = await this.xapiRequest(config, {
+      jsonrpc: '2.0',
+      method: 'session.login_with_password',
+      params: [config.username || 'root', config.password || ''],
+      id: 1,
     });
+    if (response.result?.Status !== 'Success') {
+      throw new Error(response.error?.message || 'XAPI login failed');
+    }
+    if (typeof response.result.Value !== 'string' || !response.result.Value) {
+      throw new Error('XAPI login returned an invalid session identifier');
+    }
+    return response.result.Value;
   }
 
   private async executeXECommand(
@@ -967,36 +990,168 @@ export class XenProtocol extends BaseProtocol {
     config: XenConfig,
     sessionId: string
   ): Promise<void> {
-    return new Promise((resolve) => {
-      const protocol = config.useSSL ? https : http;
-      const postData = JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'session.logout',
-        params: [sessionId],
-        id: 1,
-      });
-
-      const options = {
-        hostname: config.host,
-        port: config.port || 443,
-        path: '/jsonrpc',
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(postData),
-        },
-        rejectUnauthorized: false,
-      };
-
-      const req = protocol.request(options, (res) => {
-        res.on('data', () => {}); // Drain response
-        res.on('end', resolve);
-      });
-
-      req.on('error', () => resolve()); // Ignore errors
-      req.write(postData);
-      req.end();
+    const response = await this.xapiRequest(config, {
+      jsonrpc: '2.0',
+      method: 'session.logout',
+      params: [sessionId],
+      id: 1,
     });
+    if (response.result?.Status !== 'Success') {
+      throw new Error(response.error?.message || 'XAPI logout failed');
+    }
+  }
+
+  private async xapiRequest(
+    config: XenConfig,
+    payload: Record<string, unknown>
+  ): Promise<XapiResponse> {
+    this.validateXapiConfig(config);
+    const postData = JSON.stringify(payload);
+    const customCa = config.caFile
+      ? await fs.readFile(config.caFile)
+      : undefined;
+    const expectedFingerprint = config.serverCertSha256?.slice(
+      'sha256:'.length
+    );
+    const timeoutMs = config.timeout ?? XAPI_DEFAULT_TIMEOUT_MS;
+    const agent = new https.Agent({ keepAlive: false, maxCachedSessions: 0 });
+
+    return new Promise<XapiResponse>((resolve, reject) => {
+      let settled = false;
+      const succeed = (response: XapiResponse) => {
+        if (settled) return;
+        settled = true;
+        agent.destroy();
+        resolve(response);
+      };
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        agent.destroy();
+        reject(error);
+      };
+      const request = https.request(
+        {
+          hostname: config.host,
+          port: config.port || 443,
+          path: '/jsonrpc',
+          method: 'POST',
+          agent,
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(postData),
+          },
+          rejectUnauthorized: true,
+          ...(customCa ? { ca: [...rootCertificates, customCa] } : {}),
+          checkServerIdentity: (hostname, certificate) => {
+            const hostnameError = checkTlsServerIdentity(hostname, certificate);
+            if (hostnameError) return hostnameError;
+            if (!expectedFingerprint) return undefined;
+            if (!certificate.raw) {
+              return new Error(
+                'XAPI server certificate fingerprint is unavailable'
+              );
+            }
+            const actualFingerprint = createHash('sha256')
+              .update(certificate.raw)
+              .digest('hex');
+            if (actualFingerprint !== expectedFingerprint) {
+              return new Error('XAPI server certificate fingerprint mismatch');
+            }
+            return undefined;
+          },
+        },
+        (response) => {
+          const status = response.statusCode ?? 0;
+          if (status < 200 || status >= 300) {
+            response.destroy();
+            fail(new Error(`XAPI request failed with HTTP status ${status}`));
+            return;
+          }
+
+          const chunks: Buffer[] = [];
+          let totalBytes = 0;
+          response.on('data', (chunk: Buffer | string) => {
+            const boundedChunk = Buffer.isBuffer(chunk)
+              ? chunk
+              : Buffer.from(chunk);
+            totalBytes += boundedChunk.length;
+            if (totalBytes > XAPI_MAX_RESPONSE_BYTES) {
+              response.destroy();
+              request.destroy();
+              fail(new Error('XAPI response exceeded the 1 MiB limit'));
+              return;
+            }
+            chunks.push(boundedChunk);
+          });
+          response.once('error', (error) => fail(error));
+          response.once('end', () => {
+            if (settled) return;
+            try {
+              succeed(
+                JSON.parse(
+                  Buffer.concat(chunks).toString('utf8')
+                ) as XapiResponse
+              );
+            } catch {
+              fail(new Error('XAPI returned invalid JSON'));
+            }
+          });
+        }
+      );
+
+      request.setTimeout(timeoutMs, () => {
+        request.destroy(new Error('XAPI request timed out'));
+      });
+      request.once('error', (error) => fail(error));
+      request.end(postData);
+    });
+  }
+
+  private validateXapiConfig(config: XenConfig): void {
+    if (!config.host) throw new Error('XAPI connection requires a host');
+    if (config.useSSL === false) {
+      throw new Error('XAPI requires HTTPS; --nossl is not permitted');
+    }
+    const timeoutMs = config.timeout ?? XAPI_DEFAULT_TIMEOUT_MS;
+    if (
+      !Number.isFinite(timeoutMs) ||
+      timeoutMs < XAPI_MIN_TIMEOUT_MS ||
+      timeoutMs > XAPI_MAX_TIMEOUT_MS
+    ) {
+      throw new Error(
+        'XAPI timeout must be between 1000 and 120000 milliseconds'
+      );
+    }
+    if (config.serverCertSha256) {
+      config.serverCertSha256 = this.normalizeServerCertSha256(
+        config.serverCertSha256
+      );
+    }
+  }
+
+  private normalizeServerCertSha256(value: string | undefined): string {
+    const normalized = value?.trim().toLowerCase() ?? '';
+    if (!/^sha256:[0-9a-f]{64}$/.test(normalized)) {
+      throw new Error(
+        'Xen server certificate fingerprint must use sha256:<64 hexadecimal characters>'
+      );
+    }
+    return normalized;
+  }
+
+  private parseConnectionType(
+    value: string | undefined
+  ): XenConfig['connectionType'] {
+    if (
+      value === 'xe' ||
+      value === 'xapi' ||
+      value === 'xl' ||
+      value === 'ssh'
+    ) {
+      return value;
+    }
+    throw new Error('Xen connection type must be xe, xapi, xl, or ssh');
   }
 
   private async executeSystemCommand(
