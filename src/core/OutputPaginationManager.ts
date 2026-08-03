@@ -98,6 +98,7 @@ export class OutputPaginationManager extends EventEmitter {
       },
       30 * 60 * 1000
     );
+    this.cleanupInterval.unref?.();
 
     this.logger.info('OutputPaginationManager initialized', {
       options: this.options,

@@ -300,6 +300,36 @@ describe('ConsoleManager', () => {
       mockProtocolFactory.createProtocol.mockResolvedValue(mockProtocol);
     });
 
+    it('should reserve capacity while a session is being created', async () => {
+      (consoleManager as any).maxSessions = 1;
+
+      let releaseCreation!: () => void;
+      const creationGate = new Promise<void>(resolve => {
+        releaseCreation = resolve;
+      });
+      (consoleManager as any).retryManager.executeWithRetry.mockImplementation(
+        async (operation: () => Promise<string>) => {
+          await creationGate;
+          return operation();
+        }
+      );
+
+      const sessionOptions: SessionOptions = {
+        command: '/bin/bash',
+        streaming: true,
+      };
+      const firstCreation = consoleManager.createSession(sessionOptions);
+
+      await expect(consoleManager.createSession(sessionOptions)).rejects.toThrow(
+        'Maximum session limit (1) reached'
+      );
+      expect((consoleManager as any).pendingSessionCreations.size).toBe(1);
+
+      releaseCreation();
+      await expect(firstCreation).resolves.toEqual(expect.any(String));
+      expect((consoleManager as any).pendingSessionCreations.size).toBe(0);
+    });
+
     it('should get all sessions', async () => {
       const sessionOptions: SessionOptions = {
         command: '/bin/bash',
@@ -572,6 +602,84 @@ describe('ConsoleManager', () => {
   });
 
   describe('Destruction', () => {
+    it('does not poll an unavailable interactive recovery service', async () => {
+      (consoleManager as any).stopInteractiveSessionMonitoring();
+      jest.useFakeTimers();
+
+      try {
+        (consoleManager as any).sessionRecovery = undefined;
+        (consoleManager as any).sessions.set('session-without-recovery', {
+          id: 'session-without-recovery',
+          status: 'running'
+        });
+
+        (consoleManager as any).startInteractiveSessionMonitoring();
+        await jest.advanceTimersByTimeAsync(15000);
+
+        expect((consoleManager as any).logger.error).not.toHaveBeenCalledWith(
+          'Error in proactive interactive session monitoring:',
+          expect.anything()
+        );
+      } finally {
+        (consoleManager as any).sessions.clear();
+        (consoleManager as any).stopInteractiveSessionMonitoring();
+        jest.useRealTimers();
+      }
+    });
+
+    it('deduplicates and clears interactive monitoring timers on destroy', async () => {
+      (consoleManager as any).stopInteractiveSessionMonitoring();
+      jest.useFakeTimers();
+
+      const sessionRecovery = {
+        shouldTriggerInteractiveRecovery: jest.fn<any>().mockReturnValue({
+          shouldTrigger: true,
+          urgency: 'medium',
+          reason: 'test-stall'
+        }),
+        updateInteractiveState: jest.fn<any>().mockResolvedValue(undefined),
+        recoverSession: jest.fn<any>().mockResolvedValue(undefined),
+        stop: jest.fn<any>().mockResolvedValue(undefined)
+      };
+
+      try {
+        (consoleManager as any).sessionRecovery = sessionRecovery;
+        (consoleManager as any).promptDetector = {
+          getBuffer: jest.fn<any>().mockReturnValue(null),
+          removeSession: jest.fn<any>()
+        };
+        (consoleManager as any).sessions.set('medium-recovery-session', {
+          id: 'medium-recovery-session',
+          status: 'running'
+        });
+
+        (consoleManager as any).startInteractiveSessionMonitoring();
+        const monitoringTimer = (consoleManager as any).interactiveSessionMonitor;
+        (consoleManager as any).startInteractiveSessionMonitoring();
+
+        expect((consoleManager as any).interactiveSessionMonitor).toBe(monitoringTimer);
+
+        await jest.advanceTimersByTimeAsync(15000);
+        expect(sessionRecovery.shouldTriggerInteractiveRecovery).toHaveBeenCalledTimes(1);
+        expect((consoleManager as any).mediumInteractiveRecoveryTimers.size).toBe(1);
+
+        (consoleManager as any).sessions.clear();
+        await consoleManager.destroy();
+
+        expect((consoleManager as any).interactiveSessionMonitor).toBeNull();
+        expect((consoleManager as any).networkPerformanceMonitor).toBeNull();
+        expect((consoleManager as any).resourceMonitor).toBeNull();
+        expect((consoleManager as any).mediumInteractiveRecoveryTimers.size).toBe(0);
+
+        await jest.advanceTimersByTimeAsync(30000);
+        expect(sessionRecovery.recoverSession).not.toHaveBeenCalled();
+      } finally {
+        (consoleManager as any).sessions.clear();
+        (consoleManager as any).stopInteractiveSessionMonitoring();
+        jest.useRealTimers();
+      }
+    });
+
     it('should destroy manager and all resources', async () => {
       const sessionOptions: SessionOptions = {
         command: '/bin/bash',

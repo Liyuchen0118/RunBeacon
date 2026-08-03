@@ -256,6 +256,12 @@ export class ConsoleManager extends EventEmitter {
   private maxBufferSize: number = 10000;
   private maxSessions: number = mcpConfig.maxSessions;
   private resourceMonitor: NodeJS.Timeout | null = null;
+  private networkPerformanceMonitor: NodeJS.Timeout | null = null;
+  private interactiveSessionMonitor: NodeJS.Timeout | null = null;
+  private mediumInteractiveRecoveryTimers: Map<string, NodeJS.Timeout> =
+    new Map();
+  private pendingSessionCreations: Set<string> = new Set();
+  private isDestroyed = false;
   private monitoringSystem: MonitoringSystem;
   private monitoringSystems: Map<string, MonitoringSystem>;
   private retryAttempts: Map<string, number>;
@@ -916,6 +922,7 @@ export class ConsoleManager extends EventEmitter {
     this.persistenceTimer = setInterval(() => {
       this.persistAllSessionData();
     }, this.continuityConfig.persistenceInterval);
+    this.persistenceTimer.unref?.();
 
     // Load any existing persistent data
     this.loadPersistedSessionData();
@@ -1013,6 +1020,7 @@ export class ConsoleManager extends EventEmitter {
       const timer = setInterval(() => {
         this.createSessionBookmark(sessionId, 'periodic');
       }, 60000); // Every minute
+      timer.unref?.();
 
       this.bookmarkTimers.set(sessionId, timer);
     }
@@ -4238,9 +4246,11 @@ export class ConsoleManager extends EventEmitter {
       // Re-initialize and start components
       this.initializeSelfHealingComponents();
       this.setupSelfHealingIntegration();
+      this.startInteractiveSessionMonitoring();
       this.logger.info('Self-healing enabled');
     } else if (!enabled && wasEnabled) {
       // Stop all health monitoring
+      this.stopInteractiveSessionMonitoring();
       this.healthMonitor?.stop();
       this.heartbeatMonitor?.stop();
       this.metricsCollector?.stop();
@@ -4625,34 +4635,72 @@ export class ConsoleManager extends EventEmitter {
   }
 
   async createSession(options: SessionOptions): Promise<string> {
-    if (this.sessions.size >= this.maxSessions) {
-      throw new Error(`Maximum session limit (${this.maxSessions}) reached`);
+    if (this.isDestroyed) {
+      throw new Error('ConsoleManager has been destroyed');
     }
 
     const sessionId = uuidv4();
+    if (
+      this.getActiveSessionCount() +
+        this.getUnrepresentedPendingSessionCount() >=
+      this.maxSessions
+    ) {
+      throw new Error(`Maximum session limit (${this.maxSessions}) reached`);
+    }
 
-    // Use retry logic for session creation
-    return await this.retryManager.executeWithRetry(
-      async () => {
-        return await this.createSessionInternal(sessionId, options, false);
-      },
-      {
-        sessionId,
-        operationName: 'create_session',
-        strategyName: options.command?.toLowerCase().includes('ssh')
-          ? 'ssh'
-          : 'generic',
-        context: { command: options.command, args: options.args },
-        onRetry: (context) => {
-          this.logger.info(
-            `Retrying session creation for ${sessionId} (attempt ${context.attemptNumber})`
-          );
+    this.pendingSessionCreations.add(sessionId);
 
-          // Clean up any partial session state before retry
-          this.cleanupPartialSession(sessionId);
+    try {
+      // Use retry logic for session creation
+      return await this.retryManager.executeWithRetry(
+        async () => {
+          return await this.createSessionInternal(sessionId, options, false);
         },
+        {
+          sessionId,
+          operationName: 'create_session',
+          strategyName: options.command?.toLowerCase().includes('ssh')
+            ? 'ssh'
+            : 'generic',
+          context: { command: options.command, args: options.args },
+          onRetry: (context) => {
+            this.logger.info(
+              `Retrying session creation for ${sessionId} (attempt ${context.attemptNumber})`
+            );
+
+            // Clean up any partial session state before retry
+            this.cleanupPartialSession(sessionId);
+          },
+        }
+      );
+    } finally {
+      this.pendingSessionCreations.delete(sessionId);
+    }
+  }
+
+  private getUnrepresentedPendingSessionCount(): number {
+    let pendingSessions = 0;
+    for (const sessionId of this.pendingSessionCreations) {
+      if (!this.sessions.has(sessionId)) {
+        pendingSessions++;
       }
-    );
+    }
+    return pendingSessions;
+  }
+
+  private getActiveSessionCount(): number {
+    let activeSessions = 0;
+    for (const session of this.sessions.values()) {
+      if (
+        session.status === 'running' ||
+        session.status === 'initializing' ||
+        session.status === 'recovering' ||
+        session.status === 'paused'
+      ) {
+        activeSessions++;
+      }
+    }
+    return activeSessions;
   }
 
   private async createSessionInternal(
@@ -7714,10 +7762,18 @@ export class ConsoleManager extends EventEmitter {
    * Start periodic network performance monitoring
    */
   private startNetworkPerformanceMonitoring(): void {
+    if (this.isDestroyed || this.networkPerformanceMonitor) {
+      return;
+    }
+
     // Monitor all known hosts every 5 minutes
     const monitoringInterval = 5 * 60 * 1000; // 5 minutes
 
-    setInterval(async () => {
+    this.networkPerformanceMonitor = setInterval(async () => {
+      if (this.isDestroyed) {
+        return;
+      }
+
       const hosts = Array.from(
         new Set([
           ...Array.from(this.networkMetrics.keys()),
@@ -7740,6 +7796,7 @@ export class ConsoleManager extends EventEmitter {
       // Clean up old metrics (older than 24 hours)
       this.cleanupOldNetworkMetrics();
     }, monitoringInterval);
+    this.networkPerformanceMonitor.unref?.();
 
     this.logger.info('Started network performance monitoring');
   }
@@ -9416,7 +9473,15 @@ export class ConsoleManager extends EventEmitter {
   }
 
   private startResourceMonitor() {
+    if (this.isDestroyed || this.resourceMonitor) {
+      return;
+    }
+
     this.resourceMonitor = setInterval(() => {
+      if (this.isDestroyed) {
+        return;
+      }
+
       const usage = this.getResourceUsage();
 
       // Clean up stopped sessions older than 5 minutes
@@ -9447,10 +9512,12 @@ export class ConsoleManager extends EventEmitter {
         this.logger.warn(`High memory usage: ${usage.memoryMB}MB`);
       }
     }, 30000); // Check every 30 seconds
+    this.resourceMonitor.unref?.();
   }
 
   private cleanupSession(sessionId: string) {
     const session = this.sessions.get(sessionId);
+    this.cancelMediumInteractiveRecovery(sessionId);
 
     // Record cleanup start
     this.diagnosticsManager.recordEvent({
@@ -10577,10 +10644,25 @@ export class ConsoleManager extends EventEmitter {
   }
 
   async destroy() {
+    if (this.isDestroyed) {
+      return;
+    }
+    this.isDestroyed = true;
+
+    this.stopInteractiveSessionMonitoring();
+
     if (this.resourceMonitor) {
       clearInterval(this.resourceMonitor);
+      this.resourceMonitor = null;
+    }
+    if (this.networkPerformanceMonitor) {
+      clearInterval(this.networkPerformanceMonitor);
+      this.networkPerformanceMonitor = null;
     }
     await this.stopAllSessions();
+
+    this.azureMonitoring?.stop?.();
+    this.paginationManager?.destroy?.();
 
     // Close all SSH connections in the pool
     this.sshConnectionPool.forEach((client, key) => {
@@ -11080,13 +11162,36 @@ export class ConsoleManager extends EventEmitter {
    * Start proactive interactive session monitoring
    */
   private startInteractiveSessionMonitoring(): void {
+    if (this.isDestroyed || this.interactiveSessionMonitor) {
+      return;
+    }
+
     // Monitor every 15 seconds for interactive prompt issues
-    const monitoringInterval = setInterval(async () => {
+    this.interactiveSessionMonitor = setInterval(async () => {
+      if (this.isDestroyed) {
+        return;
+      }
+
+      const sessionRecovery = this.sessionRecovery;
+      if (
+        !sessionRecovery ||
+        typeof sessionRecovery.shouldTriggerInteractiveRecovery !==
+          'function' ||
+        typeof sessionRecovery.updateInteractiveState !== 'function' ||
+        typeof sessionRecovery.recoverSession !== 'function'
+      ) {
+        return;
+      }
+
       try {
-        for (const [sessionId, session] of this.sessions) {
+        for (const [sessionId] of this.sessions) {
+          if (this.isDestroyed) {
+            return;
+          }
+
           // Check if session needs interactive prompt recovery
           const shouldTrigger =
-            this.sessionRecovery.shouldTriggerInteractiveRecovery(sessionId);
+            sessionRecovery.shouldTriggerInteractiveRecovery(sessionId);
 
           if (shouldTrigger.shouldTrigger) {
             this.logger.info(
@@ -11098,7 +11203,7 @@ export class ConsoleManager extends EventEmitter {
             const pendingCommands =
               commandQueue?.commands.map((cmd) => cmd.input) || [];
 
-            await this.sessionRecovery.updateInteractiveState(sessionId, {
+            await sessionRecovery.updateInteractiveState(sessionId, {
               isInteractive: true,
               sessionUnresponsive: shouldTrigger.urgency === 'high',
               pendingCommands,
@@ -11108,24 +11213,18 @@ export class ConsoleManager extends EventEmitter {
             // Trigger appropriate recovery based on urgency
             if (shouldTrigger.urgency === 'high') {
               // Immediate recovery for high urgency issues
-              await this.sessionRecovery.recoverSession(
+              if (this.isDestroyed) {
+                return;
+              }
+              await sessionRecovery.recoverSession(
                 sessionId,
                 `proactive-high-${shouldTrigger.reason}`
               );
             } else if (shouldTrigger.urgency === 'medium') {
-              // Schedule recovery for medium urgency issues
-              setTimeout(async () => {
-                const recheck =
-                  this.sessionRecovery.shouldTriggerInteractiveRecovery(
-                    sessionId
-                  );
-                if (recheck.shouldTrigger) {
-                  await this.sessionRecovery.recoverSession(
-                    sessionId,
-                    `proactive-medium-${shouldTrigger.reason}`
-                  );
-                }
-              }, 30000); // Wait 30 seconds before medium priority recovery
+              this.scheduleMediumInteractiveRecovery(
+                sessionId,
+                shouldTrigger.reason
+              );
             }
           }
 
@@ -11137,7 +11236,7 @@ export class ConsoleManager extends EventEmitter {
               promptResult
             );
             if (hasPrompt?.detected) {
-              await this.sessionRecovery.updateInteractiveState(sessionId, {
+              await sessionRecovery.updateInteractiveState(sessionId, {
                 lastPromptDetected: new Date(),
                 promptType: hasPrompt.pattern?.name,
               });
@@ -11145,19 +11244,89 @@ export class ConsoleManager extends EventEmitter {
           }
         }
       } catch (error) {
-        this.logger.error(
-          'Error in proactive interactive session monitoring:',
-          error
-        );
+        if (!this.isDestroyed) {
+          this.logger.error(
+            'Error in proactive interactive session monitoring:',
+            error
+          );
+        }
       }
     }, 15000); // Run every 15 seconds
-
-    // Store interval for cleanup
-    if (!this.resourceMonitor) {
-      this.resourceMonitor = monitoringInterval;
-    }
+    this.interactiveSessionMonitor.unref?.();
 
     this.logger.info('Started proactive interactive session monitoring');
+  }
+
+  private scheduleMediumInteractiveRecovery(
+    sessionId: string,
+    reason: string
+  ): void {
+    if (
+      this.isDestroyed ||
+      this.mediumInteractiveRecoveryTimers.has(sessionId)
+    ) {
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      this.mediumInteractiveRecoveryTimers.delete(sessionId);
+
+      if (this.isDestroyed || !this.sessions.has(sessionId)) {
+        return;
+      }
+
+      const sessionRecovery = this.sessionRecovery;
+      if (
+        !sessionRecovery ||
+        typeof sessionRecovery.shouldTriggerInteractiveRecovery !==
+          'function' ||
+        typeof sessionRecovery.recoverSession !== 'function'
+      ) {
+        return;
+      }
+
+      try {
+        const recheck =
+          sessionRecovery.shouldTriggerInteractiveRecovery(sessionId);
+        if (recheck.shouldTrigger && !this.isDestroyed) {
+          await sessionRecovery.recoverSession(
+            sessionId,
+            `proactive-medium-${reason}`
+          );
+        }
+      } catch (error) {
+        if (!this.isDestroyed) {
+          this.logger.error(
+            `Error in delayed interactive recovery for session ${sessionId}:`,
+            error
+          );
+        }
+      }
+    }, 30000);
+    timer.unref?.();
+    this.mediumInteractiveRecoveryTimers.set(sessionId, timer);
+  }
+
+  private cancelMediumInteractiveRecovery(sessionId: string): void {
+    const timer = this.mediumInteractiveRecoveryTimers.get(sessionId);
+    if (!timer) {
+      return;
+    }
+
+    clearTimeout(timer);
+    this.mediumInteractiveRecoveryTimers.delete(sessionId);
+  }
+
+  private stopInteractiveSessionMonitoring(): void {
+    if (this.interactiveSessionMonitor) {
+      clearInterval(this.interactiveSessionMonitor);
+      this.interactiveSessionMonitor = null;
+    }
+
+    for (const timer of this.mediumInteractiveRecoveryTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.mediumInteractiveRecoveryTimers.clear();
   }
 
   /**
