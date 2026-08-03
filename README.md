@@ -44,7 +44,7 @@ sequenceDiagram
   U->>M: job_list (direct MCP calls)
   M->>D: snapshots
   D-->>M: terminal result
-  M-->>C: tool result; continue next step
+  M-->>C: tool result and continue next step
 ```
 
 The dashboard still refreshes locally every 1.5 seconds, but those calls run between the MCP App and the MCP server. They do not invoke the model and do not spend model tokens. The model-facing path is event-driven.
