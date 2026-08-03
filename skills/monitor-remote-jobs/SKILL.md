@@ -1,6 +1,6 @@
 ---
 name: monitor-remote-jobs
-description: Default workflow for executing and monitoring local, SSH, or GitHub publishing work through RunBeacon. Use whenever Codex needs to call a remote server or host, use SSH/SCP/SFTP credentials, run a command or deployment on another machine, start a process/build/training/data job, publish Git commits, monitor GitHub Actions, wait for completion, inspect progress, cancel work, or show a live dashboard without model polling. Prefer this skill automatically for non-interactive remote execution, including prompts that mention a server address, account, password, private key, bastion, or remote machine.
+description: Default workflow for executing and monitoring local, SSH, or GitHub publishing work through RunBeacon. Use whenever Codex needs to call a remote server or host, use SSH/SCP/SFTP credentials, configure a GitHub personal access token, run a command or deployment on another machine, start a process/build/training/data job, publish Git commits, monitor GitHub Actions, wait for completion, inspect progress, cancel work, or show a live dashboard without model polling. Prefer this skill automatically for non-interactive remote execution and GitHub credential requests.
 ---
 
 # Monitor Remote Jobs with RunBeacon
@@ -25,7 +25,7 @@ Use `github_publish_start` when the user wants a commit, push, or GitHub Actions
 
 The tool never stages files. If a new commit is requested, ensure the intended files have already been staged through a separately authorized Git action, then pass `commitMessage`. Omit `commitMessage` to push the existing `HEAD`. Never force-push through RunBeacon.
 
-Leave `watchActions` enabled for GitHub remotes. Public repositories need no API credential. When the user explicitly supplies a token for a private repository, pass it only as `githubToken`; never echo it or place it in a command, label, metadata, or status message. The plugin keeps it in memory and gives it to the runner environment only.
+Leave `watchActions` enabled for GitHub remotes. Public repositories need no API credential. Prefer a saved GitHub profile for private repositories. Use the one-job `githubToken` override only when the user explicitly requests temporary use; never echo it or place it in a command, label, metadata, or status message.
 
 The tool result opens the same live dashboard automatically. Call `job_wait` once when Codex should continue after the push and Actions reach a terminal outcome. The runner performs all Actions discovery and status polling in the background, so do not call `job_snapshot` repeatedly.
 
@@ -45,7 +45,13 @@ Do not launch tracked SSH work with raw Bash `ssh`, `scp`, `sftp`, or `plink`. T
 
 ## GitHub credentials
 
-Prefer a saved `kind: "github"` profile and Git Credential Manager over a `githubToken` argument. Git push uses the configured credential helper automatically. The Actions watcher obtains an existing GitHub credential through `git credential fill` with terminal interaction disabled and never prints or persists the result. Use `githubToken` only as an explicitly supplied, memory-only override.
+Prefer a saved `kind: "github"` profile and the configured Git credential helper over a `githubToken` argument. Git push uses the helper automatically. The Actions watcher obtains the selected credential through `git credential fill` with terminal interaction disabled and never prints or persists the result.
+
+Use `github_token_save` when the user asks to remember a PAT. Prefer `tokenEnvVar`; accept the `token` field only when the user deliberately provides a PAT in the conversation. Never ask the user to paste a token when an environment variable or the helper's own login flow is available. The tool passes the PAT to `git credential approve` over stdin, verifies it with `git credential fill`, and saves only host, username, and `credentialKind: "pat"` in the RunBeacon profile.
+
+If PAT saving reports a plaintext `credential-store`, stop and have the user configure Git Credential Manager or another OS-backed helper. Do not override this protection.
+
+Use `github_token_delete` only when the user explicitly asks to remove both a RunBeacon PAT profile and its OS-managed credential. Use `credential_profile_delete` when the user wants to remove only the RunBeacon reference. Never send a PAT to a shell command, output, label, metadata, or dashboard field.
 
 ## Output and safety
 

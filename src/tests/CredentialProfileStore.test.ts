@@ -32,6 +32,8 @@ describe('CredentialProfileStore', () => {
       kind: 'github',
       host: 'github.com',
       credentialSource: 'git',
+      username: 'octocat',
+      credentialKind: 'pat',
     });
 
     expect(ssh.kind).toBe('ssh');
@@ -39,6 +41,9 @@ describe('CredentialProfileStore', () => {
     expect(store.findSsh('SERVER.EXAMPLE.COM', 'deploy')).toHaveLength(1);
     expect(new CredentialProfileStore(profilePath).list()).toHaveLength(2);
     expect(readFileSync(profilePath, 'utf8')).toContain('"agent": "auto"');
+    expect(readFileSync(profilePath, 'utf8')).toContain(
+      '"credentialKind": "pat"'
+    );
     expect(readFileSync(profilePath, 'utf8')).not.toMatch(
       /password|passphrase|token|privateKey"/i
     );
@@ -59,6 +64,17 @@ describe('CredentialProfileStore', () => {
         password: marker,
       } as never)
     ).toThrow(/never store password/);
+    expect(store.list()).toEqual([]);
+
+    expect(() =>
+      store.save({
+        id: 'unsafe-github',
+        kind: 'github',
+        host: 'github.com',
+        credentialSource: 'git',
+        token: marker,
+      } as never)
+    ).toThrow(/never store token/);
     expect(store.list()).toEqual([]);
   });
 

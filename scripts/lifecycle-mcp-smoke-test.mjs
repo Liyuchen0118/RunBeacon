@@ -34,7 +34,7 @@ const transport = new StdioClientTransport({
 try {
   await client.connect(transport);
   assert.equal(client.getServerVersion()?.name, 'remote-job-monitor');
-  assert.equal(client.getServerVersion()?.version, '0.3.0');
+  assert.equal(client.getServerVersion()?.version, '0.4.0');
 
   const { tools } = await client.listTools();
   const toolNames = new Set(tools.map((tool) => tool.name));
@@ -49,6 +49,8 @@ try {
     'credential_profile_save',
     'credential_profile_list',
     'credential_profile_delete',
+    'github_token_save',
+    'github_token_delete',
   ]) {
     assert.ok(toolNames.has(name), `Missing tool: ${name}`);
   }
@@ -94,12 +96,23 @@ try {
   });
   assert.equal(rejectedProfile.isError, true);
 
+  const rejectedTokenImport = await client.callTool({
+    name: 'github_token_save',
+    arguments: {
+      id: 'missing-token',
+      username: 'runbeacon-smoke',
+      tokenEnvVar: 'RUNBEACON_MISSING_GITHUB_TOKEN_7416',
+    },
+  });
+  assert.equal(rejectedTokenImport.isError, true);
+
   for (const profile of [
     {
       id: 'github-main',
       kind: 'github',
       host: 'github.com',
       credentialSource: 'git',
+      username: 'runbeacon-smoke',
     },
     {
       id: 'ssh-smoke',

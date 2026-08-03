@@ -1,7 +1,7 @@
 interface:
   display_name: "RunBeacon Remote Jobs"
-  short_description: "Default tracked routing for SSH and remote jobs"
-  default_prompt: "Use $monitor-remote-jobs to run this command on the remote server and continue when it finishes."
+  short_description: "Tracked routing for SSH, GitHub, and remote jobs"
+  default_prompt: "Use $monitor-remote-jobs to configure safe credentials and run this remote or GitHub job through RunBeacon."
 
 policy:
   allow_implicit_invocation: true

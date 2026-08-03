@@ -22,6 +22,10 @@ import {
   SshCredentialProfile,
 } from '../lifecycle/CredentialProfileStore.js';
 import {
+  deleteGitHubTokenCredential,
+  saveGitHubTokenCredential,
+} from '../lifecycle/GitCredentialManager.js';
+import {
   createDashboardHtml,
   DASHBOARD_RESOURCE_URI,
   MCP_APP_MIME_TYPE,
@@ -186,6 +190,75 @@ const tools: Tool[] = [
     },
     annotations: {
       title: 'Delete Credential Profile',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'github_token_save',
+    description:
+      'Store a GitHub personal access token in the configured Git credential helper and create a safe RunBeacon profile reference. Prefer tokenEnvVar so the token never appears in conversation; use token only when the user explicitly provides it. The token is never written to RunBeacon profiles, jobs, dashboard state, or logs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'string',
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$',
+          description: 'Reusable GitHub credential profile name.',
+        },
+        host: {
+          type: 'string',
+          enum: ['github.com'],
+          default: 'github.com',
+        },
+        username: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 128,
+          description: 'GitHub account name associated with the token.',
+        },
+        tokenEnvVar: {
+          type: 'string',
+          pattern: '^[A-Za-z_][A-Za-z0-9_]{0,127}$',
+          description:
+            'Preferred: read the token from this MCP server environment variable.',
+        },
+        token: {
+          type: 'string',
+          minLength: 20,
+          maxLength: 2000,
+          description:
+            'Explicit memory-only token input. Use only when the user deliberately supplies a PAT in this conversation.',
+        },
+      },
+      required: ['id', 'username'],
+    },
+    annotations: {
+      title: 'Save GitHub Token',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'github_token_delete',
+    description:
+      'Delete a GitHub PAT created through github_token_save from the configured Git credential helper and remove its RunBeacon profile reference. This cannot delete generic OAuth/login profiles.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'string',
+          description: 'RunBeacon GitHub PAT profile to delete.',
+        },
+      },
+      required: ['id'],
+    },
+    annotations: {
+      title: 'Delete GitHub Token',
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: false,
@@ -518,6 +591,54 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           `Deleted RunBeacon profile ${profile.id}; OS-managed credentials and key files were not changed.`
         );
       }
+      case 'github_token_save': {
+        const id = String(args.id ?? '').trim();
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id)) {
+          throw new Error(
+            'Credential profile id must contain 1 to 64 letters, numbers, dots, underscores, or hyphens'
+          );
+        }
+        const existing = credentialProfiles
+          .list()
+          .find((profile) => profile.id === id);
+        if (existing && existing.kind !== 'github') {
+          throw new Error(`Credential profile ${id} is not a GitHub profile`);
+        }
+        const username = requiredString(args.username, 'username', 128);
+        const token = resolveGitHubTokenInput(args);
+        delete args.token;
+        await saveGitHubTokenCredential({
+          host: 'github.com',
+          username,
+          token,
+        });
+        const profile = credentialProfiles.save({
+          id,
+          kind: 'github',
+          host: 'github.com',
+          credentialSource: 'git',
+          username,
+          credentialKind: 'pat',
+        });
+        return reply(
+          { profile, credentialStored: true },
+          `Saved GitHub PAT profile ${profile.id} in the configured Git credential helper. RunBeacon stored only the safe profile reference.`
+        );
+      }
+      case 'github_token_delete': {
+        const profile = requireGitHubProfile(String(args.id ?? ''));
+        if (profile.credentialKind !== 'pat' || !profile.username) {
+          throw new Error(
+            `Credential profile ${profile.id} is not a PAT managed by RunBeacon`
+          );
+        }
+        await deleteGitHubTokenCredential(profile.host, profile.username);
+        credentialProfiles.delete(profile.id);
+        return reply(
+          { profileId: profile.id, credentialDeleted: true },
+          `Deleted GitHub PAT profile ${profile.id} from the configured Git credential helper and RunBeacon.`
+        );
+      }
       case 'github_publish_start': {
         const cwd = String(args.cwd ?? '').trim();
         if (!cwd) throw new Error('cwd is required');
@@ -576,7 +697,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
                     ? { RUNBEACON_GITHUB_TOKEN: githubToken }
                     : {}),
                   ...(credentialProfile
-                    ? { RUNBEACON_GITHUB_CREDENTIAL_SOURCE: 'git' }
+                    ? {
+                        RUNBEACON_GITHUB_CREDENTIAL_SOURCE: 'git',
+                        ...(credentialProfile.username
+                          ? {
+                              RUNBEACON_GITHUB_USERNAME:
+                                credentialProfile.username,
+                            }
+                          : {}),
+                      }
                     : {}),
                 }
               : undefined,
@@ -643,6 +772,35 @@ function optionalString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return trimmed || undefined;
+}
+
+function requiredString(value: unknown, name: string, limit: number): string {
+  const normalized = optionalString(value);
+  if (!normalized || normalized.length > limit || /[\r\n\0]/.test(normalized)) {
+    throw new Error(
+      `${name} is required and must not exceed ${limit} characters`
+    );
+  }
+  return normalized;
+}
+
+function resolveGitHubTokenInput(args: Record<string, any>): string {
+  const inlineToken = optionalString(args.token);
+  const environmentName = optionalString(args.tokenEnvVar);
+  if (Boolean(inlineToken) === Boolean(environmentName)) {
+    throw new Error('Provide exactly one of tokenEnvVar or token');
+  }
+  if (inlineToken) return inlineToken;
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(environmentName ?? '')) {
+    throw new Error('tokenEnvVar must be a valid environment variable name');
+  }
+  const token = process.env[environmentName!]?.trim();
+  if (!token) {
+    throw new Error(
+      `GitHub token environment variable ${environmentName} is not available to the MCP server`
+    );
+  }
+  return token;
 }
 
 function numericArgument(value: unknown, fallback: number): number {

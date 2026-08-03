@@ -123,7 +123,9 @@ async function watchActions(
 ): Promise<void> {
   const token =
     process.env.RUNBEACON_GITHUB_TOKEN?.trim() ||
-    (await resolveGitHubTokenFromCredentialManager());
+    (await resolveGitHubTokenFromCredentialManager(
+      process.env.RUNBEACON_GITHUB_USERNAME?.trim()
+    ));
   const pollIntervalMs = token
     ? Math.max(10_000, input.pollIntervalMs)
     : Math.max(60_000, input.pollIntervalMs);
@@ -148,7 +150,7 @@ async function watchActions(
   }
 
   const deadline = Date.now() + input.actionsTimeoutMs;
-  while (true) {
+  for (;;) {
     const summary = runs
       .map(
         (run) =>
@@ -213,9 +215,9 @@ async function fetchWorkflowRuns(
   return (body.workflow_runs ?? []).filter((run) => run.head_sha === sha);
 }
 
-async function resolveGitHubTokenFromCredentialManager(): Promise<
-  string | undefined
-> {
+async function resolveGitHubTokenFromCredentialManager(
+  username?: string
+): Promise<string | undefined> {
   if (process.env.RUNBEACON_GITHUB_CREDENTIAL_SOURCE === 'none') {
     return undefined;
   }
@@ -251,7 +253,15 @@ async function resolveGitHubTokenFromCredentialManager(): Promise<
       if (code !== 0) finish();
       else finish(parseGitCredentialOutput(stdout).password?.trim());
     });
-    child.stdin.end('protocol=https\nhost=github.com\n\n');
+    child.stdin.end(
+      [
+        'protocol=https',
+        'host=github.com',
+        ...(username ? [`username=${username}`] : []),
+        '',
+        '',
+      ].join('\n')
+    );
   });
 }
 

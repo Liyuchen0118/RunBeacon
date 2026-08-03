@@ -30,6 +30,8 @@ export interface GitHubCredentialProfile extends CredentialProfileBase {
   kind: 'github';
   host: 'github.com';
   credentialSource: 'git';
+  username?: string;
+  credentialKind?: 'credential-helper' | 'pat';
 }
 
 export type CredentialProfile = SshCredentialProfile | GitHubCredentialProfile;
@@ -141,7 +143,17 @@ function normalizeProfile(
         'GitHub credential profiles currently support github.com'
       );
     }
-    return { id, kind: 'github', host, credentialSource: 'git' };
+    const username = normalizeOptional(input.username, 128);
+    const credentialKind =
+      input.credentialKind === 'pat' ? 'pat' : 'credential-helper';
+    return {
+      id,
+      kind: 'github',
+      host,
+      credentialSource: 'git',
+      username,
+      credentialKind,
+    };
   }
 
   const host = normalizeRequired(input.host, 'host', 253);

@@ -28,6 +28,7 @@ flowchart LR
 - `src/lifecycle/DashboardApp.ts`: portable MCP Apps HTML resource.
 - `src/daemon/github-publish-runner.ts`: staged-commit, non-force push, and background GitHub Actions monitoring.
 - `src/lifecycle/GitHubPublish.ts`: GitHub remote parsing and failure classification.
+- `src/lifecycle/GitCredentialManager.ts`: PAT save, verification, and deletion through the configured Git credential helper.
 - `src/lifecycle/CredentialProfileStore.ts`: owner-only, secret-free SSH/GitHub connection references.
 - `hooks/route-ssh.cjs`: prevents Codex Bash from bypassing tracking.
 - `hooks/route-remote-prompt.cjs`: detects operational remote prompts and injects RunBeacon as the default execution route.
@@ -93,7 +94,7 @@ The local daemon RPC uses a random token stored with owner-only permissions unde
 
 Passwordless profiles are stored separately as `credential-profiles.json` with owner-only permissions. SSH profiles contain only host, port, username, an agent socket/pipe or private-key path, and host-key verification policy. A profile never accepts passwords, passphrases, tokens, authorization headers, or private-key contents. `job_start` can select a profile explicitly or uniquely match one by host and username.
 
-GitHub profiles point to the standard Git credential helper rather than duplicating its secret store. Pushes use Git normally. The Actions runner invokes `git credential fill` with terminal interaction disabled, keeps the returned password/token only in memory, suppresses both helper output streams, and falls back to anonymous API access when no credential is available.
+GitHub profiles point to the standard Git credential helper rather than duplicating its secret store. `github_token_save` accepts an environment-variable import or an explicitly supplied PAT, sends it to `git credential approve` over stdin, verifies it with `git credential fill`, and persists only the profile id, host, username, and credential kind. `github_token_delete` is limited to PAT profiles created through this path. Pushes use Git normally. The Actions runner invokes `git credential fill` with terminal interaction disabled, keeps the returned password/token only in memory, suppresses both helper output streams, and falls back to anonymous API access when no credential is available.
 
 An optional `githubToken` is sent through daemon RPC and the child environment only. It is not placed in runner arguments, labels, metadata, output, or `jobs.json`. Public repositories do not require a token. Git credential discovery for the push is delegated to Git with terminal prompting disabled, so a missing credential fails visibly instead of hanging an unattended job.
 
@@ -111,7 +112,7 @@ If the daemon process itself crashes or the machine reboots, local child process
 2. Add remote durable execution adapters (systemd-run, tmux, Slurm, Kubernetes Job) that return a stable remote job identifier.
 3. Add callback/webhook completion for remote schedulers; use adaptive daemon-side polling only when the remote system exposes no event channel.
 4. Add SSH known_hosts parsing so pinned fingerprints are not the only strict-verification option.
-5. Add encrypted credential-profile integration with the OS keychain; never add plaintext secret profiles.
+5. Add GitHub Enterprise and non-Git credential-helper keychain backends; never add plaintext secret profiles.
 6. Add audit log retention, output redaction policies, and per-host command policy.
 7. Add job dependencies and completion actions so multi-step workflows can run entirely inside the daemon when no model reasoning is needed between steps.
 
