@@ -1,5 +1,10 @@
-import { Socket, createConnection } from 'net';
-import { createSecureContext, TLSSocket, connect as tlsConnect } from 'tls';
+import { Socket, createConnection, isIP } from 'net';
+import {
+  checkServerIdentity,
+  createSecureContext,
+  TLSSocket,
+  connect as tlsConnect,
+} from 'tls';
 import * as crypto from 'crypto';
 import * as zlib from 'zlib';
 import * as fs from 'fs';
@@ -235,6 +240,7 @@ export class VNCProtocol extends BaseProtocol {
   // TLS/Encryption state
   private tlsSocket?: TLSSocket;
   private encryptionEnabled: boolean = false;
+  private tlsVerified: boolean = false;
 
   // Recording state
   private recordingStream?: fs.WriteStream;
@@ -250,6 +256,12 @@ export class VNCProtocol extends BaseProtocol {
 
   constructor(options?: VNCConnectionOptions) {
     super('VNCProtocol');
+
+    if (
+      (options?.tlsOptions?.rejectUnauthorized as boolean | undefined) === false
+    ) {
+      throw new Error('VNC TLS certificate validation cannot be disabled');
+    }
 
     this.defaultOptions = { ...this.getDefaultOptions(), ...(options || {}) };
 
@@ -366,7 +378,7 @@ export class VNCProtocol extends BaseProtocol {
       enableRichCursor: true,
       recordSession: false,
       recordingFormat: 'fbs',
-      securityTypes: ['vencrypt', 'tls', 'vnc', 'none'],
+      securityTypes: ['vencrypt', 'tls', 'none'],
       allowInsecure: false,
       enableFastPath: true,
       bufferSize: 65536,
@@ -397,7 +409,7 @@ export class VNCProtocol extends BaseProtocol {
         bigEndianFlag: false,
         trueColorFlag: true,
       },
-      allowedSecurityTypes: ['vencrypt', 'tls', 'vnc'],
+      allowedSecurityTypes: ['vencrypt', 'tls'],
       requireEncryption: false,
       enableCompression: true,
       compressionLevel: 6,
@@ -477,6 +489,12 @@ export class VNCProtocol extends BaseProtocol {
    */
   public async connect(): Promise<VNCSession> {
     try {
+      if (
+        (this.options.tlsOptions?.rejectUnauthorized as boolean | undefined) ===
+        false
+      ) {
+        throw new Error('VNC TLS certificate validation cannot be disabled');
+      }
       this.logger.info(
         `Connecting to VNC server at ${this.options.host}:${this.options.port}`
       );
@@ -841,12 +859,13 @@ export class VNCProtocol extends BaseProtocol {
   }
 
   private selectPreferredSecurity(): number {
-    const preferenceOrder = [
-      RFB_SECURITY_TYPES.VENCRYPT,
-      RFB_SECURITY_TYPES.TLS,
-      RFB_SECURITY_TYPES.VNC_AUTH,
-      RFB_SECURITY_TYPES.NONE,
-    ];
+    const preferenceOrder = this.isVerifiedTlsChannel()
+      ? [RFB_SECURITY_TYPES.VNC_AUTH, RFB_SECURITY_TYPES.NONE]
+      : [
+          RFB_SECURITY_TYPES.VENCRYPT,
+          RFB_SECURITY_TYPES.TLS,
+          RFB_SECURITY_TYPES.NONE,
+        ];
 
     for (const preferred of preferenceOrder) {
       if (this.securityTypes.includes(preferred)) {
@@ -894,6 +913,7 @@ export class VNCProtocol extends BaseProtocol {
   }
 
   private async authenticateVNC(): Promise<void> {
+    this.assertVerifiedTlsForVncAuth();
     if (!this.options.password) {
       throw new Error('VNC authentication requires a password');
     }
@@ -924,6 +944,7 @@ export class VNCProtocol extends BaseProtocol {
   }
 
   private vncAuthChallenge(challenge: Buffer, password: string): Buffer {
+    this.assertVerifiedTlsForVncAuth();
     // VNC uses DES encryption with the password as key
     const key = Buffer.alloc(8);
     const passwordBytes = Buffer.from(password.slice(0, 8), 'binary');
@@ -938,7 +959,16 @@ export class VNCProtocol extends BaseProtocol {
       key[i] = byte;
     }
 
-    const cipher = crypto.createCipheriv('des-ecb', key, null);
+    // RFB requires single DES for the challenge. EDE3 with the same key three
+    // times is mathematically equivalent to single DES and remains available
+    // on supported Node/OpenSSL builds. This helper is guarded so it can only
+    // run after certificate and hostname verification have succeeded.
+    const equivalentTripleDesKey = Buffer.concat([key, key, key]);
+    const cipher = crypto.createCipheriv(
+      'des-ede3',
+      equivalentTripleDesKey,
+      null
+    );
     cipher.setAutoPadding(false);
 
     return Buffer.concat([cipher.update(challenge), cipher.final()]);
@@ -1021,7 +1051,6 @@ export class VNCProtocol extends BaseProtocol {
       VENCRYPT_SUBTYPES.X509_PLAIN,
       VENCRYPT_SUBTYPES.TLS_VNC,
       VENCRYPT_SUBTYPES.TLS_PLAIN,
-      VENCRYPT_SUBTYPES.PLAIN,
     ];
 
     for (const preferred of preferenceOrder) {
@@ -1048,8 +1077,7 @@ export class VNCProtocol extends BaseProtocol {
         await this.authenticatePlain();
         break;
       case VENCRYPT_SUBTYPES.PLAIN:
-        await this.authenticatePlain();
-        break;
+        throw new Error('VeNCrypt PLAIN authentication is not permitted');
       default:
         throw new Error(`Unsupported VeNCrypt subtype: ${subtype}`);
     }
@@ -1057,9 +1085,22 @@ export class VNCProtocol extends BaseProtocol {
 
   private async upgradToTLS(): Promise<void> {
     return new Promise((resolve, reject) => {
+      if (
+        (this.options.tlsOptions?.rejectUnauthorized as boolean | undefined) ===
+        false
+      ) {
+        reject(new Error('VNC TLS certificate validation cannot be disabled'));
+        return;
+      }
+      this.tlsVerified = false;
+      this.encryptionEnabled = false;
+      const host = String(this.options.host || 'localhost');
       const tlsOptions: any = {
         socket: this.socket,
-        rejectUnauthorized: this.options.tlsOptions?.rejectUnauthorized ?? true,
+        rejectUnauthorized: true,
+        ...(isIP(host) === 0 ? { servername: host } : {}),
+        checkServerIdentity: (_hostname: string, certificate: any) =>
+          checkServerIdentity(host, certificate),
       };
 
       if (this.options.tlsOptions?.certificates) {
@@ -1072,14 +1113,23 @@ export class VNCProtocol extends BaseProtocol {
 
       this.tlsSocket = tlsConnect(tlsOptions);
       this.socket = this.tlsSocket;
-      this.encryptionEnabled = true;
 
       this.tlsSocket.on('secureConnect', () => {
+        if (!this.tlsSocket?.authorized) {
+          const reason = this.tlsSocket?.authorizationError || 'unknown error';
+          this.tlsSocket?.destroy();
+          reject(new Error(`VNC TLS certificate validation failed: ${reason}`));
+          return;
+        }
+        this.tlsVerified = true;
+        this.encryptionEnabled = true;
         this.logger.debug('TLS connection established');
         resolve();
       });
 
       this.tlsSocket.on('error', (error) => {
+        this.tlsVerified = false;
+        this.encryptionEnabled = false;
         this.logger.error('TLS connection failed:', error);
         reject(error);
       });
@@ -1092,6 +1142,9 @@ export class VNCProtocol extends BaseProtocol {
   }
 
   private async authenticatePlain(): Promise<void> {
+    if (!this.isVerifiedTlsChannel()) {
+      throw new Error('Plain authentication requires a verified TLS channel');
+    }
     if (!this.options.username || !this.options.password) {
       throw new Error('Plain authentication requires username and password');
     }
@@ -2244,6 +2297,9 @@ export class VNCProtocol extends BaseProtocol {
 
     this.isConnected = false;
     this.isAuthenticated = false;
+    this.tlsVerified = false;
+    this.encryptionEnabled = false;
+    this.tlsSocket = undefined;
 
     if (this.session) {
       this.session.status = 'disconnected';
@@ -2520,10 +2576,31 @@ export class VNCProtocol extends BaseProtocol {
       this.repeaterConnection = undefined;
     }
 
+    this.tlsVerified = false;
+    this.encryptionEnabled = false;
+    this.tlsSocket = undefined;
+
     this.removeAllListeners();
     this.isInitialized = false;
 
     this.logger.info('VNC Protocol disposed');
+  }
+
+  private isVerifiedTlsChannel(): boolean {
+    return Boolean(
+      this.tlsVerified &&
+        this.tlsSocket &&
+        this.socket === this.tlsSocket &&
+        this.tlsSocket.authorized
+    );
+  }
+
+  private assertVerifiedTlsForVncAuth(): void {
+    if (!this.isVerifiedTlsChannel()) {
+      throw new Error(
+        'VNC challenge authentication requires a certificate-verified TLS channel'
+      );
+    }
   }
 
   /**
