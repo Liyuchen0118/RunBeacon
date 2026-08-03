@@ -150,6 +150,12 @@ const tools: Tool[] = [
           description:
             'GitHub credentials come from the configured Git credential helper.',
         },
+        makeDefault: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Make the saved profile the default for its SSH or GitHub kind.',
+        },
       },
       required: ['id', 'kind'],
     },
@@ -197,6 +203,47 @@ const tools: Tool[] = [
     },
   },
   {
+    name: 'credential_profile_set_default',
+    description:
+      'Make an existing safe credential profile the default for its kind. SSH and GitHub defaults are independent. This changes only RunBeacon profile selection and does not alter OS-managed secrets.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'string',
+          description: 'Existing SSH or GitHub credential profile id.',
+        },
+      },
+      required: ['id'],
+    },
+    annotations: {
+      title: 'Set Default Credential Profile',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'credential_profile_clear_default',
+    description:
+      'Clear the default SSH or GitHub credential profile without deleting the profile or any OS-managed secret.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['ssh', 'github'] },
+      },
+      required: ['kind'],
+    },
+    annotations: {
+      title: 'Clear Default Credential Profile',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
     name: 'github_token_save',
     description:
       'Store a GitHub personal access token in the configured Git credential helper and create a safe RunBeacon profile reference. Prefer tokenEnvVar so the token never appears in conversation; use token only when the user explicitly provides it. The token is never written to RunBeacon profiles, jobs, dashboard state, or logs.',
@@ -231,6 +278,12 @@ const tools: Tool[] = [
           maxLength: 2000,
           description:
             'Explicit memory-only token input. Use only when the user deliberately supplies a PAT in this conversation.',
+        },
+        makeDefault: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Make this PAT profile the default GitHub credential after saving.',
         },
       },
       required: ['id', 'username'],
@@ -334,7 +387,7 @@ const tools: Tool[] = [
         credentialProfile: {
           type: 'string',
           description:
-            'Optional saved GitHub profile that reuses Git Credential Manager without exposing its token.',
+            'Optional saved GitHub profile that reuses Git Credential Manager without exposing its token. When omitted, the default GitHub profile is selected unless githubToken is supplied.',
         },
       },
       required: ['cwd'],
@@ -412,6 +465,12 @@ const tools: Tool[] = [
           type: 'string',
           description:
             'Saved SSH profile. If omitted, a unique profile matching target.host and target.username is selected automatically when no inline authentication is supplied.',
+        },
+        useDefaultCredential: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Use the default SSH profile for an explicitly remote request. Leave false for local commands.',
         },
       },
       required: ['command'],
@@ -568,19 +627,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   try {
     switch (request.params.name) {
       case 'credential_profile_save': {
+        const makeDefault = args.makeDefault === true;
+        const profileInput = { ...args };
+        delete profileInput.makeDefault;
         const profile = credentialProfiles.save(
-          args as SaveCredentialProfileInput
+          profileInput as SaveCredentialProfileInput
         );
+        if (makeDefault) credentialProfiles.setDefault(profile.id);
         return reply(
-          { profile },
-          `Saved passwordless ${profile.kind} credential profile ${profile.id}. No secret material was stored.`
+          { profile, isDefault: makeDefault },
+          `Saved passwordless ${profile.kind} credential profile ${profile.id}${makeDefault ? ' as the default' : ''}. No secret material was stored.`
         );
       }
       case 'credential_profile_list': {
         const kind = optionalCredentialKind(args.kind);
-        const profiles = credentialProfiles.list(kind);
+        const defaults = credentialProfiles.defaults();
+        const profiles = credentialProfiles.list(kind).map((profile) => ({
+          ...profile,
+          isDefault: defaults[profile.kind] === profile.id,
+        }));
         return reply(
-          { profiles },
+          { profiles, defaults },
           `${profiles.length} safe credential reference profile(s).`
         );
       }
@@ -589,6 +656,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         return reply(
           { profile },
           `Deleted RunBeacon profile ${profile.id}; OS-managed credentials and key files were not changed.`
+        );
+      }
+      case 'credential_profile_set_default': {
+        const profile = credentialProfiles.setDefault(String(args.id ?? ''));
+        return reply(
+          { profile, defaults: credentialProfiles.defaults() },
+          `Set ${profile.id} as the default ${profile.kind} credential profile.`
+        );
+      }
+      case 'credential_profile_clear_default': {
+        const kind = optionalCredentialKind(args.kind);
+        if (!kind) throw new Error('Credential profile kind is required');
+        const profile = credentialProfiles.clearDefault(kind);
+        return reply(
+          {
+            clearedProfileId: profile?.id,
+            defaults: credentialProfiles.defaults(),
+          },
+          profile
+            ? `Cleared ${profile.id} as the default ${kind} credential profile.`
+            : `No default ${kind} credential profile was configured.`
         );
       }
       case 'github_token_save': {
@@ -620,9 +708,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           username,
           credentialKind: 'pat',
         });
+        const makeDefault = args.makeDefault === true;
+        if (makeDefault) credentialProfiles.setDefault(profile.id);
         return reply(
-          { profile, credentialStored: true },
-          `Saved GitHub PAT profile ${profile.id} in the configured Git credential helper. RunBeacon stored only the safe profile reference.`
+          { profile, credentialStored: true, isDefault: makeDefault },
+          `Saved GitHub PAT profile ${profile.id}${makeDefault ? ' as the default' : ''} in the configured Git credential helper. RunBeacon stored only the safe profile reference.`
         );
       }
       case 'github_token_delete': {
@@ -677,7 +767,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         const credentialProfileId = optionalString(args.credentialProfile);
         const credentialProfile = credentialProfileId
           ? requireGitHubProfile(credentialProfileId)
-          : undefined;
+          : githubToken
+            ? undefined
+            : credentialProfiles.getDefault('github');
         const job = await manager.start({
           command: process.execPath,
           args: runnerArgs,
@@ -829,7 +921,14 @@ function requireGitHubProfile(id: string): GitHubCredentialProfile {
 function resolveJobStartInput(args: Record<string, any>): StartJobInput {
   const input = { ...args } as Record<string, any>;
   delete input.credentialProfile;
+  delete input.useDefaultCredential;
   const requestedProfile = optionalString(args.credentialProfile);
+  const useDefaultCredential = args.useDefaultCredential === true;
+  if (requestedProfile && useDefaultCredential) {
+    throw new Error(
+      'Use either credentialProfile or useDefaultCredential, not both'
+    );
+  }
   const suppliedTarget =
     args.target && typeof args.target === 'object'
       ? ({ ...args.target } as Record<string, any>)
@@ -844,6 +943,13 @@ function resolveJobStartInput(args: Record<string, any>): StartJobInput {
       );
     }
     profile = selected;
+  } else if (useDefaultCredential) {
+    profile = credentialProfiles.getDefault('ssh');
+    if (!profile) {
+      throw new Error(
+        'No default SSH credential profile is configured; set one with credential_profile_set_default'
+      );
+    }
   } else if (
     suppliedTarget?.kind === 'ssh' &&
     !suppliedTarget.password &&
@@ -906,6 +1012,11 @@ function resolveJobStartInput(args: Record<string, any>): StartJobInput {
   }
 
   if (target?.kind === 'ssh') {
+    if (!optionalString(target.host) || !optionalString(target.username)) {
+      throw new Error(
+        'SSH host and username are required when no credential profile supplies them'
+      );
+    }
     if (target.agent === 'auto') target.agent = resolveSshAgent();
     if (!target.password && !target.privateKeyPath && !target.agent) {
       throw new Error(

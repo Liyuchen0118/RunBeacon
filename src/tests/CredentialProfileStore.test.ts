@@ -89,4 +89,41 @@ describe('CredentialProfileStore', () => {
     expect(store.delete('github-main').id).toBe('github-main');
     expect(store.list()).toEqual([]);
   });
+
+  test('persists one default profile per credential kind and clears it on delete', () => {
+    const store = new CredentialProfileStore(profilePath);
+    store.save({
+      id: 'production',
+      kind: 'ssh',
+      host: 'server.example.com',
+      port: 22,
+      username: 'deploy',
+      agent: 'auto',
+      hostKeySha256: 'SHA256:test',
+    });
+    store.save({
+      id: 'github-main',
+      kind: 'github',
+      host: 'github.com',
+      credentialSource: 'git',
+      username: 'octocat',
+    });
+
+    store.setDefault('production');
+    store.setDefault('github-main');
+    expect(store.defaults()).toEqual({
+      ssh: 'production',
+      github: 'github-main',
+    });
+
+    const reloaded = new CredentialProfileStore(profilePath);
+    expect(reloaded.getDefault('ssh')?.id).toBe('production');
+    expect(reloaded.getDefault('github')?.id).toBe('github-main');
+    reloaded.delete('production');
+    expect(reloaded.getDefault('ssh')).toBeUndefined();
+    expect(reloaded.getDefault('github')?.id).toBe('github-main');
+
+    expect(reloaded.clearDefault('github')?.id).toBe('github-main');
+    expect(reloaded.defaults()).toEqual({});
+  });
 });

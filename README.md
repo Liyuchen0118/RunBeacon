@@ -4,7 +4,7 @@ RunBeacon turns long-running local and SSH commands into tracked jobs for Codex.
 
 For non-interactive remote execution, RunBeacon is the default route. Its skill description makes Codex prefer `job_start` for server/SSH requests, a `UserPromptSubmit` Hook adds the routing policy when a prompt contains remote-execution intent, and a `PreToolUse` Hook blocks raw `ssh`, `scp`, `sftp`, or `plink` commands that would bypass lifecycle tracking. Plugin Hooks must be reviewed and trusted by the user after installation.
 
-Version 0.4.0 adds GitHub PAT credential tools. RunBeacon sends a PAT to the configured Git credential helper over stdin and persists only a safe profile reference. SSH profiles still use `ssh-agent` or private-key paths. No password, passphrase, key contents, or token is stored in RunBeacon profiles, jobs, dashboard state, or logs.
+Version 0.5.0 adds independent default SSH and GitHub profiles. Explicit profile selections still win, GitHub publishing automatically uses its default when no credential is supplied, and explicitly remote SSH work can opt into the default without risking accidental local-to-remote routing. No password, passphrase, key contents, or token is stored in RunBeacon profiles, jobs, dashboard state, or logs.
 
 ## What is implemented
 
@@ -19,6 +19,7 @@ Version 0.4.0 adds GitHub PAT credential tools. RunBeacon sends a PAT to the con
 - Memory-only inline SSH passwords/passphrases and pinned host-key support
 - Passwordless `credential_profile_*` tools for SSH agent/private-key references and Git Credential Manager
 - `github_token_save` and `github_token_delete` for OS-managed GitHub PAT credentials
+- Independent default SSH and GitHub profiles with explicit set/clear tools
 - Persistent redacted job metadata; command output persistence is off by default
 - Reattachment from a new MCP client to jobs owned by the resident daemon
 
@@ -106,6 +107,14 @@ RunBeacon refuses the plaintext Git `credential-store` helper for PAT saving. Co
 Use the resulting `credentialProfile: "github-pat"` with `github_publish_start`. `github_token_delete` removes both a PAT profile and its matching helper credential; it refuses to delete generic OAuth/login profiles.
 
 `credential_profile_list` returns only safe references. `credential_profile_delete` removes the RunBeacon reference but does not delete OS credentials, agent keys, or key files.
+
+## Default credential profiles
+
+Call `credential_profile_set_default` with an existing profile id, or pass `makeDefault: true` while saving a profile. RunBeacon keeps one SSH default and one GitHub default. `credential_profile_list` marks each selected profile with `isDefault` and returns the current `defaults` map.
+
+For a remote SSH request with no named server, `job_start` uses the SSH default only when `useDefaultCredential: true` is explicitly present. Local jobs never inherit it. Explicit `credentialProfile`, host, or inline authentication remains authoritative. For `github_publish_start`, the GitHub default is automatic when both `credentialProfile` and `githubToken` are absent.
+
+Use `credential_profile_clear_default` to stop automatic selection without deleting the profile. Deleting a profile also clears it if it was the default.
 
 ## Development quick start
 

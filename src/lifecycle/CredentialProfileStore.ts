@@ -43,13 +43,25 @@ export type SaveCredentialProfileInput =
 interface CredentialProfileDocument {
   version: 1;
   profiles: CredentialProfile[];
+  defaults?: Partial<Record<CredentialProfile['kind'], string>>;
 }
 
 export class CredentialProfileStore {
   private readonly profiles = new Map<string, CredentialProfile>();
+  private readonly defaultProfileIds: Partial<
+    Record<CredentialProfile['kind'], string>
+  > = {};
 
   constructor(private readonly filePath: string) {
-    for (const profile of this.load()) this.profiles.set(profile.id, profile);
+    const document = this.load();
+    for (const profile of document.profiles) {
+      this.profiles.set(profile.id, profile);
+    }
+    for (const kind of ['ssh', 'github'] as const) {
+      const id = document.defaults?.[kind];
+      const profile = id ? this.profiles.get(id) : undefined;
+      if (profile?.kind === kind) this.defaultProfileIds[kind] = id;
+    }
   }
 
   list(kind?: CredentialProfile['kind']): CredentialProfile[] {
@@ -61,6 +73,34 @@ export class CredentialProfileStore {
   get(id: string): CredentialProfile {
     const profile = this.profiles.get(normalizeId(id));
     if (!profile) throw new Error(`Credential profile not found: ${id}`);
+    return profile;
+  }
+
+  getDefault<TKind extends CredentialProfile['kind']>(
+    kind: TKind
+  ): Extract<CredentialProfile, { kind: TKind }> | undefined {
+    const id = this.defaultProfileIds[kind];
+    const profile = id ? this.profiles.get(id) : undefined;
+    return profile?.kind === kind
+      ? (profile as Extract<CredentialProfile, { kind: TKind }>)
+      : undefined;
+  }
+
+  defaults(): Partial<Record<CredentialProfile['kind'], string>> {
+    return { ...this.defaultProfileIds };
+  }
+
+  setDefault(id: string): CredentialProfile {
+    const profile = this.get(id);
+    this.defaultProfileIds[profile.kind] = profile.id;
+    this.persist();
+    return profile;
+  }
+
+  clearDefault(kind: CredentialProfile['kind']): CredentialProfile | undefined {
+    const profile = this.getDefault(kind);
+    delete this.defaultProfileIds[kind];
+    this.persist();
     return profile;
   }
 
@@ -82,6 +122,9 @@ export class CredentialProfileStore {
   delete(id: string): CredentialProfile {
     const profile = this.get(id);
     this.profiles.delete(profile.id);
+    if (this.defaultProfileIds[profile.kind] === profile.id) {
+      delete this.defaultProfileIds[profile.kind];
+    }
     this.persist();
     return profile;
   }
@@ -98,19 +141,26 @@ export class CredentialProfileStore {
     );
   }
 
-  private load(): CredentialProfile[] {
-    if (!existsSync(this.filePath)) return [];
+  private load(): CredentialProfileDocument {
+    if (!existsSync(this.filePath)) return { version: 1, profiles: [] };
     try {
       const document = JSON.parse(
         readFileSync(this.filePath, 'utf8')
       ) as CredentialProfileDocument;
       if (document.version !== 1 || !Array.isArray(document.profiles))
-        return [];
-      return document.profiles
-        .map(normalizeStoredProfile)
-        .filter((profile): profile is CredentialProfile => Boolean(profile));
+        return { version: 1, profiles: [] };
+      return {
+        version: 1,
+        profiles: document.profiles
+          .map(normalizeStoredProfile)
+          .filter((profile): profile is CredentialProfile => Boolean(profile)),
+        defaults:
+          document.defaults && typeof document.defaults === 'object'
+            ? document.defaults
+            : undefined,
+      };
     } catch {
-      return [];
+      return { version: 1, profiles: [] };
     }
   }
 
@@ -121,6 +171,7 @@ export class CredentialProfileStore {
     const document: CredentialProfileDocument = {
       version: 1,
       profiles: this.list(),
+      defaults: this.defaults(),
     };
     writeFileSync(temporaryPath, JSON.stringify(document, null, 2), {
       encoding: 'utf8',

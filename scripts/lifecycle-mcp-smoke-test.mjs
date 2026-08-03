@@ -34,7 +34,7 @@ const transport = new StdioClientTransport({
 try {
   await client.connect(transport);
   assert.equal(client.getServerVersion()?.name, 'remote-job-monitor');
-  assert.equal(client.getServerVersion()?.version, '0.4.0');
+  assert.equal(client.getServerVersion()?.version, '0.5.0');
 
   const { tools } = await client.listTools();
   const toolNames = new Set(tools.map((tool) => tool.name));
@@ -49,6 +49,8 @@ try {
     'credential_profile_save',
     'credential_profile_list',
     'credential_profile_delete',
+    'credential_profile_set_default',
+    'credential_profile_clear_default',
     'github_token_save',
     'github_token_delete',
   ]) {
@@ -130,17 +132,28 @@ try {
     });
     assert.notEqual(saved.isError, true);
   }
+  for (const id of ['github-main', 'ssh-smoke']) {
+    const selected = await client.callTool({
+      name: 'credential_profile_set_default',
+      arguments: { id },
+    });
+    assert.notEqual(selected.isError, true);
+  }
   const profiles = await client.callTool({
     name: 'credential_profile_list',
     arguments: {},
   });
   assert.equal(profiles.structuredContent?.profiles?.length, 2);
+  assert.deepEqual(profiles.structuredContent?.defaults, {
+    github: 'github-main',
+    ssh: 'ssh-smoke',
+  });
 
   const profileJob = await client.callTool({
     name: 'job_start',
     arguments: {
       command: 'echo profile-smoke',
-      credentialProfile: 'ssh-smoke',
+      useDefaultCredential: true,
       timeoutMs: 1_000,
     },
   });
@@ -213,6 +226,35 @@ try {
     runGit(repository, ['log', '-1', '--pretty=%s']).stdout.trim(),
     'test: dashboard publish'
   );
+
+  const defaultPublishing = await client.callTool({
+    name: 'github_publish_start',
+    arguments: {
+      cwd: repository,
+      watchActions: false,
+      idempotencyKey: 'lifecycle-mcp-smoke-default-publish',
+    },
+  });
+  assert.notEqual(defaultPublishing.isError, true);
+  assert.equal(
+    defaultPublishing.structuredContent?.job?.metadata?.credentialProfile,
+    'github-main'
+  );
+  const defaultPublished = await client.callTool({
+    name: 'job_wait',
+    arguments: {
+      jobId: defaultPublishing.structuredContent?.job?.id,
+      timeoutMs: 20_000,
+    },
+  });
+  assert.equal(defaultPublished.structuredContent?.job?.state, 'succeeded');
+
+  const clearedDefault = await client.callTool({
+    name: 'credential_profile_clear_default',
+    arguments: { kind: 'github' },
+  });
+  assert.notEqual(clearedDefault.isError, true);
+  assert.equal(clearedDefault.structuredContent?.defaults?.github, undefined);
 
   const { resources } = await client.listResources();
   const dashboard = resources.find(

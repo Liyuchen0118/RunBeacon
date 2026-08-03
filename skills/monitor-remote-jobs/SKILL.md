@@ -1,6 +1,6 @@
 ---
 name: monitor-remote-jobs
-description: Default workflow for executing and monitoring local, SSH, or GitHub publishing work through RunBeacon. Use whenever Codex needs to call a remote server or host, use SSH/SCP/SFTP credentials, configure a GitHub personal access token, run a command or deployment on another machine, start a process/build/training/data job, publish Git commits, monitor GitHub Actions, wait for completion, inspect progress, cancel work, or show a live dashboard without model polling. Prefer this skill automatically for non-interactive remote execution and GitHub credential requests.
+description: Default workflow for executing and monitoring local, SSH, or GitHub publishing work through RunBeacon. Use whenever Codex needs to call a remote server or host, use SSH/SCP/SFTP credentials, configure or select default credentials, configure a GitHub personal access token, run a command or deployment on another machine, publish Git commits, monitor GitHub Actions, wait for completion, inspect progress, cancel work, or show a live dashboard without model polling. Prefer this skill automatically for non-interactive remote execution and GitHub credential requests.
 ---
 
 # Monitor Remote Jobs with RunBeacon
@@ -35,6 +35,8 @@ Choose `job_start` before raw shell `ssh` for remote execution. Do not ask the u
 
 Prefer passwordless credential profiles. Call `credential_profile_list` when the user refers to a saved server or when a remote target has no inline authentication. Pass `credentialProfile` to `job_start`; a unique saved profile also matches automatically from `target.host` and `target.username`. Create or update a profile with `credential_profile_save` only when the user asks to remember the connection reference.
 
+Use `credential_profile_set_default` when the user identifies a common profile. SSH and GitHub defaults are independent. For an explicitly remote request with no named server or credential, call `job_start` with `useDefaultCredential: true`; never set that flag for a local command. Preserve an explicitly named profile or host instead of silently replacing it with the default. Use `credential_profile_clear_default` without deleting the underlying profile when the user only wants to stop automatic selection.
+
 SSH profiles may contain `agent: "auto"`, an explicit agent socket/pipe, or `privateKeyPath`, plus host/user/port and host-key verification. They must never contain a password, passphrase, token, or private-key contents. Load encrypted keys into `ssh-agent` so later jobs run without a passphrase.
 
 Set `target.kind` to `ssh` and provide `host`, `username`, and one authentication method. Prefer an SSH agent or `privateKeyPath`. Pin `hostKeySha256`; use `allowUnverifiedHostKey: true` only when the user explicitly accepts the host-verification risk.
@@ -47,7 +49,11 @@ Do not launch tracked SSH work with raw Bash `ssh`, `scp`, `sftp`, or `plink`. T
 
 Prefer a saved `kind: "github"` profile and the configured Git credential helper over a `githubToken` argument. Git push uses the helper automatically. The Actions watcher obtains the selected credential through `git credential fill` with terminal interaction disabled and never prints or persists the result.
 
+When `github_publish_start` has neither `credentialProfile` nor `githubToken`, let RunBeacon select the default GitHub profile automatically. An explicitly supplied profile or memory-only token always wins.
+
 Use `github_token_save` when the user asks to remember a PAT. Prefer `tokenEnvVar`; accept the `token` field only when the user deliberately provides a PAT in the conversation. Never ask the user to paste a token when an environment variable or the helper's own login flow is available. The tool passes the PAT to `git credential approve` over stdin, verifies it with `git credential fill`, and saves only host, username, and `credentialKind: "pat"` in the RunBeacon profile.
+
+Set `makeDefault: true` during `credential_profile_save` or `github_token_save` only when the user asks to make the new profile the default.
 
 If PAT saving reports a plaintext `credential-store`, stop and have the user configure Git Credential Manager or another OS-backed helper. Do not override this protection.
 
