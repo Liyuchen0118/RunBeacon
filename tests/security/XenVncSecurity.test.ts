@@ -282,24 +282,40 @@ describe('VNC authentication security', () => {
     await expect(protocol.upgradToTLS()).rejects.toThrow(/cannot be disabled/);
   });
 
-  test('allows the RFC DES challenge only on an authorized TLS socket', () => {
+  test.each([258, 261])(
+    'allows the RFC DES challenge on authorized VeNCrypt subtype %i',
+    (subtype) => {
+      const protocol = new VNCProtocol({ password: 'test-only' }) as any;
+      const authorizedSocket = { authorized: true };
+      protocol.tlsSocket = authorizedSocket;
+      protocol.socket = authorizedSocket;
+      protocol.tlsVerified = true;
+      protocol.activeVeNCryptSubtype = subtype;
+
+      const response = protocol.vncAuthChallenge(
+        Buffer.from('00112233445566778899aabbccddeeff', 'hex'),
+        'test-only'
+      );
+      expect(response).toBeInstanceOf(Buffer);
+      expect(response).toHaveLength(16);
+
+      protocol.tlsSocket.authorized = false;
+      expect(() =>
+        protocol.vncAuthChallenge(Buffer.alloc(16), 'test-only')
+      ).toThrow(/certificate-verified TLS/);
+    }
+  );
+
+  test('rejects DES on generic verified TLS without TLS_VNC/X509_VNC', () => {
     const protocol = new VNCProtocol({ password: 'test-only' }) as any;
     const authorizedSocket = { authorized: true };
     protocol.tlsSocket = authorizedSocket;
     protocol.socket = authorizedSocket;
     protocol.tlsVerified = true;
 
-    const response = protocol.vncAuthChallenge(
-      Buffer.from('00112233445566778899aabbccddeeff', 'hex'),
-      'test-only'
-    );
-    expect(response).toBeInstanceOf(Buffer);
-    expect(response).toHaveLength(16);
-
-    protocol.tlsSocket.authorized = false;
     expect(() =>
       protocol.vncAuthChallenge(Buffer.alloc(16), 'test-only')
-    ).toThrow(/certificate-verified TLS/);
+    ).toThrow(/TLS_VNC or X509_VNC/);
   });
 
   test('TLS_VNC upgrades TLS before invoking challenge authentication', async () => {

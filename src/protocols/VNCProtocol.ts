@@ -241,6 +241,7 @@ export class VNCProtocol extends BaseProtocol {
   private tlsSocket?: TLSSocket;
   private encryptionEnabled: boolean = false;
   private tlsVerified: boolean = false;
+  private activeVeNCryptSubtype?: number;
 
   // Recording state
   private recordingStream?: fs.WriteStream;
@@ -489,6 +490,7 @@ export class VNCProtocol extends BaseProtocol {
    */
   public async connect(): Promise<VNCSession> {
     try {
+      this.activeVeNCryptSubtype = undefined;
       if (
         (this.options.tlsOptions?.rejectUnauthorized as boolean | undefined) ===
         false
@@ -859,13 +861,11 @@ export class VNCProtocol extends BaseProtocol {
   }
 
   private selectPreferredSecurity(): number {
-    const preferenceOrder = this.isVerifiedTlsChannel()
-      ? [RFB_SECURITY_TYPES.VNC_AUTH, RFB_SECURITY_TYPES.NONE]
-      : [
-          RFB_SECURITY_TYPES.VENCRYPT,
-          RFB_SECURITY_TYPES.TLS,
-          RFB_SECURITY_TYPES.NONE,
-        ];
+    const preferenceOrder = [
+      RFB_SECURITY_TYPES.VENCRYPT,
+      RFB_SECURITY_TYPES.TLS,
+      RFB_SECURITY_TYPES.NONE,
+    ];
 
     for (const preferred of preferenceOrder) {
       if (this.securityTypes.includes(preferred)) {
@@ -1065,14 +1065,17 @@ export class VNCProtocol extends BaseProtocol {
   }
 
   private async handleVeNCryptSubtype(subtype: number): Promise<void> {
+    this.activeVeNCryptSubtype = undefined;
     switch (subtype) {
       case VENCRYPT_SUBTYPES.TLS_VNC:
       case VENCRYPT_SUBTYPES.X509_VNC:
+        this.activeVeNCryptSubtype = subtype;
         await this.upgradToTLS();
         await this.authenticateVNC();
         break;
       case VENCRYPT_SUBTYPES.TLS_PLAIN:
       case VENCRYPT_SUBTYPES.X509_PLAIN:
+        this.activeVeNCryptSubtype = subtype;
         await this.upgradToTLS();
         await this.authenticatePlain();
         break;
@@ -2300,6 +2303,7 @@ export class VNCProtocol extends BaseProtocol {
     this.tlsVerified = false;
     this.encryptionEnabled = false;
     this.tlsSocket = undefined;
+    this.activeVeNCryptSubtype = undefined;
 
     if (this.session) {
       this.session.status = 'disconnected';
@@ -2579,6 +2583,7 @@ export class VNCProtocol extends BaseProtocol {
     this.tlsVerified = false;
     this.encryptionEnabled = false;
     this.tlsSocket = undefined;
+    this.activeVeNCryptSubtype = undefined;
 
     this.removeAllListeners();
     this.isInitialized = false;
@@ -2596,9 +2601,12 @@ export class VNCProtocol extends BaseProtocol {
   }
 
   private assertVerifiedTlsForVncAuth(): void {
-    if (!this.isVerifiedTlsChannel()) {
+    const isVncVeNCryptSubtype =
+      this.activeVeNCryptSubtype === VENCRYPT_SUBTYPES.TLS_VNC ||
+      this.activeVeNCryptSubtype === VENCRYPT_SUBTYPES.X509_VNC;
+    if (!this.isVerifiedTlsChannel() || !isVncVeNCryptSubtype) {
       throw new Error(
-        'VNC challenge authentication requires a certificate-verified TLS channel'
+        'VNC challenge authentication requires a certificate-verified TLS_VNC or X509_VNC channel'
       );
     }
   }

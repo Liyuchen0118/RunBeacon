@@ -13,6 +13,6 @@ This file records the evidence required to close or retain the CodeQL alerts add
 
 #63 may be dismissed as `won't fix` only if the GitHub alert points to the RFB/VNC challenge cipher in `VNCProtocol.vncAuthChallenge`.
 
-The retained cipher is required for RFB VNC challenge-response compatibility. RunBeacon does not select raw `VNC_AUTH`, rejects VeNCrypt `PLAIN`, rejects disabled certificate validation, and calls the challenge helper only when the active socket is the certificate-verified TLS socket. Regression tests cover raw-auth rejection, unauthorized helper rejection, verified TLS state, and TLS-before-challenge ordering.
+The retained cipher is required for RFB VNC challenge-response compatibility. RunBeacon does not select raw `VNC_AUTH`, rejects VeNCrypt `PLAIN`, rejects disabled certificate validation, and calls the challenge helper only when the active socket is the certificate-verified TLS socket and the negotiated VeNCrypt subtype is `TLS_VNC` or `X509_VNC`. Regression tests cover raw-auth rejection, unauthorized and generic-TLS helper rejection, both permitted VeNCrypt subtypes, and TLS-before-challenge ordering.
 
 Use this dismissal rationale only after the new CodeQL analysis confirms the exact alert location. No other alert is covered by this exception.
