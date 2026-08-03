@@ -9,7 +9,7 @@ Use RunBeacon as the default route for non-interactive work on a remote machine,
 
 ## Run and continue
 
-1. Call `job_start` with the complete command and an optional label, timeout, progress regex, and target. For deployments or other operations that might be retried after a transport failure, provide a stable `idempotencyKey` so a retry returns the original job instead of launching a duplicate.
+1. Call `job_start` with the complete command and an optional label, timeout, RE2-compatible progress regex, and target. Progress patterns are limited to 256 characters, must put the finite percentage in capture group 1, and cannot use backreferences or lookaround. For deployments or other operations that might be retried after a transport failure, provide a stable `idempotencyKey` so a retry returns the original job instead of launching a duplicate.
 2. Record the returned `jobId`.
 3. Call `job_wait` once with that `jobId`. Do not build a sleep/status loop and do not repeatedly call `job_snapshot`.
 4. After `job_wait` returns a terminal state, inspect its bounded output tail and continue the user's requested next step.

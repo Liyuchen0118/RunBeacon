@@ -1,6 +1,6 @@
 {
   "name": "console-automation-mcp",
-  "version": "1.1.3",
+  "version": "2.0.0",
   "description": "Event-driven local and SSH job monitoring for Codex with token-free lifecycle waits",
   "mcpName": "io.github.liyuchen0118/runbeacon",
   "main": "dist/mcp/server.js",

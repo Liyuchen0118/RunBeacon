@@ -1,7 +1,7 @@
 {
   "name": "remote-job-monitor",
-  "version": "0.5.0+codex.20260803050802",
-  "description": "Default tracked routing for local, SSH, and GitHub jobs with reusable default credentials and a token-free dashboard.",
+  "version": "1.0.0+codex.20260803072850",
+  "description": "Security-hardened tracked routing for local, SSH, and GitHub jobs with reusable default credentials and a token-free dashboard.",
   "author": {
     "name": "RunBeacon contributors"
   },
@@ -17,7 +17,7 @@
   "interface": {
     "displayName": "RunBeacon",
     "shortDescription": "Default tracked route for SSH, remote jobs, and publishing.",
-    "longDescription": "Automatically prefers tracked RunBeacon jobs for non-interactive remote execution. Independent default SSH and GitHub profiles remove repeated credential selection while preserving explicit overrides. Passwordless profiles reference ssh-agent and private-key paths; GitHub PAT profiles delegate secret storage to the configured Git credential helper. RunBeacon owns command and publishing lifecycles and renders a live dashboard without repeated model turns.",
+    "longDescription": "Automatically prefers tracked RunBeacon jobs for non-interactive remote execution. Independent default SSH and GitHub profiles remove repeated credential selection while preserving explicit overrides. RE2-compatible progress parsing and bounded shared wait coordination keep untrusted job output and concurrent waits resource-safe. Passwordless profiles reference ssh-agent and private-key paths; GitHub PAT profiles delegate secret storage to the configured Git credential helper. RunBeacon owns command and publishing lifecycles and renders a live dashboard without repeated model turns.",
     "developerName": "RunBeacon contributors",
     "category": "Developer Tools",
     "capabilities": [

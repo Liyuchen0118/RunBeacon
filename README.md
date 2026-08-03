@@ -4,12 +4,12 @@ RunBeacon turns long-running local and SSH commands into tracked jobs for Codex.
 
 For non-interactive remote execution, RunBeacon is the default route. Its skill description makes Codex prefer `job_start` for server/SSH requests, a `UserPromptSubmit` Hook adds the routing policy when a prompt contains remote-execution intent, and a `PreToolUse` Hook blocks raw `ssh`, `scp`, `sftp`, or `plink` commands that would bypass lifecycle tracking. Plugin Hooks must be reviewed and trusted by the user after installation.
 
-Version 0.5.0 adds independent default SSH and GitHub profiles. Explicit profile selections still win, GitHub publishing automatically uses its default when no credential is supplied, and explicitly remote SSH work can opt into the default without risking accidental local-to-remote routing. No password, passphrase, key contents, or token is stored in RunBeacon profiles, jobs, dashboard state, or logs.
+Plugin version 1.0.0 and npm version 2.0.0 add security-bounded RE2 progress parsing, shared `job_wait` coordination, entry-point log redaction, verified TLS-only VNC challenge authentication, and strict HTTPS Xen XAPI access. This is a breaking security release; see the [2.0 security migration guide](docs/SECURITY_MIGRATION_2.0.md).
 
 ## What is implemented
 
 - Resident cross-platform daemon over a local named pipe or Unix socket
-- Event-driven `job_wait` with a configurable 24-hour MCP tool timeout
+- Event-driven `job_wait` with a configurable 24-hour MCP tool timeout, one timer per job, and bounded per-job/global waiters
 - Local process and SSH channel ownership, output capture, cancellation, and timeout handling
 - Lifecycle assessment with active/stalled state, elapsed time, progress, and linear ETA
 - MCP Apps dashboard whose refresh loop consumes no model tokens
@@ -22,6 +22,8 @@ Version 0.5.0 adds independent default SSH and GitHub profiles. Explicit profile
 - Independent default SSH and GitHub profiles with explicit set/clear tools
 - Persistent redacted job metadata; command output persistence is off by default
 - Reattachment from a new MCP client to jobs owned by the resident daemon
+- RE2-compatible progress patterns compiled once per job and matched against a bounded 16 KiB line tail
+- Pre-sink structured log redaction with depth, key, array, and string limits
 
 ## Token-free control flow
 
