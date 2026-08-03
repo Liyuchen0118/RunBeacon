@@ -453,8 +453,9 @@ const tools: Tool[] = [
         },
         progressPattern: {
           type: 'string',
+          maxLength: 256,
           description:
-            'Optional regex; capture group 1 must contain a percentage.',
+            'Optional RE2-compatible regex (no backreferences or lookbehind); capture group 1 must contain a finite percentage.',
         },
         metadata: {
           type: 'object',

@@ -176,8 +176,152 @@ describe('LifecycleManager', () => {
     controller.abort();
 
     await expect(waiting).rejects.toThrow(/aborted/);
+    expect(manager.waitCoordinatorStatus()).toEqual({
+      waiters: 0,
+      jobs: 0,
+      timers: 0,
+    });
     manager.cancel(started.id);
     await manager.waitForTerminal(started.id, 5_000);
+  });
+
+  test('uses RE2-compatible progress patterns compiled at job start', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const started = manager.start({
+      command: process.execPath,
+      args: ['-e', "console.log('73% working')"],
+      shell: false,
+      progressPattern: '(\\d+)% .*',
+    });
+
+    const result = await manager.waitForTerminal(started.id, 5_000);
+    expect(result.job.progress?.percentage).toBe(73);
+    expect(() =>
+      manager.start({ command: 'noop', progressPattern: '\\d+%' })
+    ).toThrow(/capture group 1/);
+    expect(() =>
+      manager.start({ command: 'noop', progressPattern: '' })
+    ).toThrow(/capture group 1/);
+    expect(() =>
+      manager.start({ command: 'noop', progressPattern: '(?<=(\\d+))%' })
+    ).toThrow(/RE2-compatible/);
+    expect(() =>
+      manager.start({ command: 'noop', progressPattern: '(\\d+)%.*\\1' })
+    ).toThrow(/RE2-compatible/);
+    expect(() =>
+      manager.start({
+        command: 'noop',
+        progressPattern: `(${'.'.repeat(256)})`,
+      })
+    ).toThrow(/256 characters/);
+  });
+
+  test('bounds progress matching to the final 16 KiB of a line', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const script =
+      "process.stdout.write('a'.repeat(64 * 1024) + ' 42% done\\n')";
+    const started = manager.start({
+      command: process.execPath,
+      args: ['-e', script],
+      shell: false,
+      progressPattern: '(\\d+)% .*',
+    });
+
+    const before = Date.now();
+    const result = await manager.waitForTerminal(started.id, 5_000);
+    expect(result.job.progress?.percentage).toBe(42);
+    expect(Date.now() - before).toBeLessThan(1_000);
+  });
+
+  test('shares one timer across eight waiters and rejects the ninth', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const started = manager.start({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => process.exit(0), 150)'],
+      shell: false,
+    });
+    const waiters = Array.from({ length: 8 }, () =>
+      manager.waitForTerminal(started.id, 5_000)
+    );
+
+    expect(manager.waitCoordinatorStatus()).toEqual({
+      waiters: 8,
+      jobs: 1,
+      timers: 1,
+    });
+    await expect(manager.waitForTerminal(started.id, 5_000)).rejects.toThrow(
+      'job_wait limit reached for job'
+    );
+    await expect(Promise.all(waiters)).resolves.toHaveLength(8);
+    expect(manager.waitCoordinatorStatus()).toEqual({
+      waiters: 0,
+      jobs: 0,
+      timers: 0,
+    });
+  });
+
+  test('enforces the global waiter limit without leaking resources', async () => {
+    const manager = new LifecycleManager({
+      statePath,
+      maxConcurrentJobs: 17,
+    });
+    const jobs = Array.from({ length: 17 }, (_, index) =>
+      manager.start({
+        command: process.execPath,
+        args: [
+          '-e',
+          `setTimeout(() => process.exit(0), ${index === 16 ? 250 : 180})`,
+        ],
+        shell: false,
+      })
+    );
+    const waiters = jobs
+      .slice(0, 16)
+      .flatMap((job) =>
+        Array.from({ length: 8 }, () => manager.waitForTerminal(job.id, 5_000))
+      );
+
+    expect(manager.waitCoordinatorStatus()).toEqual({
+      waiters: 128,
+      jobs: 16,
+      timers: 16,
+    });
+    await expect(manager.waitForTerminal(jobs[16].id, 5_000)).rejects.toThrow(
+      'global job_wait limit reached'
+    );
+    await Promise.all(waiters);
+    await manager.waitForTerminal(jobs[16].id, 5_000);
+    expect(manager.waitCoordinatorStatus()).toEqual({
+      waiters: 0,
+      jobs: 0,
+      timers: 0,
+    });
+  });
+
+  test('cleans up timed-out and disposed wait coordinators', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const started = manager.start({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => process.exit(0), 200)'],
+      shell: false,
+    });
+    const timedOut = await manager.waitForTerminal(started.id, 10);
+    expect(timedOut.timedOut).toBe(true);
+    expect(manager.waitCoordinatorStatus()).toEqual({
+      waiters: 0,
+      jobs: 0,
+      timers: 0,
+    });
+
+    const waiting = manager.waitForTerminal(started.id, 5_000);
+    manager.dispose();
+    await expect(waiting).rejects.toThrow(/disposed/);
+    expect(manager.waitCoordinatorStatus()).toEqual({
+      waiters: 0,
+      jobs: 0,
+      timers: 0,
+    });
+    manager.cancel(started.id);
   });
 
   test('preserves split UTF-8 output and keeps the in-memory ring bounded', async () => {
