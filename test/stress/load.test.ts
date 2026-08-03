@@ -817,9 +817,11 @@ describeIfHardware('Load and Stress Tests', () => {
     it('should meet memory efficiency benchmarks', async () => {
       const sessions = 50;
       const sessionIds: string[] = [];
-      const command = platform() === 'win32' ? 
-        'for /L %i in (1,1,20) do @echo Memory benchmark output %i' :
-        'for i in {1..20}; do echo "Memory benchmark output $i"; done';
+      const command = process.execPath;
+      const args = [
+        '-e',
+        'for (let i = 1; i <= 20; i++) console.log(`Memory benchmark output ${i}`);'
+      ];
 
       const initialMemory = process.memoryUsage().heapUsed / (1024 * 1024);
 
@@ -827,7 +829,8 @@ describeIfHardware('Load and Stress Tests', () => {
         // Create sessions
         for (let i = 0; i < sessions; i++) {
           const sessionId = await consoleManager.createSession({
-            command: command,
+            command,
+            args,
             timeout: 10000
           });
           sessionIds.push(sessionId);
@@ -855,7 +858,7 @@ describeIfHardware('Load and Stress Tests', () => {
         timeout: 30000
       });
 
-      const startTime = performance.now();
+      const dispatchStart = performance.now();
 
       try {
         // Send commands rapidly
@@ -868,18 +871,25 @@ describeIfHardware('Load and Stress Tests', () => {
           }
         }
 
-        // Wait for processing
+        const dispatchTime = performance.now() - dispatchStart;
+
+        // Wait for processing. This settling period is intentionally excluded
+        // from dispatch throughput because it measures output collection, not
+        // how quickly commands can be accepted.
         await new Promise(resolve => setTimeout(resolve, 10000));
 
-        const totalTime = performance.now() - startTime;
-        const commandsPerSecond = commands / (totalTime / 1000);
+        const commandsPerSecond = commands / (dispatchTime / 1000);
 
         expect(commandsPerSecond).toBeGreaterThan(20); // At least 20 commands per second
-        expect(totalTime).toBeLessThan(15000); // Should complete within 15 seconds
+        expect(dispatchTime).toBeLessThan(5000); // Dispatch should complete within 5 seconds
 
         // Verify output was captured
         const output = consoleManager.getOutput(sessionId);
-        expect(output.length).toBeGreaterThan(commands / 2); // At least half the commands should have output
+        const capturedCommands = new Set(
+          [...output.map(entry => entry.data).join('').matchAll(/Command (\d+)/g)]
+            .map(match => Number(match[1]))
+        );
+        expect(capturedCommands.size).toBeGreaterThan(commands / 2); // At least half the commands should have output
 
       } finally {
         await consoleManager.stopSession(sessionId);

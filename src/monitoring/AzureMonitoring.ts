@@ -408,6 +408,7 @@ export class AzureMonitoring extends EventEmitter<AzureMonitoringEvents> {
     this.monitoringInterval = setInterval(() => {
       this.performRoutineChecks();
     }, 60000); // Check every minute
+    this.monitoringInterval.unref?.();
 
     this.logger.info('Azure monitoring started');
   }

@@ -1061,6 +1061,7 @@ export class DiagnosticsManager extends EventEmitter {
     this.metricsInterval = setInterval(() => {
       this.collectMetrics();
     }, intervalMs);
+    this.metricsInterval.unref?.();
   }
 
   private collectMetrics(): void {
