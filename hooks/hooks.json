@@ -1,6 +1,19 @@
 {
-  "description": "Route raw SSH commands through RunBeacon so their lifecycle remains observable.",
+  "description": "Select RunBeacon by default for remote execution and prevent untracked raw SSH commands.",
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/route-remote-prompt.cjs\"",
+            "commandWindows": "node \"%PLUGIN_ROOT%\\hooks\\route-remote-prompt.cjs\"",
+            "timeout": 5,
+            "statusMessage": "Selecting tracked remote execution"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "^Bash$",

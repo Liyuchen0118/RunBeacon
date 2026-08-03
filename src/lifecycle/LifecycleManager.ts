@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { spawn, ChildProcess } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { Client, ClientChannel, ConnectConfig } from 'ssh2';
+import { RE2JS } from 're2js';
 import { JobStore } from './JobStore.js';
 import { redactCommand, safeErrorMessage } from './security.js';
 import {
@@ -40,8 +41,28 @@ interface RuntimeHandle {
   cancellationVerified: boolean;
 }
 
+interface Waiter {
+  id: number;
+  tailLines: number;
+  expiresAt: number;
+  signal?: AbortSignal;
+  abortListener?: () => void;
+  resolve: (result: WaitResult) => void;
+  reject: (error: Error) => void;
+}
+
+interface WaitCoordinator {
+  jobId: string;
+  waiters: Map<number, Waiter>;
+  timer?: NodeJS.Timeout;
+}
+
 const DEFAULT_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const MAX_WAIT_MS = 24 * 60 * 60 * 1000;
+const MAX_PROGRESS_PATTERN_LENGTH = 256;
+const MAX_PROGRESS_LINE_LENGTH = 16 * 1024;
+const MAX_WAITERS_PER_JOB = 8;
+const MAX_WAITERS_GLOBAL = 128;
 
 export class LifecycleManager extends EventEmitter {
   private readonly jobs = new Map<string, JobRecord>();
@@ -57,11 +78,16 @@ export class LifecycleManager extends EventEmitter {
   private readonly maxRetainedJobs: number;
   private readonly cancellationGraceMs: number;
   private readonly progressRemainders = new Map<string, string>();
+  private readonly progressPatterns = new Map<string, RE2JS>();
+  private readonly waitCoordinators = new Map<string, WaitCoordinator>();
   private persistenceTimer?: NodeJS.Timeout;
   private lastPersistenceError?: string;
   private lastPersistenceSuccessAt?: string;
   private sequence = 0;
+  private waiterSequence = 0;
+  private totalWaiters = 0;
   private drainScheduled = false;
+  private disposed = false;
 
   constructor(options: LifecycleManagerOptions) {
     super();
@@ -105,6 +131,7 @@ export class LifecycleManager extends EventEmitter {
   }
 
   start(input: StartJobInput): JobSnapshot {
+    this.assertNotDisposed();
     if (!input.command?.trim()) throw new Error('command is required');
     if (input.timeoutMs !== undefined && input.timeoutMs <= 0) {
       throw new Error('timeoutMs must be greater than zero');
@@ -120,16 +147,10 @@ export class LifecycleManager extends EventEmitter {
       if (existing) return this.snapshot(existing.id);
       input = { ...input, idempotencyKey: key };
     }
-    if (input.progressPattern) {
-      if (input.progressPattern.length > 500) {
-        throw new Error('progressPattern must not exceed 500 characters');
-      }
-      try {
-        new RegExp(input.progressPattern, 'm');
-      } catch {
-        throw new Error('progressPattern must be a valid regular expression');
-      }
-    }
+    const progressPattern =
+      input.progressPattern !== undefined
+        ? this.compileProgressPattern(input.progressPattern)
+        : undefined;
 
     const id = randomUUID();
     const now = new Date().toISOString();
@@ -154,6 +175,7 @@ export class LifecycleManager extends EventEmitter {
     };
 
     this.jobs.set(id, record);
+    if (progressPattern) this.progressPatterns.set(id, progressPattern);
     this.pendingInputs.set(id, input);
     this.queue.push(id);
     this.touch(record, 'Job queued.', 'system', 'immediate');
@@ -188,47 +210,91 @@ export class LifecycleManager extends EventEmitter {
     tailLines = 120,
     signal?: AbortSignal
   ): Promise<WaitResult> {
+    this.assertNotDisposed();
     if (signal?.aborted) throw new Error('Job wait was aborted');
     const current = this.requireJob(jobId);
     if (isTerminalJobState(current.state)) {
       return { timedOut: false, job: this.snapshot(jobId, tailLines) };
     }
 
-    const boundedTimeout = Math.max(1, Math.min(timeoutMs, MAX_WAIT_MS));
-    return new Promise<WaitResult>((resolve, reject) => {
-      let settled = false;
-      const timer = setTimeout(() => finish(true), boundedTimeout);
-      const finish = (timedOut: boolean) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        this.off('jobChanged', listener);
-        signal?.removeEventListener('abort', abortListener);
-        resolve({ timedOut, job: this.snapshot(jobId, tailLines) });
-      };
-      const listener = (changed: JobRecord) => {
-        if (changed.id === jobId && isTerminalJobState(changed.state)) {
-          finish(false);
-        }
-      };
-      const abortListener = () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        this.off('jobChanged', listener);
-        signal?.removeEventListener('abort', abortListener);
-        reject(new Error('Job wait was aborted'));
-      };
-      this.on('jobChanged', listener);
-      signal?.addEventListener('abort', abortListener, { once: true });
-      timer.unref?.();
+    const existing = this.waitCoordinators.get(jobId);
+    if ((existing?.waiters.size ?? 0) >= MAX_WAITERS_PER_JOB) {
+      throw new Error('job_wait limit reached for job');
+    }
+    if (this.totalWaiters >= MAX_WAITERS_GLOBAL) {
+      throw new Error('global job_wait limit reached');
+    }
 
-      // Recheck after subscribing so a terminal transition cannot be lost
-      // between the initial state read and listener registration.
-      const latest = this.requireJob(jobId);
-      if (isTerminalJobState(latest.state)) finish(false);
-      else if (signal?.aborted) abortListener();
+    const boundedTimeout = Math.max(1, Math.min(timeoutMs, MAX_WAIT_MS));
+    const coordinator = existing ?? {
+      jobId,
+      waiters: new Map<number, Waiter>(),
+    };
+    if (!existing) this.waitCoordinators.set(jobId, coordinator);
+
+    return new Promise<WaitResult>((resolve, reject) => {
+      const waiter: Waiter = {
+        id: ++this.waiterSequence,
+        tailLines,
+        expiresAt: Date.now() + boundedTimeout,
+        signal,
+        resolve,
+        reject,
+      };
+      waiter.abortListener = () => {
+        this.rejectWaiter(
+          coordinator,
+          waiter,
+          new Error('Job wait was aborted')
+        );
+      };
+      coordinator.waiters.set(waiter.id, waiter);
+      this.totalWaiters += 1;
+      signal?.addEventListener('abort', waiter.abortListener, { once: true });
+      this.armWaitTimer(coordinator);
+
+      // Recheck after registration so a terminal transition or abort cannot be lost.
+      const latest = this.jobs.get(jobId);
+      if (!latest) {
+        this.rejectWaiter(
+          coordinator,
+          waiter,
+          new Error(`Unknown job: ${jobId}`)
+        );
+      } else if (isTerminalJobState(latest.state)) {
+        this.resolveCoordinator(coordinator, false);
+      } else if (signal?.aborted) {
+        waiter.abortListener();
+      }
     });
+  }
+
+  waitCoordinatorStatus() {
+    let timers = 0;
+    for (const coordinator of this.waitCoordinators.values()) {
+      if (coordinator.timer) timers += 1;
+    }
+    return {
+      waiters: this.totalWaiters,
+      jobs: this.waitCoordinators.size,
+      timers,
+    };
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const coordinator of Array.from(this.waitCoordinators.values())) {
+      this.rejectCoordinator(
+        coordinator,
+        new Error('LifecycleManager was disposed')
+      );
+    }
+    if (this.persistenceTimer) clearTimeout(this.persistenceTimer);
+    this.persistenceTimer = undefined;
+    this.progressPatterns.clear();
+    this.progressRemainders.clear();
+    this.removeAllListeners();
   }
 
   cancel(jobId: string): JobSnapshot {
@@ -540,7 +606,10 @@ export class LifecycleManager extends EventEmitter {
     const combined = `${previous}${data}`;
     const lines = combined.split(/\r\n|\r|\n/);
     const remainder = lines.pop() ?? '';
-    this.progressRemainders.set(job.id, remainder.slice(-64 * 1024));
+    this.progressRemainders.set(
+      job.id,
+      remainder.slice(-MAX_PROGRESS_LINE_LENGTH)
+    );
     for (const line of lines) this.parseProgress(job, line, input);
   }
 
@@ -550,34 +619,44 @@ export class LifecycleManager extends EventEmitter {
     input: StartJobInput
   ): void {
     let percentage: number | undefined;
+    let phase: string | undefined;
     let message: string | undefined;
     try {
+      const boundedData = data.slice(-MAX_PROGRESS_LINE_LENGTH);
       if (input.progressPattern) {
-        const matches = Array.from(
-          data.matchAll(new RegExp(input.progressPattern, 'gm'))
-        );
-        const match = matches.at(-1);
-        if (match?.[0]) {
-          const parsed = Number(match[1] ?? match[0]);
+        const compiled = this.progressPatterns.get(job.id);
+        if (!compiled) return;
+        const matcher = compiled.matcher(boundedData);
+        let matchedText: string | null = null;
+        let capturedPercentage: string | null = null;
+        while (matcher.find()) {
+          matchedText = matcher.group(0);
+          capturedPercentage = matcher.group(1);
+        }
+        if (matchedText !== null) {
+          const parsed = Number(capturedPercentage);
           if (Number.isFinite(parsed)) percentage = parsed;
-          message = match[0].slice(0, 240);
+          message = matchedText.slice(0, 240);
         }
       } else {
         const matches = Array.from(
-          data.matchAll(/(?:^|\s)(\d{1,3}(?:\.\d+)?)\s*%/g)
+          boundedData.matchAll(/(?:^|\s)(\d{1,3}(?:\.\d+)?)\s*%/g)
         );
         const match = matches.at(-1);
         if (match?.[0]) {
           percentage = Number(match[1]);
-          message = match[0].trim();
+          message = boundedData.trim().slice(0, 240);
         }
       }
+      const phaseMatch = /\[([A-Za-z][A-Za-z0-9_-]{0,63})\]/.exec(boundedData);
+      if (phaseMatch) phase = phaseMatch[1];
     } catch {
       // A malformed optional progress pattern must not interrupt the job.
     }
     if (percentage === undefined) return;
     job.progress = {
       percentage: Math.max(0, Math.min(100, percentage)),
+      phase,
       message,
       updatedAt: new Date().toISOString(),
     };
@@ -612,6 +691,7 @@ export class LifecycleManager extends EventEmitter {
           ? 'Job cancelled.'
           : error || `Job finished with state ${state}.`;
     this.touch(job, terminalMessage, 'system', 'immediate');
+    this.progressPatterns.delete(job.id);
   }
 
   private changed(job: JobRecord): void {
@@ -619,6 +699,10 @@ export class LifecycleManager extends EventEmitter {
     job.updatedAt = new Date().toISOString();
     this.schedulePersist();
     this.emit('jobChanged', job);
+    if (isTerminalJobState(job.state)) {
+      const coordinator = this.waitCoordinators.get(job.id);
+      if (coordinator) this.resolveCoordinator(coordinator, false);
+    }
   }
 
   private schedulePersist(): void {
@@ -662,7 +746,128 @@ export class LifecycleManager extends EventEmitter {
       this.pendingInputs.delete(job.id);
       this.runtimeHandles.delete(job.id);
       this.progressRemainders.delete(job.id);
+      this.progressPatterns.delete(job.id);
+      const coordinator = this.waitCoordinators.get(job.id);
+      if (coordinator) {
+        this.rejectCoordinator(
+          coordinator,
+          new Error(`Unknown job: ${job.id}`)
+        );
+      }
     }
+  }
+
+  private compileProgressPattern(pattern: string): RE2JS {
+    if (pattern.length > MAX_PROGRESS_PATTERN_LENGTH) {
+      throw new Error('progressPattern must not exceed 256 characters');
+    }
+    try {
+      const compiled = RE2JS.compile(pattern, RE2JS.MULTILINE);
+      if (compiled.groupCount() < 1) {
+        throw new Error('capture-group-required');
+      }
+      return compiled;
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === 'capture-group-required'
+      ) {
+        throw new Error('progressPattern must contain capture group 1');
+      }
+      throw new Error(
+        'progressPattern must be a valid RE2-compatible regular expression'
+      );
+    }
+  }
+
+  private armWaitTimer(coordinator: WaitCoordinator): void {
+    if (coordinator.timer) clearTimeout(coordinator.timer);
+    coordinator.timer = undefined;
+    if (coordinator.waiters.size === 0) {
+      this.waitCoordinators.delete(coordinator.jobId);
+      return;
+    }
+    const nextExpiry = Math.min(
+      ...Array.from(coordinator.waiters.values(), (waiter) => waiter.expiresAt)
+    );
+    coordinator.timer = setTimeout(
+      () => this.expireWaiters(coordinator),
+      Math.max(1, nextExpiry - Date.now())
+    );
+    coordinator.timer.unref?.();
+  }
+
+  private expireWaiters(coordinator: WaitCoordinator): void {
+    coordinator.timer = undefined;
+    const now = Date.now();
+    for (const waiter of Array.from(coordinator.waiters.values())) {
+      if (waiter.expiresAt <= now) {
+        this.resolveWaiter(coordinator, waiter, true);
+      }
+    }
+    this.armWaitTimer(coordinator);
+  }
+
+  private resolveCoordinator(
+    coordinator: WaitCoordinator,
+    timedOut: boolean
+  ): void {
+    for (const waiter of Array.from(coordinator.waiters.values())) {
+      this.resolveWaiter(coordinator, waiter, timedOut);
+    }
+    this.clearCoordinator(coordinator);
+  }
+
+  private rejectCoordinator(coordinator: WaitCoordinator, error: Error): void {
+    for (const waiter of Array.from(coordinator.waiters.values())) {
+      this.rejectWaiter(coordinator, waiter, error);
+    }
+    this.clearCoordinator(coordinator);
+  }
+
+  private resolveWaiter(
+    coordinator: WaitCoordinator,
+    waiter: Waiter,
+    timedOut: boolean
+  ): void {
+    if (!this.removeWaiter(coordinator, waiter)) return;
+    try {
+      waiter.resolve({
+        timedOut,
+        job: this.snapshot(coordinator.jobId, waiter.tailLines),
+      });
+    } catch (error) {
+      waiter.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private rejectWaiter(
+    coordinator: WaitCoordinator,
+    waiter: Waiter,
+    error: Error
+  ): void {
+    if (!this.removeWaiter(coordinator, waiter)) return;
+    waiter.reject(error);
+    this.armWaitTimer(coordinator);
+  }
+
+  private removeWaiter(coordinator: WaitCoordinator, waiter: Waiter): boolean {
+    if (!coordinator.waiters.delete(waiter.id)) return false;
+    this.totalWaiters -= 1;
+    if (waiter.abortListener) {
+      waiter.signal?.removeEventListener('abort', waiter.abortListener);
+    }
+    return true;
+  }
+
+  private clearCoordinator(coordinator: WaitCoordinator): void {
+    if (coordinator.timer) clearTimeout(coordinator.timer);
+    coordinator.timer = undefined;
+    this.waitCoordinators.delete(coordinator.jobId);
+  }
+
+  private assertNotDisposed(): void {
+    if (this.disposed) throw new Error('LifecycleManager was disposed');
   }
 
   private boundOutputChunk(data: string): {

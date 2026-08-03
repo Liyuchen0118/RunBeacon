@@ -267,55 +267,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      - name: Detect package manager
-        id: pm_audit
-        run: |
-          if [ -f yarn.lock ]; then echo "pm=yarn" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if [ -f pnpm-lock.yaml ]; then echo "pm=pnpm" >> "$GITHUB_OUTPUT"; exit 0; fi
-          echo "pm=npm" >> "$GITHUB_OUTPUT"
-
-      - name: Enable Corepack (optional)
-        if: steps.pm_audit.outputs.pm != 'npm'
-        run: corepack enable || true
-
-      - name: Cache (yarn)
-        if: steps.pm_audit.outputs.pm == 'yarn'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/yarn
-          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
-          restore-keys: ${{ runner.os }}-yarn-
-
-      - name: Cache (pnpm)
-        if: steps.pm_audit.outputs.pm == 'pnpm'
-        uses: actions/cache@v4
-        with:
-          path: ~/.pnpm-store
-          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-pnpm-
-
-      - name: Install dependencies
-        run: |
-          PM="${{ steps.pm_audit.outputs.pm }}"
-          if [ "$PM" = "npm" ]; then
-            if [ -f package-lock.json ]; then npm ci; else npm i; fi
-          elif [ "$PM" = "yarn" ]; then
-            yarn install --frozen-lockfile
-          else
-            pnpm install --frozen-lockfile
-          fi
-      - name: Run audit (non-blocking)
-        run: |
-          PM="${{ steps.pm_audit.outputs.pm }}"
-          if [ "$PM" = "npm" ]; then
-            npm audit --audit-level=high || true
-          elif [ "$PM" = "yarn" ]; then
-            yarn -s npm audit --audit-level=high || yarn -s audit || true
-          else
-            pnpm audit --audit-level=high || true
-          fi
+      - name: Audit production and development dependencies
+        run: npm audit --audit-level=high --registry=https://registry.npmjs.org
 
   license-compliance:
     if: ${{ !startsWith(github.head_ref, 'release-please--') }}

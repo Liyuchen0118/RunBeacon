@@ -1,4 +1,7 @@
 interface:
-  display_name: "Monitor Remote Jobs"
-  short_description: "Run and await long jobs without model polling"
-  default_prompt: "Use $monitor-remote-jobs to start this command as a tracked job and continue when it finishes."
+  display_name: "RunBeacon Remote Jobs"
+  short_description: "Tracked routing for SSH, GitHub, and remote jobs"
+  default_prompt: "Use $monitor-remote-jobs to configure default credentials and run this remote or GitHub job through RunBeacon."
+
+policy:
+  allow_implicit_invocation: true

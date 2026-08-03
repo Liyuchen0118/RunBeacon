@@ -3,7 +3,58 @@ import * as path from 'path';
 import * as fs from 'fs';
 
 const SENSITIVE_KEY =
-  /pass(word|phrase)?|private.?key|token|secret|credential|authorization|api.?key/i;
+  /pass(word|phrase)?|private.?key|token|secret|credential|authorization|api.?key|access.?key|cookie/i;
+const MAX_LOG_STRING_LENGTH = 4096;
+const MAX_LOG_DEPTH = 6;
+const MAX_LOG_KEYS = 100;
+const MAX_LOG_ARRAY_ITEMS = 100;
+const REDACTED = '[REDACTED]';
+const TRUNCATED = '[TRUNCATED]';
+
+function redactLogString(value: string): string {
+  let redacted = value
+    .replace(
+      /-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]*PRIVATE KEY-----/g,
+      REDACTED
+    )
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{20,255}\b/g, REDACTED)
+    .replace(/\bgh[pousr]_[A-Za-z0-9_]{20,255}\b/g, REDACTED)
+    .replace(/\bglpat-[A-Za-z0-9_-]{20,255}\b/g, REDACTED)
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, REDACTED)
+    .replace(/\bAIza[0-9A-Za-z_-]{30,60}\b/g, REDACTED)
+    .replace(/\bxox[baprs]-[A-Za-z0-9-]{10,255}\b/g, REDACTED)
+    .replace(/\bsk_live_[A-Za-z0-9]{16,255}\b/g, REDACTED)
+    .replace(
+      /([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+(?::[^/\s@]*)?@/gi,
+      `$1${REDACTED}@`
+    )
+    .replace(
+      /((?:authorization|proxy-authorization)\s*[:=]\s*)(?:basic|bearer)?\s*[^\s,;}]+/gi,
+      `$1${REDACTED}`
+    )
+    .replace(/\b(basic|bearer)\s+[A-Za-z0-9._~+/=-]+/gi, `$1 ${REDACTED}`)
+    .replace(/((?:set-cookie|cookie)\s*[:=]\s*)[^\r\n]+/gi, `$1${REDACTED}`)
+    .replace(
+      /((?:--?(?:password|passwd|passphrase|token|api[-_]?key|secret|client[-_]?secret|access[-_]?key|github[-_]?token)|-pw)\s*(?:=|\s)\s*)(?:"[^"]*"|'[^']*'|[^\s]+)/gi,
+      `$1${REDACTED}`
+    )
+    .replace(
+      /(\b[A-Z][A-Z0-9_]*(?:PASSWORD|PASSWD|PASSPHRASE|TOKEN|SECRET|API_KEY|ACCESS_KEY|PRIVATE_KEY|COOKIE)[A-Z0-9_]*\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s;]+)/g,
+      `$1${REDACTED}`
+    )
+    .replace(
+      /([?&](?:access_token|token|api_key|secret|password)=)[^&#\s]+/gi,
+      `$1${REDACTED}`
+    );
+
+  if (redacted.length > MAX_LOG_STRING_LENGTH) {
+    redacted = `${redacted.slice(
+      0,
+      MAX_LOG_STRING_LENGTH - TRUNCATED.length
+    )}${TRUNCATED}`;
+  }
+  return redacted;
+}
 
 function redactLogValue(
   value: unknown,
@@ -11,31 +62,93 @@ function redactLogValue(
   seen = new WeakSet<object>(),
   depth = 0
 ): unknown {
-  if (SENSITIVE_KEY.test(key)) return '[REDACTED]';
+  if (SENSITIVE_KEY.test(key)) return REDACTED;
   if (value === null || value === undefined) return value;
   if (typeof value === 'string') {
-    if (
-      /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(value) ||
-      /\b(?:basic|bearer)\s+[a-z0-9._~+/=-]+/i.test(value)
-    ) {
-      return '[REDACTED]';
-    }
-    return value;
+    return redactLogString(value);
   }
+  if (typeof value === 'bigint') return redactLogString(value.toString());
   if (typeof value !== 'object') return value;
-  if (depth >= 6 || seen.has(value)) return '[TRUNCATED]';
+  if (depth >= MAX_LOG_DEPTH || seen.has(value)) return TRUNCATED;
   seen.add(value);
 
-  if (Array.isArray(value)) {
-    return value.map((item) => redactLogValue(item, key, seen, depth + 1));
+  if (value instanceof Error) {
+    const safeError: Record<string, unknown> = {
+      name: redactLogString(value.name),
+      message: redactLogString(value.message),
+    };
+    if (value.stack) safeError.stack = redactLogString(value.stack);
+    if ('cause' in value) {
+      safeError.cause = redactLogValue(value.cause, 'cause', seen, depth + 1);
+    }
+    const errorKeys = Object.keys(value).filter(
+      (childKey) => !(childKey in safeError) && childKey !== 'cause'
+    );
+    const remainingSlots = MAX_LOG_KEYS - Object.keys(safeError).length;
+    const keptErrorKeys = errorKeys.slice(
+      0,
+      errorKeys.length > remainingSlots
+        ? Math.max(0, remainingSlots - 1)
+        : remainingSlots
+    );
+    for (const childKey of keptErrorKeys) {
+      if (childKey in safeError || childKey === 'cause') continue;
+      safeError[childKey] = redactObjectProperty(value, childKey, seen, depth);
+    }
+    if (errorKeys.length > keptErrorKeys.length) {
+      safeError.__truncated__ = TRUNCATED;
+    }
+    return safeError;
   }
 
-  return Object.fromEntries(
-    Object.entries(value).map(([childKey, childValue]) => [
+  if (value instanceof Date) return value.toISOString();
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    return `[BINARY ${value.byteLength} bytes]`;
+  }
+
+  if (Array.isArray(value)) {
+    const keptItems =
+      value.length > MAX_LOG_ARRAY_ITEMS
+        ? MAX_LOG_ARRAY_ITEMS - 1
+        : MAX_LOG_ARRAY_ITEMS;
+    const result = value
+      .slice(0, keptItems)
+      .map((item) => redactLogValue(item, key, seen, depth + 1));
+    if (value.length > MAX_LOG_ARRAY_ITEMS) result.push(TRUNCATED);
+    return result;
+  }
+
+  const result: Record<string, unknown> = {};
+  const childKeys = Object.keys(value);
+  const keptKeys =
+    childKeys.length > MAX_LOG_KEYS ? MAX_LOG_KEYS - 1 : MAX_LOG_KEYS;
+  for (const childKey of childKeys.slice(0, keptKeys)) {
+    result[childKey] = redactObjectProperty(value, childKey, seen, depth);
+  }
+  if (childKeys.length > MAX_LOG_KEYS) result.__truncated__ = TRUNCATED;
+  return result;
+}
+
+function redactObjectProperty(
+  value: object,
+  childKey: string,
+  seen: WeakSet<object>,
+  depth: number
+): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, childKey);
+    if (descriptor && !('value' in descriptor)) return TRUNCATED;
+    return redactLogValue(
+      descriptor
+        ? descriptor.value
+        : (value as Record<string, unknown>)[childKey],
       childKey,
-      redactLogValue(childValue, childKey, seen, depth + 1),
-    ])
-  );
+      seen,
+      depth + 1
+    );
+  } catch {
+    return TRUNCATED;
+  }
 }
 
 const redactFormat = winston.format((info) => {
@@ -117,7 +230,11 @@ export class Logger {
         redactFormat(),
         winston.format.json()
       ),
-      defaultMeta: { service: 'mcp-console', context, mcpMode: isMCPServer },
+      defaultMeta: {
+        service: 'mcp-console',
+        context: redactLogString(context),
+        mcpMode: isMCPServer,
+      },
       transports,
       // Never write application logs to stdout in MCP mode. Stdout belongs
       // exclusively to the JSON-RPC transport.
@@ -131,19 +248,33 @@ export class Logger {
   }
 
   info(message: string, meta?: any) {
-    this.logger.info(message, meta);
+    this.write('info', message, meta);
   }
 
   error(message: string, meta?: any) {
-    this.logger.error(message, meta);
+    this.write('error', message, meta);
   }
 
   warn(message: string, meta?: any) {
-    this.logger.warn(message, meta);
+    this.write('warn', message, meta);
   }
 
   debug(message: string, meta?: any) {
-    this.logger.debug(message, meta);
+    this.write('debug', message, meta);
+  }
+
+  private write(
+    level: 'info' | 'error' | 'warn' | 'debug',
+    message: string,
+    meta?: unknown
+  ): void {
+    const safeMessage = redactLogString(String(message));
+    if (meta === undefined) {
+      this.logger[level](safeMessage);
+      return;
+    }
+    const safeMeta = redactLogValue(meta);
+    this.logger[level](safeMessage, safeMeta);
   }
 
   getWinstonLogger(): winston.Logger {

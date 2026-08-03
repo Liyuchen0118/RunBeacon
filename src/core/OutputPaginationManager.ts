@@ -1,6 +1,6 @@
 import { ConsoleOutput } from '../types/index.js';
 import { Logger } from '../utils/logger.js';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 
 /**
@@ -403,7 +403,7 @@ export class OutputPaginationManager extends EventEmitter {
    */
   private calculateBufferChecksum(buffer: SessionBuffer): string {
     const data = `${buffer.sessionId}:${buffer.totalLines}:${buffer.lastAccessed}`;
-    return createHash('md5').update(data).digest('hex');
+    return createHash('sha256').update(data).digest('hex');
   }
 
   /**
@@ -547,9 +547,5 @@ export class OutputPaginationManager extends EventEmitter {
 
 // Utility function to generate UUID for tokens
 function uuidv4(): string {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-    const r = (Math.random() * 16) | 0;
-    const v = c == 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
+  return randomUUID();
 }

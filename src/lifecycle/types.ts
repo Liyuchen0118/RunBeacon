@@ -18,6 +18,7 @@ export interface JobOutputChunk {
 
 export interface JobProgress {
   percentage?: number;
+  phase?: string;
   message?: string;
   updatedAt: string;
 }
@@ -62,6 +63,7 @@ export interface StartJobInput {
   label?: string;
   timeoutMs?: number;
   target?: JobTarget;
+  /** RE2-compatible expression whose first capture group is the percentage. */
   progressPattern?: string;
   metadata?: Record<string, unknown>;
 }

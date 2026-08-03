@@ -1,7 +1,7 @@
 {
   "name": "remote-job-monitor",
-  "version": "0.1.1+codex.20260802090120",
-  "description": "Run local and SSH jobs with durable event-driven waits and a token-free live dashboard.",
+  "version": "1.0.0+codex.20260803075712",
+  "description": "Security-hardened tracked routing for local, SSH, and GitHub jobs with reusable default credentials and a token-free dashboard.",
   "author": {
     "name": "RunBeacon contributors"
   },
@@ -16,19 +16,23 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "RunBeacon",
-    "shortDescription": "Await long-running local and SSH jobs without model polling.",
-    "longDescription": "Tracks local and SSH command lifecycles, streams bounded output, waits for completion inside the MCP server, and renders a live MCP Apps dashboard without repeated model turns.",
+    "shortDescription": "Default tracked route for SSH, remote jobs, and publishing.",
+    "longDescription": "Automatically prefers tracked RunBeacon jobs for non-interactive remote execution. Independent default SSH and GitHub profiles remove repeated credential selection while preserving explicit overrides. RE2-compatible progress parsing and bounded shared wait coordination keep untrusted job output and concurrent waits resource-safe. Passwordless profiles reference ssh-agent and private-key paths; GitHub PAT profiles delegate secret storage to the configured Git credential helper. RunBeacon owns command and publishing lifecycles and renders a live dashboard without repeated model turns.",
     "developerName": "RunBeacon contributors",
     "category": "Developer Tools",
     "capabilities": [
       "MCP",
       "Hooks",
       "Interactive",
-      "SSH"
+      "SSH",
+      "GitHub"
     ],
     "defaultPrompt": [
-      "Track this long-running command and continue when it finishes.",
-      "Open the live dashboard for my remote jobs."
+      "Run this command on my SSH server through RunBeacon and continue when it finishes.",
+      "Save my GitHub PAT through the system credential manager without persisting it in RunBeacon.",
+      "Make my common SSH and GitHub profiles the defaults for future tracked jobs.",
+      "Open the live dashboard for my remote jobs.",
+      "Push my staged commit and monitor GitHub Actions in the dashboard."
     ]
   },
   "mcpServers": "./.mcp.json"

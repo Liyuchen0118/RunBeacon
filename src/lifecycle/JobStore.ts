@@ -87,6 +87,7 @@ export class JobStore {
               this.persistOutput && job.progress.message
                 ? redactPersistedText(job.progress.message, 240)
                 : undefined,
+            phase: this.persistOutput ? job.progress.phase : undefined,
           }
         : undefined,
       metadata: this.persistMetadata
@@ -177,6 +178,10 @@ function normalizeJob(
             message:
               persistOutput && typeof raw.progress.message === 'string'
                 ? redactPersistedText(raw.progress.message, 240)
+                : undefined,
+            phase:
+              persistOutput && typeof raw.progress.phase === 'string'
+                ? raw.progress.phase.slice(0, 64)
                 : undefined,
           }
         : undefined,

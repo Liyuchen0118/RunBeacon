@@ -721,7 +721,7 @@ export interface VNCConnectionOptions {
       key?: string;
       passphrase?: string;
     };
-    rejectUnauthorized?: boolean;
+    rejectUnauthorized?: true;
     ciphers?: string;
     secureProtocol?: string;
   };

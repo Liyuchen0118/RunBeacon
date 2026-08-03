@@ -1,7 +1,7 @@
 const SECRET_FLAG =
   /(--?(?:pass(?:word|phrase)?|token|secret|credential|authorization|api[-_]?key)(?:=|\s+))("[^"]*"|'[^']*'|\S+)/gi;
 
-const URL_CREDENTIALS = /([a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:)([^@\s/]+)(@)/gi;
+const URL_CREDENTIALS = /([a-z][a-z0-9+.-]*:\/\/)([^@\s/]+)(@)/gi;
 
 const SECRET_ENV_ASSIGNMENT =
   /\b((?:[A-Z0-9_]*(?:PASS(?:WORD|PHRASE)?|TOKEN|SECRET|CREDENTIAL|AUTHORIZATION|API_?KEY)[A-Z0-9_]*)=)("[^"]*"|'[^']*'|\S+)/gi;

@@ -3,8 +3,6 @@ name: Commit Lint
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
-  pull_request_target:
-    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
@@ -31,18 +29,10 @@ jobs:
 
       - name: Install commitlint dependencies
         run: |
-          npm install --save-dev @commitlint/config-conventional @commitlint/cli
-
-      - name: Validate current commit (if any)
-        if: github.event_name == 'push'
-        run: npx commitlint --from HEAD~1 --to HEAD --verbose
+          npm install --no-save --ignore-scripts @commitlint/config-conventional@19.8.1 @commitlint/cli@19.8.1
 
       - name: Validate PR commits
-        # Dependabot commit subjects ("build(deps): Bump X from Y to Z") use a
-        # fixed, capitalized "Bump" that the subject-case rule rejects. The bot's
-        # format is trusted and not author-editable, so skip commitlint for its
-        # PRs instead of failing every dependency bump.
-        if: (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && github.actor != 'dependabot[bot]'
+        if: github.event_name == 'pull_request'
         id: commitlint
         run: |
           echo "::group::Debug Information"
@@ -56,7 +46,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Comment on PR with commit format guide
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
+        if: failure() && github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
@@ -111,4 +101,3 @@ jobs:
               repo: context.repo.repo,
               body: body
             });
-

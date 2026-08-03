@@ -15,12 +15,23 @@ import {
 import { LifecycleManager } from '../lifecycle/LifecycleManager.js';
 import { DaemonClient, LifecycleService } from '../lifecycle/DaemonClient.js';
 import {
+  CredentialProfile,
+  CredentialProfileStore,
+  GitHubCredentialProfile,
+  SaveCredentialProfileInput,
+  SshCredentialProfile,
+} from '../lifecycle/CredentialProfileStore.js';
+import {
+  deleteGitHubTokenCredential,
+  saveGitHubTokenCredential,
+} from '../lifecycle/GitCredentialManager.js';
+import {
   createDashboardHtml,
   DASHBOARD_RESOURCE_URI,
   MCP_APP_MIME_TYPE,
 } from '../lifecycle/DashboardApp.js';
 import { safeErrorMessage } from '../lifecycle/security.js';
-import { StartJobInput } from '../lifecycle/types.js';
+import { SshJobTarget, StartJobInput } from '../lifecycle/types.js';
 import { RUNBEACON_VERSION } from '../lifecycle/protocol.js';
 
 process.env.MCP_SERVER_MODE = 'true';
@@ -29,6 +40,12 @@ const pluginData =
   process.env.PLUGIN_DATA ||
   process.env.CLAUDE_PLUGIN_DATA ||
   join(homedir(), '.remote-job-monitor');
+const githubPublishRunner = fileURLToPath(
+  new URL('../daemon/github-publish-runner.js', import.meta.url)
+);
+const credentialProfiles = new CredentialProfileStore(
+  join(pluginData, 'credential-profiles.json')
+);
 
 let manager: LifecycleService;
 if (process.env.RJM_INLINE_MANAGER === 'true') {
@@ -87,9 +104,309 @@ const sshTargetSchema = {
 
 const tools: Tool[] = [
   {
+    name: 'credential_profile_save',
+    description:
+      'Create or update a passwordless credential reference profile. SSH profiles store only host, user, host-key verification, and an SSH-agent/private-key path. GitHub profiles reuse Git Credential Manager. Passwords, passphrases, private-key contents, and tokens are rejected and never persisted.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'string',
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$',
+          description:
+            'Reusable profile name, for example production or github-main.',
+        },
+        kind: { type: 'string', enum: ['ssh', 'github'] },
+        host: {
+          type: 'string',
+          description: 'SSH host or github.com for a GitHub profile.',
+        },
+        port: { type: 'integer', minimum: 1, maximum: 65535, default: 22 },
+        username: { type: 'string' },
+        privateKeyPath: {
+          type: 'string',
+          description:
+            'Path to an SSH private key. Prefer loading encrypted keys into ssh-agent instead of storing a passphrase.',
+        },
+        agent: {
+          type: 'string',
+          description:
+            'SSH agent socket/pipe path, or "auto" to use SSH_AUTH_SOCK and the Windows OpenSSH agent pipe.',
+        },
+        hostKeySha256: {
+          type: 'string',
+          description: 'Pinned SSH host-key fingerprint.',
+        },
+        allowUnverifiedHostKey: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Explicit insecure override when no fingerprint is available.',
+        },
+        credentialSource: {
+          type: 'string',
+          enum: ['git'],
+          default: 'git',
+          description:
+            'GitHub credentials come from the configured Git credential helper.',
+        },
+        makeDefault: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Make the saved profile the default for its SSH or GitHub kind.',
+        },
+      },
+      required: ['id', 'kind'],
+    },
+    annotations: {
+      title: 'Save Credential Profile',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'credential_profile_list',
+    description:
+      'List safe credential reference profiles. Results never contain passwords, passphrases, private-key contents, or tokens.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['ssh', 'github'] },
+      },
+    },
+    annotations: {
+      title: 'List Credential Profiles',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'credential_profile_delete',
+    description:
+      'Delete one RunBeacon credential reference profile. This does not delete keys from ssh-agent, private-key files, or credentials from Git Credential Manager.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string' } },
+      required: ['id'],
+    },
+    annotations: {
+      title: 'Delete Credential Profile',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'credential_profile_set_default',
+    description:
+      'Make an existing safe credential profile the default for its kind. SSH and GitHub defaults are independent. This changes only RunBeacon profile selection and does not alter OS-managed secrets.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'string',
+          description: 'Existing SSH or GitHub credential profile id.',
+        },
+      },
+      required: ['id'],
+    },
+    annotations: {
+      title: 'Set Default Credential Profile',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'credential_profile_clear_default',
+    description:
+      'Clear the default SSH or GitHub credential profile without deleting the profile or any OS-managed secret.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['ssh', 'github'] },
+      },
+      required: ['kind'],
+    },
+    annotations: {
+      title: 'Clear Default Credential Profile',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'github_token_save',
+    description:
+      'Store a GitHub personal access token in the configured Git credential helper and create a safe RunBeacon profile reference. Prefer tokenEnvVar so the token never appears in conversation; use token only when the user explicitly provides it. The token is never written to RunBeacon profiles, jobs, dashboard state, or logs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'string',
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$',
+          description: 'Reusable GitHub credential profile name.',
+        },
+        host: {
+          type: 'string',
+          enum: ['github.com'],
+          default: 'github.com',
+        },
+        username: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 128,
+          description: 'GitHub account name associated with the token.',
+        },
+        tokenEnvVar: {
+          type: 'string',
+          pattern: '^[A-Za-z_][A-Za-z0-9_]{0,127}$',
+          description:
+            'Preferred: read the token from this MCP server environment variable.',
+        },
+        token: {
+          type: 'string',
+          minLength: 20,
+          maxLength: 2000,
+          description:
+            'Explicit memory-only token input. Use only when the user deliberately supplies a PAT in this conversation.',
+        },
+        makeDefault: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Make this PAT profile the default GitHub credential after saving.',
+        },
+      },
+      required: ['id', 'username'],
+    },
+    annotations: {
+      title: 'Save GitHub Token',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'github_token_delete',
+    description:
+      'Delete a GitHub PAT created through github_token_save from the configured Git credential helper and remove its RunBeacon profile reference. This cannot delete generic OAuth/login profiles.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'string',
+          description: 'RunBeacon GitHub PAT profile to delete.',
+        },
+      },
+      required: ['id'],
+    },
+    annotations: {
+      title: 'Delete GitHub Token',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'github_publish_start',
+    description:
+      'Start a dashboard-tracked GitHub publish: optionally commit already-staged changes, push without force, then monitor GitHub Actions in the background. This never runs git add. Use job_wait once if the workflow should continue automatically after publishing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cwd: {
+          type: 'string',
+          minLength: 1,
+          description: 'Working tree or a directory inside it.',
+        },
+        remote: {
+          type: 'string',
+          default: 'origin',
+          description: 'Git remote to push without force.',
+        },
+        branch: {
+          type: 'string',
+          description: 'Destination branch. Defaults to the current branch.',
+        },
+        commitMessage: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 10_000,
+          description:
+            'When present, commit only changes that are already staged. The tool never runs git add.',
+        },
+        watchActions: {
+          type: 'boolean',
+          default: true,
+          description:
+            'Discover and monitor GitHub Actions after the push. Disable for non-GitHub remotes.',
+        },
+        githubToken: {
+          type: 'string',
+          description:
+            'Optional memory-only GitHub token override. By default RunBeacon safely reuses Git Credential Manager for private repositories and API limits.',
+        },
+        actionsTimeoutMs: {
+          type: 'integer',
+          minimum: 10_000,
+          maximum: 82_800_000,
+          default: 1_800_000,
+        },
+        discoveryTimeoutMs: {
+          type: 'integer',
+          minimum: 1_000,
+          maximum: 600_000,
+          default: 120_000,
+        },
+        pollIntervalMs: {
+          type: 'integer',
+          minimum: 1_000,
+          maximum: 300_000,
+          default: 15_000,
+          description:
+            'Background API interval. Anonymous GitHub API access is automatically limited to at least 60 seconds.',
+        },
+        idempotencyKey: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 200,
+          description:
+            'Stable key that prevents a retry from creating another commit or push job.',
+        },
+        credentialProfile: {
+          type: 'string',
+          description:
+            'Optional saved GitHub profile that reuses Git Credential Manager without exposing its token. When omitted, the default GitHub profile is selected unless githubToken is supplied.',
+        },
+      },
+      required: ['cwd'],
+    },
+    annotations: {
+      title: 'Publish to GitHub',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    _meta: {
+      ui: { resourceUri: DASHBOARD_RESOURCE_URI },
+    },
+  } as Tool,
+  {
     name: 'job_start',
     description:
-      'Start a tracked local or SSH command. Use this instead of raw shell/ssh for long-running work so lifecycle events, output, progress, cancellation, and event-driven waiting remain available.',
+      'Start a tracked local or SSH command. This is the default tool for non-interactive remote execution: use it instead of raw shell/ssh whenever Codex calls a remote server so lifecycle events, output, progress, cancellation, and event-driven waiting remain available.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -136,13 +453,25 @@ const tools: Tool[] = [
         },
         progressPattern: {
           type: 'string',
+          maxLength: 256,
           description:
-            'Optional regex; capture group 1 must contain a percentage.',
+            'Optional RE2-compatible regex (no backreferences or lookbehind); capture group 1 must contain a finite percentage.',
         },
         metadata: {
           type: 'object',
           description:
             'In-memory caller metadata. It is not persisted unless RJM_PERSIST_METADATA=true, and sensitive-key values are redacted when persistence is enabled.',
+        },
+        credentialProfile: {
+          type: 'string',
+          description:
+            'Saved SSH profile. If omitted, a unique profile matching target.host and target.username is selected automatically when no inline authentication is supplied.',
+        },
+        useDefaultCredential: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Use the default SSH profile for an explicitly remote request. Leave false for local commands.',
         },
       },
       required: ['command'],
@@ -298,8 +627,196 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const args = (request.params.arguments ?? {}) as Record<string, any>;
   try {
     switch (request.params.name) {
+      case 'credential_profile_save': {
+        const makeDefault = args.makeDefault === true;
+        const profileInput = { ...args };
+        delete profileInput.makeDefault;
+        const profile = credentialProfiles.save(
+          profileInput as SaveCredentialProfileInput
+        );
+        if (makeDefault) credentialProfiles.setDefault(profile.id);
+        return reply(
+          { profile, isDefault: makeDefault },
+          `Saved passwordless ${profile.kind} credential profile ${profile.id}${makeDefault ? ' as the default' : ''}. No secret material was stored.`
+        );
+      }
+      case 'credential_profile_list': {
+        const kind = optionalCredentialKind(args.kind);
+        const defaults = credentialProfiles.defaults();
+        const profiles = credentialProfiles.list(kind).map((profile) => ({
+          ...profile,
+          isDefault: defaults[profile.kind] === profile.id,
+        }));
+        return reply(
+          { profiles, defaults },
+          `${profiles.length} safe credential reference profile(s).`
+        );
+      }
+      case 'credential_profile_delete': {
+        const profile = credentialProfiles.delete(String(args.id ?? ''));
+        return reply(
+          { profile },
+          `Deleted RunBeacon profile ${profile.id}; OS-managed credentials and key files were not changed.`
+        );
+      }
+      case 'credential_profile_set_default': {
+        const profile = credentialProfiles.setDefault(String(args.id ?? ''));
+        return reply(
+          { profile, defaults: credentialProfiles.defaults() },
+          `Set ${profile.id} as the default ${profile.kind} credential profile.`
+        );
+      }
+      case 'credential_profile_clear_default': {
+        const kind = optionalCredentialKind(args.kind);
+        if (!kind) throw new Error('Credential profile kind is required');
+        const profile = credentialProfiles.clearDefault(kind);
+        return reply(
+          {
+            clearedProfileId: profile?.id,
+            defaults: credentialProfiles.defaults(),
+          },
+          profile
+            ? `Cleared ${profile.id} as the default ${kind} credential profile.`
+            : `No default ${kind} credential profile was configured.`
+        );
+      }
+      case 'github_token_save': {
+        const id = String(args.id ?? '').trim();
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id)) {
+          throw new Error(
+            'Credential profile id must contain 1 to 64 letters, numbers, dots, underscores, or hyphens'
+          );
+        }
+        const existing = credentialProfiles
+          .list()
+          .find((profile) => profile.id === id);
+        if (existing && existing.kind !== 'github') {
+          throw new Error(`Credential profile ${id} is not a GitHub profile`);
+        }
+        const username = requiredString(args.username, 'username', 128);
+        const token = resolveGitHubTokenInput(args);
+        delete args.token;
+        await saveGitHubTokenCredential({
+          host: 'github.com',
+          username,
+          token,
+        });
+        const profile = credentialProfiles.save({
+          id,
+          kind: 'github',
+          host: 'github.com',
+          credentialSource: 'git',
+          username,
+          credentialKind: 'pat',
+        });
+        const makeDefault = args.makeDefault === true;
+        if (makeDefault) credentialProfiles.setDefault(profile.id);
+        return reply(
+          { profile, credentialStored: true, isDefault: makeDefault },
+          `Saved GitHub PAT profile ${profile.id}${makeDefault ? ' as the default' : ''} in the configured Git credential helper. RunBeacon stored only the safe profile reference.`
+        );
+      }
+      case 'github_token_delete': {
+        const profile = requireGitHubProfile(String(args.id ?? ''));
+        if (profile.credentialKind !== 'pat' || !profile.username) {
+          throw new Error(
+            `Credential profile ${profile.id} is not a PAT managed by RunBeacon`
+          );
+        }
+        await deleteGitHubTokenCredential(profile.host, profile.username);
+        credentialProfiles.delete(profile.id);
+        return reply(
+          { profileId: profile.id, credentialDeleted: true },
+          `Deleted GitHub PAT profile ${profile.id} from the configured Git credential helper and RunBeacon.`
+        );
+      }
+      case 'github_publish_start': {
+        const cwd = String(args.cwd ?? '').trim();
+        if (!cwd) throw new Error('cwd is required');
+        const remote = String(args.remote ?? 'origin');
+        const watchActions = args.watchActions !== false;
+        const branch = optionalString(args.branch);
+        const commitMessage = optionalString(args.commitMessage);
+        const actionsTimeoutMs = numericArgument(
+          args.actionsTimeoutMs,
+          1_800_000
+        );
+        const discoveryTimeoutMs = numericArgument(
+          args.discoveryTimeoutMs,
+          120_000
+        );
+        const pollIntervalMs = numericArgument(args.pollIntervalMs, 15_000);
+        const runnerArgs = [
+          githubPublishRunner,
+          '--cwd',
+          cwd,
+          '--remote',
+          remote,
+          '--watch-actions',
+          String(watchActions),
+          '--actions-timeout-ms',
+          String(actionsTimeoutMs),
+          '--discovery-timeout-ms',
+          String(discoveryTimeoutMs),
+          '--poll-interval-ms',
+          String(pollIntervalMs),
+        ];
+        if (branch) runnerArgs.push('--branch', branch);
+        if (commitMessage) runnerArgs.push('--commit-message', commitMessage);
+
+        const githubToken = optionalString(args.githubToken);
+        const credentialProfileId = optionalString(args.credentialProfile);
+        const credentialProfile = credentialProfileId
+          ? requireGitHubProfile(credentialProfileId)
+          : githubToken
+            ? undefined
+            : credentialProfiles.getDefault('github');
+        const job = await manager.start({
+          command: process.execPath,
+          args: runnerArgs,
+          shell: false,
+          label: `GitHub publish ${remote}/${branch ?? 'current branch'}`,
+          timeoutMs: Math.min(
+            24 * 60 * 60_000,
+            actionsTimeoutMs + discoveryTimeoutMs + 15 * 60_000
+          ),
+          idempotencyKey: optionalString(args.idempotencyKey),
+          progressPattern:
+            '^(\\d{1,3}(?:\\.\\d+)?)%\\s+\\[[A-Za-z][A-Za-z0-9_-]{0,63}\\].*$',
+          env:
+            githubToken || credentialProfile
+              ? {
+                  ...(githubToken
+                    ? { RUNBEACON_GITHUB_TOKEN: githubToken }
+                    : {}),
+                  ...(credentialProfile
+                    ? {
+                        RUNBEACON_GITHUB_CREDENTIAL_SOURCE: 'git',
+                        ...(credentialProfile.username
+                          ? {
+                              RUNBEACON_GITHUB_USERNAME:
+                                credentialProfile.username,
+                            }
+                          : {}),
+                      }
+                    : {}),
+                }
+              : undefined,
+          metadata: {
+            kind: 'github_publish',
+            remote,
+            branch: branch ?? 'current',
+            watchActions,
+            credentialProfile: credentialProfile?.id,
+          },
+        });
+        return reply(
+          { job },
+          `GitHub publish job ${job.id} started. The dashboard tracks commit, push, and Actions without model polling; call job_wait once if you need to continue automatically.`
+        );
+      }
       case 'job_start': {
-        const job = await manager.start(args as StartJobInput);
+        const job = await manager.start(resolveJobStartInput(args));
         return reply(
           { job },
           `Tracked job ${job.id} queued. Call job_wait once to resume when it finishes; do not poll.`
@@ -343,6 +860,188 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     };
   }
 });
+
+function optionalString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function requiredString(value: unknown, name: string, limit: number): string {
+  const normalized = optionalString(value);
+  if (!normalized || normalized.length > limit || /[\r\n\0]/.test(normalized)) {
+    throw new Error(
+      `${name} is required and must not exceed ${limit} characters`
+    );
+  }
+  return normalized;
+}
+
+function resolveGitHubTokenInput(args: Record<string, any>): string {
+  const inlineToken = optionalString(args.token);
+  const environmentName = optionalString(args.tokenEnvVar);
+  if (Boolean(inlineToken) === Boolean(environmentName)) {
+    throw new Error('Provide exactly one of tokenEnvVar or token');
+  }
+  if (inlineToken) return inlineToken;
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(environmentName ?? '')) {
+    throw new Error('tokenEnvVar must be a valid environment variable name');
+  }
+  const token = process.env[environmentName!]?.trim();
+  if (!token) {
+    throw new Error(
+      `GitHub token environment variable ${environmentName} is not available to the MCP server`
+    );
+  }
+  return token;
+}
+
+function numericArgument(value: unknown, fallback: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new Error('Expected a numeric argument');
+  return Math.round(parsed);
+}
+
+function optionalCredentialKind(
+  value: unknown
+): CredentialProfile['kind'] | undefined {
+  if (value === undefined) return undefined;
+  if (value === 'ssh' || value === 'github') return value;
+  throw new Error('Credential profile kind must be ssh or github');
+}
+
+function requireGitHubProfile(id: string): GitHubCredentialProfile {
+  const profile = credentialProfiles.get(id);
+  if (profile.kind !== 'github') {
+    throw new Error(`Credential profile ${id} is not a GitHub profile`);
+  }
+  return profile;
+}
+
+function resolveJobStartInput(args: Record<string, any>): StartJobInput {
+  const input = { ...args } as Record<string, any>;
+  delete input.credentialProfile;
+  delete input.useDefaultCredential;
+  const requestedProfile = optionalString(args.credentialProfile);
+  const useDefaultCredential = args.useDefaultCredential === true;
+  if (requestedProfile && useDefaultCredential) {
+    throw new Error(
+      'Use either credentialProfile or useDefaultCredential, not both'
+    );
+  }
+  const suppliedTarget =
+    args.target && typeof args.target === 'object'
+      ? ({ ...args.target } as Record<string, any>)
+      : undefined;
+  let profile: SshCredentialProfile | undefined;
+
+  if (requestedProfile) {
+    const selected = credentialProfiles.get(requestedProfile);
+    if (selected.kind !== 'ssh') {
+      throw new Error(
+        `Credential profile ${requestedProfile} is not an SSH profile`
+      );
+    }
+    profile = selected;
+  } else if (useDefaultCredential) {
+    profile = credentialProfiles.getDefault('ssh');
+    if (!profile) {
+      throw new Error(
+        'No default SSH credential profile is configured; set one with credential_profile_set_default'
+      );
+    }
+  } else if (
+    suppliedTarget?.kind === 'ssh' &&
+    !suppliedTarget.password &&
+    !suppliedTarget.privateKeyPath &&
+    !suppliedTarget.agent
+  ) {
+    const matches = credentialProfiles.findSsh(
+      String(suppliedTarget.host ?? ''),
+      optionalString(suppliedTarget.username)
+    );
+    if (matches.length === 1) profile = matches[0];
+    if (matches.length > 1) {
+      throw new Error(
+        `Multiple SSH profiles match ${String(suppliedTarget.host)}; pass credentialProfile explicitly`
+      );
+    }
+  }
+
+  let target = suppliedTarget;
+  if (profile) {
+    if (target?.kind && target.kind !== 'ssh') {
+      throw new Error(
+        'An SSH credential profile cannot be used with a local target'
+      );
+    }
+    if (
+      target?.host &&
+      String(target.host).toLowerCase() !== profile.host.toLowerCase()
+    ) {
+      throw new Error(
+        `SSH profile ${profile.id} is for ${profile.host}, not ${String(target.host)}`
+      );
+    }
+    if (
+      target?.username &&
+      String(target.username).toLowerCase() !== profile.username.toLowerCase()
+    ) {
+      throw new Error(
+        `SSH profile ${profile.id} is for user ${profile.username}, not ${String(target.username)}`
+      );
+    }
+    target = {
+      kind: 'ssh',
+      host: profile.host,
+      port: profile.port,
+      username: profile.username,
+      privateKeyPath: profile.privateKeyPath,
+      agent: profile.agent,
+      hostKeySha256: profile.hostKeySha256,
+      allowUnverifiedHostKey: profile.allowUnverifiedHostKey,
+      ...target,
+    };
+    const metadata =
+      input.metadata &&
+      typeof input.metadata === 'object' &&
+      !Array.isArray(input.metadata)
+        ? input.metadata
+        : {};
+    input.metadata = { ...metadata, credentialProfile: profile.id };
+  }
+
+  if (target?.kind === 'ssh') {
+    if (!optionalString(target.host) || !optionalString(target.username)) {
+      throw new Error(
+        'SSH host and username are required when no credential profile supplies them'
+      );
+    }
+    if (target.agent === 'auto') target.agent = resolveSshAgent();
+    if (!target.password && !target.privateKeyPath && !target.agent) {
+      throw new Error(
+        'SSH authentication is missing. Save a passwordless credential profile with credential_profile_save, or provide a memory-only password for this job.'
+      );
+    }
+    input.target = target as unknown as SshJobTarget;
+  } else if (target) {
+    input.target = target;
+  }
+
+  return input as StartJobInput;
+}
+
+function resolveSshAgent(): string {
+  const configured = process.env.SSH_AUTH_SOCK?.trim();
+  if (configured) return configured;
+  if (process.platform === 'win32') {
+    return '\\\\.\\pipe\\openssh-ssh-agent';
+  }
+  throw new Error(
+    'agent="auto" requires SSH_AUTH_SOCK outside Windows; start ssh-agent or save an explicit agent path'
+  );
+}
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

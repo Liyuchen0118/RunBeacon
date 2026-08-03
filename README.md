@@ -2,19 +2,28 @@
 
 RunBeacon turns long-running local and SSH commands into tracked jobs for Codex. The Codex plugin keeps the stable ID `remote-job-monitor`: Codex starts a job once, calls `job_wait` once, and resumes when the resident daemon reports a terminal event. A live MCP Apps dashboard refreshes by calling the MCP server directly, so dashboard updates and intermediate status checks do not create model turns.
 
-Version 0.1.1 adds idempotent starts, abort-safe event waits, bounded history and output, coalesced state persistence, UTF-8-safe streaming, local process-tree cancellation, explicit daemon protocol compatibility, and stricter metadata/progress persistence defaults.
+For non-interactive remote execution, RunBeacon is the default route. Its skill description makes Codex prefer `job_start` for server/SSH requests, a `UserPromptSubmit` Hook adds the routing policy when a prompt contains remote-execution intent, and a `PreToolUse` Hook blocks raw `ssh`, `scp`, `sftp`, or `plink` commands that would bypass lifecycle tracking. Plugin Hooks must be reviewed and trusted by the user after installation.
+
+Plugin version 1.0.0 and npm version 2.0.0 add security-bounded RE2 progress parsing, shared `job_wait` coordination, entry-point log redaction, verified TLS-only VNC challenge authentication, and strict HTTPS Xen XAPI access. This is a breaking security release; see the [2.0 security migration guide](docs/SECURITY_MIGRATION_2.0.md).
 
 ## What is implemented
 
 - Resident cross-platform daemon over a local named pipe or Unix socket
-- Event-driven `job_wait` with a configurable 24-hour MCP tool timeout
+- Event-driven `job_wait` with a configurable 24-hour MCP tool timeout, one timer per job, and bounded per-job/global waiters
 - Local process and SSH channel ownership, output capture, cancellation, and timeout handling
 - Lifecycle assessment with active/stalled state, elapsed time, progress, and linear ETA
 - MCP Apps dashboard whose refresh loop consumes no model tokens
+- Dashboard-tracked Git commit, push, and GitHub Actions phases through `github_publish_start`
 - `PreToolUse` Hook that blocks untracked raw `ssh`, `scp`, `sftp`, and `plink`
+- `UserPromptSubmit` Hook that selects RunBeacon for operational remote-server requests
 - Memory-only inline SSH passwords/passphrases and pinned host-key support
+- Passwordless `credential_profile_*` tools for SSH agent/private-key references and Git Credential Manager
+- `github_token_save` and `github_token_delete` for OS-managed GitHub PAT credentials
+- Independent default SSH and GitHub profiles with explicit set/clear tools
 - Persistent redacted job metadata; command output persistence is off by default
 - Reattachment from a new MCP client to jobs owned by the resident daemon
+- RE2-compatible progress patterns compiled once per job and matched against a bounded 16 KiB line tail
+- Pre-sink structured log redaction with depth, key, array, and string limits
 
 ## Token-free control flow
 
@@ -40,6 +49,75 @@ sequenceDiagram
 
 The dashboard still refreshes locally every 1.5 seconds, but those calls run between the MCP App and the MCP server. They do not invoke the model and do not spend model tokens. The model-facing path is event-driven.
 
+## GitHub publishing dashboard
+
+Call `github_publish_start` with a repository directory. If `commitMessage` is supplied, RunBeacon commits only changes that are already staged, then performs a normal non-force push. It never runs `git add`, so file selection remains an explicit user or Codex action.
+
+```json
+{
+  "cwd": "C:\\work\\my-repository",
+  "remote": "origin",
+  "commitMessage": "feat: add dashboard",
+  "watchActions": true,
+  "idempotencyKey": "publish-dashboard-v1"
+}
+```
+
+The attached MCP App shows `preflight`, `commit`, `push`, `pushed`, `actions-discovery`, `actions`, and terminal phases. For a public repository, Actions discovery works anonymously at a rate-limit-safe interval. A private repository can use the memory-only `githubToken` argument; the token is passed only to the runner environment and is never added to the command, job metadata, output, or persistent state.
+
+Use `job_wait` once with the returned job ID when Codex should automatically continue to the next reasoning step after publishing. Merely watching the dashboard requires no model turns.
+
+## Passwordless credential profiles
+
+RunBeacon profiles store connection references, never secrets. Create an SSH profile with `credential_profile_save` using a host, username, pinned host-key fingerprint, and either `agent: "auto"` or `privateKeyPath`. Then pass only `credentialProfile` to `job_start`; when a target contains a matching host and user but no inline authentication, RunBeacon also selects the unique matching SSH profile automatically.
+
+```json
+{
+  "id": "production",
+  "kind": "ssh",
+  "host": "server.example.com",
+  "username": "deploy",
+  "agent": "auto",
+  "hostKeySha256": "SHA256:..."
+}
+```
+
+After the key is loaded into the OS `ssh-agent`, a tracked command needs only `command` and `credentialProfile: "production"`.
+
+For GitHub OAuth, sign in once through Git Credential Manager:
+
+```powershell
+git credential-manager github login --device --no-ui
+```
+
+Save `{ "id": "github-main", "kind": "github", "host": "github.com" }` and pass `credentialProfile: "github-main"` to `github_publish_start`. Git itself obtains the push credential, and the background Actions watcher calls `git credential fill` with interaction disabled. Credential-helper output is kept in runner memory, never forwarded to logs or the model, and never written to job state. The profile does not perform the initial OS login; `ssh-add` or Git Credential Manager login is a one-time user action.
+
+To import a GitHub PAT, prefer an environment variable that is already available to the MCP server:
+
+```json
+{
+  "id": "github-pat",
+  "username": "octocat",
+  "tokenEnvVar": "RUNBEACON_GITHUB_PAT"
+}
+```
+
+Call `github_token_save` with that input. When the user explicitly chooses to paste a PAT into the conversation, the tool also accepts `token` instead of `tokenEnvVar`. In both modes the PAT travels to `git credential approve` over stdin, is verified through a non-interactive `git credential fill`, and is never placed in command arguments or RunBeacon persistence. Conversation history may retain a pasted token, so environment import or Git Credential Manager's login flow is safer.
+
+RunBeacon refuses the plaintext Git `credential-store` helper for PAT saving. Configure Git Credential Manager or another OS-backed helper first.
+
+Use the resulting `credentialProfile: "github-pat"` with `github_publish_start`. `github_token_delete` removes both a PAT profile and its matching helper credential; it refuses to delete generic OAuth/login profiles.
+
+`credential_profile_list` returns only safe references. `credential_profile_delete` removes the RunBeacon reference but does not delete OS credentials, agent keys, or key files.
+
+## Default credential profiles
+
+Call `credential_profile_set_default` with an existing profile id, or pass `makeDefault: true` while saving a profile. RunBeacon keeps one SSH default and one GitHub default. `credential_profile_list` marks each selected profile with `isDefault` and returns the current `defaults` map.
+
+For a remote SSH request with no named server, `job_start` uses the SSH default only when `useDefaultCredential: true` is explicitly present. Local jobs never inherit it. Explicit `credentialProfile`, host, or inline authentication remains authoritative. For `github_publish_start`, the GitHub default is automatic when both `credentialProfile` and `githubToken` are absent.
+
+Use `credential_profile_clear_default` to stop automatic selection without deleting the profile. Deleting a profile also clears it if it was the default.
+
 ## Development quick start
 
 ```powershell
@@ -56,7 +134,7 @@ See [RunBeacon architecture](docs/REMOTE_JOB_MONITOR_ARCHITECTURE.md) for lifecy
 
 ## Important boundary
 
-The plugin can reliably monitor only commands that it launches through `job_start`. A Hook can stop raw SSH before it starts, but no plugin can reconstruct a complete process lifecycle after an arbitrary command has already detached outside the plugin. Inline SSH passwords supplied by the user are accepted for a single tracked job, held in daemon memory, and never persisted; SSH agent or key-path authentication is preferred.
+The plugin can reliably monitor only commands that it launches through `job_start` or `github_publish_start`. A Hook can stop raw SSH before it starts, but no plugin can reconstruct a complete process lifecycle after an arbitrary command has already detached outside the plugin. Inline SSH passwords supplied by the user are accepted for a single tracked job, held in daemon memory, and never persisted; SSH agent or key-path authentication is preferred.
 
 ---
 

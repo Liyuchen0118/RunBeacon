@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.0.0 (2026-08-03)
+
+### Breaking security changes
+
+* require RE2-compatible lifecycle progress patterns with capture group 1 and bounded input
+* reject raw VNC challenge authentication, VeNCrypt PLAIN, and disabled TLS certificate validation
+* require HTTPS for Xen XAPI and add explicit CA plus optional SHA-256 certificate pinning
+
+### Security
+
+* share one timer per job across bounded `job_wait` callers and release all resources on every terminal path
+* cap Xen XAPI time, status, JSON, and response-body handling
+* redact structured messages, errors, headers, URLs, command arguments, environment assignments, PEM keys, cookies, and cloud credentials before Winston sinks
+* isolate CodeQL analysis from build, test, and dependency-audit failures
+
 ## [1.1.3](https://github.com/ooples/mcp-console-automation/compare/v1.1.2...v1.1.3) (2026-07-15)
 
 
