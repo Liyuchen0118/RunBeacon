@@ -885,7 +885,11 @@ describeIfHardware('Load and Stress Tests', () => {
 
         // Verify output was captured
         const output = consoleManager.getOutput(sessionId);
-        expect(output.length).toBeGreaterThan(commands / 2); // At least half the commands should have output
+        const capturedCommands = new Set(
+          [...output.map(entry => entry.data).join('').matchAll(/Command (\d+)/g)]
+            .map(match => Number(match[1]))
+        );
+        expect(capturedCommands.size).toBeGreaterThan(commands / 2); // At least half the commands should have output
 
       } finally {
         await consoleManager.stopSession(sessionId);
