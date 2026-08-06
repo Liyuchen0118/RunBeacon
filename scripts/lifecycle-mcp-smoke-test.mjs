@@ -12,6 +12,33 @@ const serverPath = path.join(root, 'dist', 'mcp', 'lifecycle-server.js');
 const temporaryData = fs.mkdtempSync(
   path.join(os.tmpdir(), 'remote-job-monitor-mcp-')
 );
+const credentialHelperPath = path.join(temporaryData, 'credential-helper.cjs');
+const credentialHelperState = path.join(
+  temporaryData,
+  'credential-helper-state.json'
+);
+fs.writeFileSync(
+  credentialHelperPath,
+  [
+    "'use strict';",
+    "const fs = require('node:fs');",
+    'const [statePath, action] = process.argv.slice(2);',
+    "let input = '';",
+    "const parse = text => Object.fromEntries(text.split(/\\r?\\n/).filter(Boolean).map(line => { const at = line.indexOf('='); return [line.slice(0, at), line.slice(at + 1)]; }));",
+    "const load = () => fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : {};",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', chunk => { input += chunk; });",
+    "process.stdin.on('end', () => {",
+    '  const query = parse(input);',
+    "  const key = [query.protocol || '', query.host || '', query.username || ''].join('|');",
+    '  const entries = load();',
+    "  if (action === 'store') { entries[key] = input; fs.writeFileSync(statePath, JSON.stringify(entries)); }",
+    "  if (action === 'get' && entries[key]) process.stdout.write(entries[key]);",
+    "  if (action === 'erase') { delete entries[key]; fs.writeFileSync(statePath, JSON.stringify(entries)); }",
+    '});',
+  ].join('\n')
+);
+const credentialHelperCommand = `!node ${credentialHelperPath.replaceAll('\\', '/')} ${credentialHelperState.replaceAll('\\', '/')}`;
 
 assert.ok(fs.existsSync(serverPath), `Missing built server: ${serverPath}`);
 
@@ -28,6 +55,11 @@ const transport = new StdioClientTransport({
     MCP_SERVER_MODE: 'true',
     PLUGIN_DATA: temporaryData,
     RJM_INLINE_MANAGER: 'true',
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'credential.helper',
+    GIT_CONFIG_VALUE_0: '',
+    GIT_CONFIG_KEY_1: 'credential.helper',
+    GIT_CONFIG_VALUE_1: credentialHelperCommand,
   },
 });
 
@@ -51,6 +83,8 @@ try {
     'credential_profile_delete',
     'credential_profile_set_default',
     'credential_profile_clear_default',
+    'ssh_password_save',
+    'ssh_password_delete',
     'github_token_save',
     'github_token_delete',
   ]) {
@@ -108,6 +142,29 @@ try {
   });
   assert.equal(rejectedTokenImport.isError, true);
 
+  const sshPasswordCanary = 'SSH_PASSWORD_MUST_NOT_LEAVE_OS_STORE_5926';
+  const savedPasswordProfile = await client.callTool({
+    name: 'ssh_password_save',
+    arguments: {
+      id: 'ssh-password-smoke',
+      host: '127.0.0.1',
+      port: 1,
+      username: 'test',
+      password: sshPasswordCanary,
+      allowUnverifiedHostKey: true,
+      makeDefault: true,
+    },
+  });
+  assert.notEqual(savedPasswordProfile.isError, true);
+  assert.equal(
+    savedPasswordProfile.structuredContent?.profile?.credentialKind,
+    'password'
+  );
+  assert.doesNotMatch(
+    JSON.stringify(savedPasswordProfile),
+    new RegExp(sshPasswordCanary)
+  );
+
   for (const profile of [
     {
       id: 'github-main',
@@ -117,9 +174,9 @@ try {
       username: 'runbeacon-smoke',
     },
     {
-      id: 'ssh-smoke',
+      id: 'ssh-key-smoke',
       kind: 'ssh',
-      host: '127.0.0.1',
+      host: '127.0.0.2',
       port: 1,
       username: 'test',
       privateKeyPath: path.join(temporaryData, 'missing-test-key'),
@@ -132,7 +189,7 @@ try {
     });
     assert.notEqual(saved.isError, true);
   }
-  for (const id of ['github-main', 'ssh-smoke']) {
+  for (const id of ['github-main']) {
     const selected = await client.callTool({
       name: 'credential_profile_set_default',
       arguments: { id },
@@ -143,11 +200,12 @@ try {
     name: 'credential_profile_list',
     arguments: {},
   });
-  assert.equal(profiles.structuredContent?.profiles?.length, 2);
+  assert.equal(profiles.structuredContent?.profiles?.length, 3);
   assert.deepEqual(profiles.structuredContent?.defaults, {
     github: 'github-main',
-    ssh: 'ssh-smoke',
+    ssh: 'ssh-password-smoke',
   });
+  assert.doesNotMatch(JSON.stringify(profiles), new RegExp(sshPasswordCanary));
 
   const profileJob = await client.callTool({
     name: 'job_start',
@@ -161,7 +219,11 @@ try {
   assert.equal(profileJob.structuredContent?.job?.target?.kind, 'ssh');
   assert.equal(
     profileJob.structuredContent?.job?.metadata?.credentialProfile,
-    'ssh-smoke'
+    'ssh-password-smoke'
+  );
+  assert.doesNotMatch(
+    JSON.stringify(profileJob),
+    new RegExp(sshPasswordCanary)
   );
   const profileJobResult = await client.callTool({
     name: 'job_wait',
@@ -171,6 +233,46 @@ try {
     },
   });
   assert.equal(profileJobResult.structuredContent?.job?.state, 'failed');
+  assert.doesNotMatch(
+    JSON.stringify(profileJobResult),
+    new RegExp(sshPasswordCanary)
+  );
+
+  const matchedPasswordJob = await client.callTool({
+    name: 'job_start',
+    arguments: {
+      command: 'echo matched-password-profile',
+      target: {
+        kind: 'ssh',
+        host: '127.0.0.1',
+        port: 1,
+        username: 'test',
+      },
+      timeoutMs: 1_000,
+    },
+  });
+  assert.notEqual(matchedPasswordJob.isError, true);
+  assert.equal(
+    matchedPasswordJob.structuredContent?.job?.metadata?.credentialProfile,
+    'ssh-password-smoke'
+  );
+  const matchedPasswordResult = await client.callTool({
+    name: 'job_wait',
+    arguments: {
+      jobId: matchedPasswordJob.structuredContent?.job?.id,
+      timeoutMs: 5_000,
+    },
+  });
+  assert.equal(matchedPasswordResult.structuredContent?.job?.state, 'failed');
+
+  const dashboardWithPasswordJob = await client.callTool({
+    name: 'job_dashboard',
+    arguments: {},
+  });
+  assert.doesNotMatch(
+    JSON.stringify(dashboardWithPasswordJob),
+    new RegExp(sshPasswordCanary)
+  );
 
   const repository = path.join(temporaryData, 'publish-worktree');
   const remote = path.join(temporaryData, 'publish-remote.git');
@@ -273,6 +375,10 @@ try {
     fs.readFileSync(stateFile, 'utf8'),
     /GITHUB_TOKEN_MUST_NOT_PERSIST_4862/
   );
+  assert.doesNotMatch(
+    fs.readFileSync(stateFile, 'utf8'),
+    new RegExp(sshPasswordCanary)
+  );
   const credentialStateFile = path.join(
     temporaryData,
     'credential-profiles.json'
@@ -281,6 +387,24 @@ try {
   assert.doesNotMatch(
     fs.readFileSync(credentialStateFile, 'utf8'),
     /PROFILE_SECRET_MUST_NOT_PERSIST_7416/
+  );
+  assert.doesNotMatch(
+    fs.readFileSync(credentialStateFile, 'utf8'),
+    new RegExp(sshPasswordCanary)
+  );
+
+  const deletedPasswordProfile = await client.callTool({
+    name: 'ssh_password_delete',
+    arguments: { id: 'ssh-password-smoke' },
+  });
+  assert.notEqual(deletedPasswordProfile.isError, true);
+  assert.equal(
+    deletedPasswordProfile.structuredContent?.credentialDeleted,
+    true
+  );
+  assert.doesNotMatch(
+    fs.readFileSync(credentialHelperState, 'utf8'),
+    new RegExp(sshPasswordCanary)
   );
 
   process.stdout.write(

@@ -15,6 +15,10 @@
 * redact structured messages, errors, headers, URLs, command arguments, environment assignments, PEM keys, cookies, and cloud credentials before Winston sinks
 * isolate CodeQL analysis from build, test, and dependency-audit failures
 
+### Features
+
+* add OS-backed SSH password profiles for IP/host and username connections, including default selection, safe deletion, and runtime-only password injection
+
 ## [1.1.3](https://github.com/ooples/mcp-console-automation/compare/v1.1.2...v1.1.3) (2026-07-15)
 
 

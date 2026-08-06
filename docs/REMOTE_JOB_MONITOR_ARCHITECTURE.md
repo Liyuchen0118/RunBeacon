@@ -86,17 +86,20 @@ Authentication order is supplied per job:
 
 1. SSH agent path
 2. Private key path with optional memory-only passphrase
-3. Memory-only password explicitly supplied by the user
+3. Password read into memory from an OS-managed RunBeacon credential reference
+4. Memory-only password explicitly supplied by the user
 
 Require `hostKeySha256` by default. `allowUnverifiedHostKey` is an explicit insecure override and should only be used with user awareness.
 
 The local daemon RPC uses a random token stored with owner-only permissions under `PLUGIN_DATA`. On Windows it uses a named pipe; on macOS/Linux it uses an owner-only Unix socket.
 
-Passwordless profiles are stored separately as `credential-profiles.json` with owner-only permissions. SSH profiles contain only host, port, username, an agent socket/pipe or private-key path, and host-key verification policy. A profile never accepts passwords, passphrases, tokens, authorization headers, or private-key contents. `job_start` can select a profile explicitly or uniquely match one by host and username.
+Safe profiles are stored separately as `credential-profiles.json` with owner-only permissions. SSH profiles contain only host, port, username, an agent socket/pipe or private-key path, host-key verification policy, and optionally `credentialKind: "password"`. A profile never contains passwords, passphrases, tokens, authorization headers, or private-key contents. `ssh_password_save` sends a password over stdin to an OS-backed Git credential helper under a profile-specific synthetic host, verifies the saved value, and rolls back on profile persistence failure. `job_start` can select a profile explicitly, use the SSH default, or uniquely match one by host and username; password profiles are resolved into the transient SSH target and excluded from daemon persistence and public snapshots.
 
 The same document stores only the default profile ids for SSH and GitHub. Defaults are independent and are cleared when their profile is deleted. GitHub publishing automatically chooses its default when no explicit profile or memory-only token is supplied. SSH default routing requires `useDefaultCredential: true`, preventing ordinary local jobs from silently becoming remote jobs.
 
 GitHub profiles point to the standard Git credential helper rather than duplicating its secret store. `github_token_save` accepts an environment-variable import or an explicitly supplied PAT, sends it to `git credential approve` over stdin, verifies it with `git credential fill`, and persists only the profile id, host, username, and credential kind. `github_token_delete` is limited to PAT profiles created through this path. Pushes use Git normally. The Actions runner invokes `git credential fill` with terminal interaction disabled, keeps the returned password/token only in memory, suppresses both helper output streams, and falls back to anonymous API access when no credential is available.
+
+Both PAT and SSH-password persistence reject Git's plaintext `credential-store` helper. `ssh_password_delete` removes the profile-specific OS credential and its RunBeacon reference; generic `credential_profile_delete` intentionally deletes only the reference.
 
 An optional `githubToken` is sent through daemon RPC and the child environment only. It is not placed in runner arguments, labels, metadata, output, or `jobs.json`. Public repositories do not require a token. Git credential discovery for the push is delegated to Git with terminal prompting disabled, so a missing credential fails visibly instead of hanging an unattended job.
 

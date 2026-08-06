@@ -17,7 +17,8 @@ Plugin version 1.0.0 and npm version 2.0.0 add security-bounded RE2 progress par
 - `PreToolUse` Hook that blocks untracked raw `ssh`, `scp`, `sftp`, and `plink`
 - `UserPromptSubmit` Hook that selects RunBeacon for operational remote-server requests
 - Memory-only inline SSH passwords/passphrases and pinned host-key support
-- Passwordless `credential_profile_*` tools for SSH agent/private-key references and Git Credential Manager
+- `credential_profile_*` tools for SSH agent/private-key references and safe OS-managed credential references
+- `ssh_password_save` and `ssh_password_delete` for IP/host, username, and OS-managed SSH password profiles
 - `github_token_save` and `github_token_delete` for OS-managed GitHub PAT credentials
 - Independent default SSH and GitHub profiles with explicit set/clear tools
 - Persistent redacted job metadata; command output persistence is off by default
@@ -67,7 +68,7 @@ The attached MCP App shows `preflight`, `commit`, `push`, `pushed`, `actions-dis
 
 Use `job_wait` once with the returned job ID when Codex should automatically continue to the next reasoning step after publishing. Merely watching the dashboard requires no model turns.
 
-## Passwordless credential profiles
+## Saved SSH credential profiles
 
 RunBeacon profiles store connection references, never secrets. Create an SSH profile with `credential_profile_save` using a host, username, pinned host-key fingerprint, and either `agent: "auto"` or `privateKeyPath`. Then pass only `credentialProfile` to `job_start`; when a target contains a matching host and user but no inline authentication, RunBeacon also selects the unique matching SSH profile automatically.
 
@@ -83,6 +84,22 @@ RunBeacon profiles store connection references, never secrets. Create an SSH pro
 ```
 
 After the key is loaded into the OS `ssh-agent`, a tracked command needs only `command` and `credentialProfile: "production"`.
+
+When password authentication is required, call `ssh_password_save`. Prefer `passwordEnvVar`; use the memory-only `password` field only when the user deliberately supplies the password in the conversation:
+
+```json
+{
+  "id": "training-server",
+  "host": "192.0.2.10",
+  "port": 22,
+  "username": "trainer",
+  "passwordEnvVar": "RUNBEACON_SSH_PASSWORD",
+  "hostKeySha256": "SHA256:...",
+  "makeDefault": true
+}
+```
+
+RunBeacon sends the password to the configured Git credential helper over stdin and verifies it through a non-interactive read. The profile JSON stores only the IP/host, port, username, host-key policy, and `credentialKind: "password"`; `job_start` reads the password into memory only for the SSH connection. It is excluded from command arguments, environment metadata, job records, errors, logs, and dashboard responses. RunBeacon rejects the plaintext Git `credential-store` helper; configure Git Credential Manager or another OS-backed helper.
 
 For GitHub OAuth, sign in once through Git Credential Manager:
 
@@ -104,11 +121,11 @@ To import a GitHub PAT, prefer an environment variable that is already available
 
 Call `github_token_save` with that input. When the user explicitly chooses to paste a PAT into the conversation, the tool also accepts `token` instead of `tokenEnvVar`. In both modes the PAT travels to `git credential approve` over stdin, is verified through a non-interactive `git credential fill`, and is never placed in command arguments or RunBeacon persistence. Conversation history may retain a pasted token, so environment import or Git Credential Manager's login flow is safer.
 
-RunBeacon refuses the plaintext Git `credential-store` helper for PAT saving. Configure Git Credential Manager or another OS-backed helper first.
+RunBeacon refuses the plaintext Git `credential-store` helper for PAT and SSH-password saving. Configure Git Credential Manager or another OS-backed helper first.
 
 Use the resulting `credentialProfile: "github-pat"` with `github_publish_start`. `github_token_delete` removes both a PAT profile and its matching helper credential; it refuses to delete generic OAuth/login profiles.
 
-`credential_profile_list` returns only safe references. `credential_profile_delete` removes the RunBeacon reference but does not delete OS credentials, agent keys, or key files.
+`credential_profile_list` returns only safe references. `credential_profile_delete` removes the RunBeacon reference but does not delete OS credentials, agent keys, or key files. Use `ssh_password_delete` when both an SSH password profile and its matching OS-managed credential must be removed.
 
 ## Default credential profiles
 
@@ -134,7 +151,7 @@ See [RunBeacon architecture](docs/REMOTE_JOB_MONITOR_ARCHITECTURE.md) for lifecy
 
 ## Important boundary
 
-The plugin can reliably monitor only commands that it launches through `job_start` or `github_publish_start`. A Hook can stop raw SSH before it starts, but no plugin can reconstruct a complete process lifecycle after an arbitrary command has already detached outside the plugin. Inline SSH passwords supplied by the user are accepted for a single tracked job, held in daemon memory, and never persisted; SSH agent or key-path authentication is preferred.
+The plugin can reliably monitor only commands that it launches through `job_start` or `github_publish_start`. A Hook can stop raw SSH before it starts, but no plugin can reconstruct a complete process lifecycle after an arbitrary command has already detached outside the plugin. Inline SSH passwords supplied to `job_start` remain single-job and memory-only. Passwords intentionally saved through `ssh_password_save` persist only in the OS credential manager and are read into memory for the selected job; SSH agent or key-path authentication remains preferred.
 
 ---
 
