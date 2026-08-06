@@ -18,6 +18,10 @@
 ### Features
 
 * add OS-backed SSH password profiles for IP/host and username connections, including default selection, safe deletion, and runtime-only password injection
+* add protocol v4 monotonic daemon upgrades so older Codex tasks cannot replace a newer resident build
+* bind one prompt trace to one tracked job, preventing automatic correction attempts from executing a second remote command
+* add prompt-to-tool, credential, queue, SSH, command, and total timing to the live dashboard
+* add a dashboard launcher that sends an exact command directly to the default SSH profile without a model turn
 
 ## [1.1.3](https://github.com/ooples/mcp-console-automation/compare/v1.1.2...v1.1.3) (2026-07-15)
 

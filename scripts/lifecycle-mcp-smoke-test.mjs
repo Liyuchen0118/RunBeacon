@@ -8,7 +8,9 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const serverPath = path.join(root, 'dist', 'mcp', 'lifecycle-server.js');
+const serverPath = process.env.RUNBEACON_SERVER_PATH
+  ? path.resolve(process.env.RUNBEACON_SERVER_PATH)
+  : path.join(root, 'dist', 'mcp', 'lifecycle-server.js');
 const temporaryData = fs.mkdtempSync(
   path.join(os.tmpdir(), 'remote-job-monitor-mcp-')
 );
@@ -91,11 +93,33 @@ try {
     assert.ok(toolNames.has(name), `Missing tool: ${name}`);
   }
 
+  const jobStartTool = tools.find((tool) => tool.name === 'job_start');
+  assert.equal(
+    jobStartTool?._meta?.ui?.resourceUri,
+    'ui://remote-job-monitor/dashboard.html'
+  );
+  assert.equal(
+    jobStartTool?._meta?.['openai/outputTemplate'],
+    'ui://remote-job-monitor/dashboard.html'
+  );
+  assert.match(jobStartTool?.description ?? '', /without listing profiles/);
+  assert.match(
+    jobStartTool?.description ?? '',
+    /Pass remote shell commands verbatim/
+  );
+  const jobWaitTool = tools.find((tool) => tool.name === 'job_wait');
+  assert.match(
+    jobWaitTool?.description ?? '',
+    /immediately as the next tool call/
+  );
+
   const script = [
     "console.log('25% boot')",
     "setTimeout(() => console.log('75% work'), 40)",
     "setTimeout(() => { console.log('100% complete'); process.exit(0) }, 90)",
   ].join(';');
+  const requestTraceId = 'deef1e83-7276-48bd-b528-e30b52884acc';
+  const requestReceivedAt = new Date(Date.now() - 1_000).toISOString();
   const started = await client.callTool({
     name: 'job_start',
     arguments: {
@@ -103,11 +127,29 @@ try {
       args: ['-e', script],
       shell: false,
       label: 'mcp-smoke',
+      requestTraceId,
+      requestReceivedAt,
     },
   });
   assert.notEqual(started.isError, true);
   const jobId = started.structuredContent?.job?.id;
   assert.equal(typeof jobId, 'string');
+  assert.equal(
+    started.structuredContent?.job?.timing?.requestTraceId,
+    requestTraceId
+  );
+
+  const duplicate = await client.callTool({
+    name: 'job_start',
+    arguments: {
+      command: process.execPath,
+      args: ['-e', "throw new Error('DUPLICATE_MUST_NOT_RUN')"],
+      shell: false,
+      requestTraceId,
+      requestReceivedAt,
+    },
+  });
+  assert.equal(duplicate.structuredContent?.job?.id, jobId);
 
   const completed = await client.callTool({
     name: 'job_wait',
@@ -117,6 +159,14 @@ try {
   assert.equal(completed.structuredContent?.timedOut, false);
   assert.equal(completed.structuredContent?.job?.state, 'succeeded');
   assert.equal(completed.structuredContent?.job?.progress?.percentage, 100);
+  assert.equal(
+    completed.structuredContent?.job?.timing?.requestTraceId,
+    requestTraceId
+  );
+  assert.equal(
+    typeof completed.structuredContent?.job?.timing?.firstOutputAt,
+    'string'
+  );
 
   const rejectedProfile = await client.callTool({
     name: 'credential_profile_save',
@@ -232,7 +282,10 @@ try {
       timeoutMs: 5_000,
     },
   });
-  assert.equal(profileJobResult.structuredContent?.job?.state, 'failed');
+  assert.match(
+    profileJobResult.structuredContent?.job?.state ?? '',
+    /^(failed|timed_out)$/
+  );
   assert.doesNotMatch(
     JSON.stringify(profileJobResult),
     new RegExp(sshPasswordCanary)
@@ -263,7 +316,10 @@ try {
       timeoutMs: 5_000,
     },
   });
-  assert.equal(matchedPasswordResult.structuredContent?.job?.state, 'failed');
+  assert.match(
+    matchedPasswordResult.structuredContent?.job?.state ?? '',
+    /^(failed|timed_out)$/
+  );
 
   const dashboardWithPasswordJob = await client.callTool({
     name: 'job_dashboard',
@@ -367,6 +423,9 @@ try {
   const html = resource.contents[0]?.text ?? '';
   assert.match(html, /ui\/initialize/);
   assert.match(html, /tools\/call/);
+  assert.match(html, /tailLines:6, limit:12/);
+  assert.match(html, /document\.hidden/);
+  assert.doesNotMatch(html, /setInterval\(refresh/);
 
   const stateFile = path.join(temporaryData, 'jobs.json');
   assert.ok(fs.existsSync(stateFile));

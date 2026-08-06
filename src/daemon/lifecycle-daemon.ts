@@ -1,8 +1,14 @@
 #!/usr/bin/env node
-import { timingSafeEqual } from 'node:crypto';
-import { chmodSync, existsSync, rmSync } from 'node:fs';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { chmodSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { createServer, Socket } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { LifecycleManager } from '../lifecycle/LifecycleManager.js';
+import {
+  compareBuildVersions,
+  readPluginBuildVersion,
+  validateBuildVersion,
+} from '../lifecycle/BuildIdentity.js';
 import { ensureDaemonToken, getDaemonPaths } from '../lifecycle/DaemonPaths.js';
 import { safeErrorMessage } from '../lifecycle/security.js';
 import { StartJobInput } from '../lifecycle/types.js';
@@ -20,6 +26,11 @@ if (!dataDir) throw new Error('--data-dir is required');
 
 const paths = getDaemonPaths(dataDir);
 const token = ensureDaemonToken(paths);
+const buildId = createHash('sha256')
+  .update(readFileSync(fileURLToPath(import.meta.url)))
+  .digest('hex');
+const buildVersion = readPluginBuildVersion(import.meta.url);
+let shuttingDown = false;
 const manager = new LifecycleManager({
   statePath: process.env.RJM_STATE_PATH || paths.statePath,
   maxConcurrentJobs: Number(process.env.RJM_MAX_CONCURRENT_JOBS || 4),
@@ -62,6 +73,10 @@ async function handle(
     respond(socket, request.id, undefined, 'Unauthorized daemon request');
     return;
   }
+  if (shuttingDown && request.method !== 'ping') {
+    respond(socket, request.id, undefined, 'RunBeacon daemon is restarting');
+    return;
+  }
   const args = request.args ?? {};
   try {
     switch (request.method) {
@@ -71,6 +86,9 @@ async function handle(
           pid: process.pid,
           version: RUNBEACON_VERSION,
           protocolVersion: DAEMON_PROTOCOL_VERSION,
+          buildId,
+          buildVersion,
+          runtime: manager.runtimeStatus(),
           persistence: manager.persistenceStatus(),
         });
         break;
@@ -113,8 +131,44 @@ async function handle(
         respond(socket, request.id, manager.cancel(String(args.jobId)));
         break;
       case 'shutdown':
+        if (args.replacement) {
+          const replacement = args.replacement as Record<string, unknown>;
+          const expectedBuildId = String(args.expectedBuildId ?? '');
+          const replacementProtocol = Number(replacement.protocolVersion);
+          const replacementBuildVersion = validateBuildVersion(
+            String(replacement.buildVersion ?? '')
+          );
+          const isNewer =
+            replacementProtocol > DAEMON_PROTOCOL_VERSION ||
+            (replacementProtocol === DAEMON_PROTOCOL_VERSION &&
+              compareBuildVersions(replacementBuildVersion, buildVersion) > 0);
+          if (expectedBuildId !== buildId || !isNewer) {
+            respond(
+              socket,
+              request.id,
+              undefined,
+              'Refusing a stale, same-version, or downgrade daemon replacement'
+            );
+            break;
+          }
+        }
+        const runtime = manager.runtimeStatus();
+        if (runtime.activeJobs > 0 || runtime.queuedJobs > 0) {
+          respond(
+            socket,
+            request.id,
+            undefined,
+            `Cannot restart RunBeacon daemon while ${runtime.activeJobs} job(s) are active and ${runtime.queuedJobs} are queued`
+          );
+          break;
+        }
+        shuttingDown = true;
         respond(socket, request.id, { stopped: true });
-        setTimeout(() => process.exit(0), 25).unref();
+        server.close(() => {
+          manager.dispose();
+          process.exit(0);
+        });
+        setTimeout(() => process.exit(0), 500).unref();
         break;
       default:
         respond(

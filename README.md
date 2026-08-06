@@ -13,6 +13,8 @@ Plugin version 1.0.0 and npm version 2.0.0 add security-bounded RE2 progress par
 - Local process and SSH channel ownership, output capture, cancellation, and timeout handling
 - Lifecycle assessment with active/stalled state, elapsed time, progress, and linear ETA
 - MCP Apps dashboard whose refresh loop consumes no model tokens
+- Direct default-SSH launcher in the dashboard, bypassing model scheduling for exact commands
+- End-to-end prompt, credential, queue, SSH, command, and total latency breakdowns
 - Dashboard-tracked Git commit, push, and GitHub Actions phases through `github_publish_start`
 - `PreToolUse` Hook that blocks untracked raw `ssh`, `scp`, `sftp`, and `plink`
 - `UserPromptSubmit` Hook that selects RunBeacon for operational remote-server requests
@@ -23,6 +25,8 @@ Plugin version 1.0.0 and npm version 2.0.0 add security-bounded RE2 progress par
 - Independent default SSH and GitHub profiles with explicit set/clear tools
 - Persistent redacted job metadata; command output persistence is off by default
 - Reattachment from a new MCP client to jobs owned by the resident daemon
+- Protocol v4 monotonic daemon upgrades; an older Codex task cannot downgrade a newer resident build
+- Prompt-trace idempotency that binds one remote execution request to one job
 - RE2-compatible progress patterns compiled once per job and matched against a bounded 16 KiB line tail
 - Pre-sink structured log redaction with depth, key, array, and string limits
 
@@ -49,6 +53,10 @@ sequenceDiagram
 ```
 
 The dashboard still refreshes locally every 1.5 seconds, but those calls run between the MCP App and the MCP server. They do not invoke the model and do not spend model tokens. The model-facing path is event-driven.
+
+For latency-sensitive exact commands, open the dashboard and use **Run on default SSH**. The app calls `job_start` directly, preserves shell text verbatim, disables duplicate clicks, and reuses the same request trace if a tool response is lost. This removes prompt-to-tool model scheduling from the critical path. Each job card separates `prompt→tool`, credential lookup, queue, SSH handshake, command runtime, and total time so a slow model turn cannot be mistaken for slow remote execution.
+
+The `UserPromptSubmit` Hook attaches a UUID and timestamp to natural-language remote requests. Codex passes them unchanged to `job_start`; the lifecycle manager returns the existing job when the same trace is submitted again, even if a retry changes the command or idempotency key. A changed command requires a new user request instead of an automatic second execution.
 
 ## GitHub publishing dashboard
 

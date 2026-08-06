@@ -2,9 +2,53 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { Script } from 'node:vm';
+import type { Client, ClientChannel, ConnectConfig } from 'ssh2';
 import { LifecycleManager } from '../lifecycle/LifecycleManager.js';
 import { createDashboardHtml } from '../lifecycle/DashboardApp.js';
+import { compareBuildVersions } from '../lifecycle/BuildIdentity.js';
 import { redactCommand } from '../lifecycle/security.js';
+
+type FakeSshClient = EventEmitter & {
+  connect: (config: ConnectConfig) => FakeSshClient;
+  exec: (
+    command: string,
+    callback: (error?: Error, stream?: ClientChannel) => void
+  ) => FakeSshClient;
+  end: () => FakeSshClient;
+};
+
+function createFakeSshClient(
+  onConnect: (client: FakeSshClient, config: ConnectConfig) => void,
+  onExec?: (
+    client: FakeSshClient,
+    command: string,
+    callback: (error?: Error, stream?: ClientChannel) => void
+  ) => void
+): Client {
+  const client = new EventEmitter() as FakeSshClient;
+  client.end = jest.fn(() => client);
+  client.connect = jest.fn((config: ConnectConfig) => {
+    onConnect(client, config);
+    return client;
+  });
+  client.exec = jest.fn((command, callback) => {
+    onExec?.(client, command, callback);
+    return client;
+  });
+  return client as unknown as Client;
+}
+
+function createSuccessfulChannel(): ClientChannel {
+  const channel = new EventEmitter() as EventEmitter & {
+    stderr: EventEmitter;
+    close: () => void;
+  };
+  channel.stderr = new EventEmitter();
+  channel.close = jest.fn();
+  return channel as unknown as ClientChannel;
+}
 
 describe('LifecycleManager', () => {
   let testRoot: string;
@@ -157,6 +201,46 @@ describe('LifecycleManager', () => {
 
     expect(retried.id).toBe(first.id);
     await manager.waitForTerminal(first.id, 5_000);
+  });
+
+  test('binds one prompt trace to one job and persists safe timing fields', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const requestTraceId = 'd16ee49e-39a8-4d43-93bf-3f519f715d69';
+    const requestReceivedAt = new Date(Date.now() - 1_000).toISOString();
+    const first = manager.start({
+      command: process.execPath,
+      args: ['-e', "console.log('TRACE_FIRST_JOB')"],
+      shell: false,
+      idempotencyKey: 'trace-first-key',
+      timing: {
+        requestTraceId,
+        requestReceivedAt,
+        toolReceivedAt: new Date().toISOString(),
+        credentialsResolvedAt: new Date().toISOString(),
+      },
+    });
+    const duplicate = manager.start({
+      command: process.execPath,
+      args: ['-e', "throw new Error('MUST_NOT_RUN')"],
+      shell: false,
+      idempotencyKey: 'trace-second-key',
+      timing: { requestTraceId },
+    });
+
+    expect(duplicate.id).toBe(first.id);
+    expect(manager.list(0)).toHaveLength(1);
+    const completed = await manager.waitForTerminal(first.id, 5_000, 20);
+    expect(completed.job.state).toBe('succeeded');
+    expect(completed.job.timing?.requestReceivedAt).toBe(requestReceivedAt);
+    expect(completed.job.timing?.commandStartedAt).toBeDefined();
+    expect(completed.job.timing?.firstOutputAt).toBeDefined();
+    expect(JSON.stringify(completed.job.tail)).toContain('TRACE_FIRST_JOB');
+    expect(JSON.stringify(completed.job.tail)).not.toContain('MUST_NOT_RUN');
+
+    const recovered = new LifecycleManager({ statePath });
+    expect(recovered.snapshot(first.id).timing?.requestTraceId).toBe(
+      requestTraceId
+    );
   });
 
   test('releases an event-driven wait when its abort signal fires', async () => {
@@ -402,7 +486,10 @@ describe('LifecycleManager', () => {
   });
 
   test('never persists an inline SSH password', async () => {
-    const manager = new LifecycleManager({ statePath });
+    const manager = new LifecycleManager({
+      statePath,
+      sshRetryBaseDelayMs: 1,
+    });
     const password = 'RJM_INLINE_PASSWORD_MUST_NOT_PERSIST';
     const started = manager.start({
       command: 'echo hello',
@@ -423,9 +510,108 @@ describe('LifecycleManager', () => {
     expect(completed.job.state).toBe('failed');
     expect(readFileSync(statePath, 'utf8')).not.toContain(password);
   });
+
+  test('retries handshake failures before executing the remote command', async () => {
+    let clientsCreated = 0;
+    let execCalls = 0;
+    const manager = new LifecycleManager({
+      statePath,
+      sshRetryBaseDelayMs: 1,
+      sshClientFactory: () => {
+        clientsCreated += 1;
+        const currentAttempt = clientsCreated;
+        return createFakeSshClient(
+          (client) => {
+            setImmediate(() => {
+              if (currentAttempt < 5) {
+                client.emit('error', new Error('handshake unavailable'));
+              } else {
+                client.emit('ready');
+              }
+            });
+          },
+          (_client, _command, callback) => {
+            execCalls += 1;
+            const channel = createSuccessfulChannel();
+            callback(undefined, channel);
+            setImmediate(() => channel.emit('close', 0));
+          }
+        );
+      },
+    });
+    const started = manager.start({
+      command: 'run-training',
+      target: {
+        kind: 'ssh',
+        host: 'example.test',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000, 50);
+
+    expect(completed.job.state).toBe('succeeded');
+    expect(clientsCreated).toBe(5);
+    expect(execCalls).toBe(1);
+    expect(completed.job.tail.map((chunk) => chunk.data).join('')).toContain(
+      'SSH handshake attempt 4/5 failed; retrying'
+    );
+  });
+
+  test('never retries after SSH is ready and exec may have reached the host', async () => {
+    let clientsCreated = 0;
+    let execCalls = 0;
+    const manager = new LifecycleManager({
+      statePath,
+      sshRetryBaseDelayMs: 1,
+      sshClientFactory: () => {
+        clientsCreated += 1;
+        return createFakeSshClient(
+          (client) => setImmediate(() => client.emit('ready')),
+          (_client, _command, callback) => {
+            execCalls += 1;
+            callback(new Error('exec response lost'));
+          }
+        );
+      },
+    });
+    const started = manager.start({
+      command: 'run-training',
+      target: {
+        kind: 'ssh',
+        host: 'example.test',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000);
+
+    expect(completed.job.state).toBe('failed');
+    expect(completed.job.error).toContain('exec response lost');
+    expect(clientsCreated).toBe(1);
+    expect(execCalls).toBe(1);
+  });
 });
 
 describe('lifecycle safety and UI helpers', () => {
+  test('orders cachebuster builds monotonically for daemon upgrades', () => {
+    expect(
+      compareBuildVersions(
+        '1.0.0+codex.20260805120000',
+        '1.0.0+codex.20260805115959'
+      )
+    ).toBeGreaterThan(0);
+    expect(
+      compareBuildVersions(
+        '1.0.0+codex.20260805115959',
+        '1.0.0+codex.20260805120000'
+      )
+    ).toBeLessThan(0);
+    expect(compareBuildVersions('1.0.0', '1.0.0')).toBe(0);
+  });
+
   test('redacts common command-line secret forms', () => {
     expect(redactCommand('deploy --password hunter2 --api-key=abc')).toBe(
       'deploy --password [REDACTED] --api-key=[REDACTED]'
@@ -437,13 +623,26 @@ describe('lifecycle safety and UI helpers', () => {
 
   test('dashboard uses the MCP Apps bridge and direct tool calls', () => {
     const html = createDashboardHtml();
+    const script = /<script>([\s\S]*)<\/script>/.exec(html)?.[1];
+    expect(script).toBeDefined();
+    expect(() => new Script(script)).not.toThrow();
     expect(html).toContain("request('ui/initialize'");
     expect(html).toContain("request('tools/call'");
     expect(html).toContain("callTool('job_list'");
+    expect(html).toContain('tailLines:6, limit:12');
+    expect(html).toContain('document.hidden');
+    expect(html).toContain('renderedSignature');
+    expect(html).toContain('scheduleRefresh(0)');
+    expect(html).not.toContain('setInterval(refresh');
     expect(html).toContain('no model polling');
     expect(html).toContain('data?.job');
     expect(html).toContain('job.progress.phase');
     expect(html).toContain("job.metadata?.kind === 'github_publish'");
+    expect(html).toContain("callTool('job_start'");
+    expect(html).toContain('useDefaultCredential:true');
+    expect(html).toContain('requestTraceId:launcherAttempt.requestTraceId');
+    expect(html).toContain('Direct default SSH start');
+    expect(html).toContain("['prompt→tool'");
   });
 
   test('plugin hook blocks raw SSH but leaves unrelated Bash commands alone', () => {
@@ -516,5 +715,35 @@ describe('lifecycle safety and UI helpers', () => {
       encoding: 'utf8',
     });
     expect(conceptual.stdout).toBe('');
+  });
+
+  test('plugin prompt hook selects the zero-exploration default SSH fast path', () => {
+    const hook = join(process.cwd(), 'hooks', 'route-remote-prompt.cjs');
+    const fastPath = spawnSync(process.execPath, [hook], {
+      input: JSON.stringify({
+        hook_event_name: 'UserPromptSubmit',
+        prompt: '使用默认 SSH 服务器运行下面的训练命令并等待完成',
+      }),
+      encoding: 'utf8',
+    });
+    const decision = JSON.parse(fastPath.stdout);
+    expect(decision.hookSpecificOutput.additionalContext).toMatch(
+      /make job_start the first task action/
+    );
+    expect(decision.hookSpecificOutput.additionalContext).toMatch(
+      /useDefaultCredential=true/
+    );
+    expect(decision.hookSpecificOutput.additionalContext).toMatch(
+      /Do not inspect the working directory, README, tests/
+    );
+    expect(decision.hookSpecificOutput.additionalContext).toMatch(
+      /requestTraceId="[0-9a-f-]{36}"/
+    );
+    expect(decision.hookSpecificOutput.additionalContext).toMatch(
+      /requestReceivedAt="\d{4}-\d{2}-\d{2}T/
+    );
+    expect(decision.hookSpecificOutput.additionalContext).toMatch(
+      /Never issue a second job_start/
+    );
   });
 });

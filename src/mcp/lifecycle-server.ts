@@ -490,12 +490,13 @@ const tools: Tool[] = [
     },
     _meta: {
       ui: { resourceUri: DASHBOARD_RESOURCE_URI },
+      'openai/outputTemplate': DASHBOARD_RESOURCE_URI,
     },
   } as Tool,
   {
     name: 'job_start',
     description:
-      'Start a tracked local or SSH command. This is the default tool for non-interactive remote execution: use it instead of raw shell/ssh whenever Codex calls a remote server so lifecycle events, output, progress, cancellation, and event-driven waiting remain available.',
+      'Start one tracked local or SSH command. Pass remote shell commands verbatim without adding escapes. For a RunBeacon prompt trace, reuse requestTraceId on every retry so the server returns the original job instead of executing twice. When the user requests the default SSH server, set useDefaultCredential=true and call this tool directly without listing profiles first.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -560,7 +561,19 @@ const tools: Tool[] = [
           type: 'boolean',
           default: false,
           description:
-            'Use the default SSH profile for an explicitly remote request. Leave false for local commands.',
+            'Fast path for an explicitly requested default SSH server. Set true directly without calling credential_profile_list first. Leave false for local commands.',
+        },
+        requestTraceId: {
+          type: 'string',
+          minLength: 36,
+          maxLength: 64,
+          description:
+            'Opaque request UUID supplied by the RunBeacon prompt hook. Reuse it unchanged; a second start with the same trace returns the first job.',
+        },
+        requestReceivedAt: {
+          type: 'string',
+          description:
+            'ISO timestamp supplied by the RunBeacon prompt hook for end-to-end latency measurement.',
         },
       },
       required: ['command'],
@@ -572,11 +585,15 @@ const tools: Tool[] = [
       idempotentHint: false,
       openWorldHint: true,
     },
-  },
+    _meta: {
+      ui: { resourceUri: DASHBOARD_RESOURCE_URI },
+      'openai/outputTemplate': DASHBOARD_RESOURCE_URI,
+    },
+  } as Tool,
   {
     name: 'job_wait',
     description:
-      'Wait inside the MCP server until a tracked job reaches a terminal state. This is event-driven and consumes no repeated model turns while waiting. Call once after job_start, then continue the workflow from the returned result.',
+      'Wait inside the MCP server until a tracked job reaches a terminal state. This is event-driven and consumes no repeated model turns while waiting. Call it immediately as the next tool call after job_start, without intermediate commentary, profile listing, status checks, or extra planning.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -670,6 +687,7 @@ const tools: Tool[] = [
     },
     _meta: {
       ui: { resourceUri: DASHBOARD_RESOURCE_URI },
+      'openai/outputTemplate': DASHBOARD_RESOURCE_URI,
     },
   } as Tool,
 ];
@@ -944,7 +962,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         );
       }
       case 'job_start': {
-        const job = await manager.start(await resolveJobStartInput(args));
+        const toolReceivedAt = new Date().toISOString();
+        const input = await resolveJobStartInput(args);
+        input.timing = resolveRequestTiming(
+          args,
+          toolReceivedAt,
+          new Date().toISOString()
+        );
+        const job = await manager.start(input);
         return reply(
           { job },
           `Tracked job ${job.id} queued. Call job_wait once to resume when it finishes; do not poll.`
@@ -1075,6 +1100,8 @@ async function resolveJobStartInput(
   const input = { ...args } as Record<string, any>;
   delete input.credentialProfile;
   delete input.useDefaultCredential;
+  delete input.requestTraceId;
+  delete input.requestReceivedAt;
   const requestedProfile = optionalString(args.credentialProfile);
   const useDefaultCredential = args.useDefaultCredential === true;
   if (requestedProfile && useDefaultCredential) {
@@ -1196,6 +1223,47 @@ async function resolveJobStartInput(
   }
 
   return input as StartJobInput;
+}
+
+function resolveRequestTiming(
+  args: Record<string, any>,
+  toolReceivedAt: string,
+  credentialsResolvedAt: string
+): StartJobInput['timing'] {
+  const requestTraceId = optionalString(args.requestTraceId);
+  const requestReceivedAt = optionalString(args.requestReceivedAt);
+  if (!requestTraceId && !requestReceivedAt) {
+    return { toolReceivedAt, credentialsResolvedAt };
+  }
+  if (!requestTraceId || !requestReceivedAt) {
+    throw new Error(
+      'requestTraceId and requestReceivedAt must be supplied together'
+    );
+  }
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      requestTraceId
+    )
+  ) {
+    throw new Error('requestTraceId must be a UUID');
+  }
+  const receivedMs = Date.parse(requestReceivedAt);
+  const toolMs = Date.parse(toolReceivedAt);
+  if (
+    !Number.isFinite(receivedMs) ||
+    receivedMs > toolMs + 5 * 60_000 ||
+    receivedMs < toolMs - 24 * 60 * 60_000
+  ) {
+    throw new Error(
+      'requestReceivedAt must be a valid timestamp within the last 24 hours'
+    );
+  }
+  return {
+    requestTraceId,
+    requestReceivedAt: new Date(receivedMs).toISOString(),
+    toolReceivedAt,
+    credentialsResolvedAt,
+  };
 }
 
 function resolveSshAgent(): string {

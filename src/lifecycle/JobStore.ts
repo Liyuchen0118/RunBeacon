@@ -11,6 +11,7 @@ import {
   JobOutputChunk,
   JobRecord,
   JobState,
+  JobTiming,
   PublicJobTarget,
   TERMINAL_JOB_STATES,
 } from './types.js';
@@ -209,7 +210,35 @@ function normalizeJob(
             : undefined
         )
       : undefined,
+    timing: normalizeTiming(raw.timing),
   };
+}
+
+function normalizeTiming(value: unknown): JobTiming | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const raw = value as Record<string, unknown>;
+  const timing: JobTiming = {};
+  for (const key of [
+    'requestReceivedAt',
+    'toolReceivedAt',
+    'credentialsResolvedAt',
+    'commandStartedAt',
+    'sshReadyAt',
+    'firstOutputAt',
+  ] as const) {
+    if (typeof raw[key] === 'string' && Number.isFinite(Date.parse(raw[key]))) {
+      timing[key] = raw[key].slice(0, 40);
+    }
+  }
+  if (
+    typeof raw.requestTraceId === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f-]{27,36}$/i.test(raw.requestTraceId)
+  ) {
+    timing.requestTraceId = raw.requestTraceId.slice(0, 64);
+  }
+  return Object.keys(timing).length > 0 ? timing : undefined;
 }
 
 function isJobState(value: unknown): value is JobState {

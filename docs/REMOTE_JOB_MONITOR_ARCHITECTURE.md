@@ -52,7 +52,7 @@ stateDiagram-v2
 
 ## Dashboard behavior
 
-`job_dashboard` and `github_publish_start` attach the same `_meta.ui.resourceUri`. The returned HTML initializes the MCP Apps bridge and calls `job_list` directly every 1.5 seconds. GitHub publish cards display remote, branch, Actions-monitoring mode, percentage, phase, full progress message, and bounded output. This is deliberate: the UI gets bounded live state while the model remains asleep. Clients without MCP Apps support can still use every data tool.
+`job_dashboard`, `job_start`, and `github_publish_start` attach the same `_meta.ui.resourceUri`. The returned HTML initializes the MCP Apps bridge and calls `job_list` directly every 1.5 seconds. Its default-SSH launcher calls `job_start` directly with the user's exact textarea value, so a latency-sensitive command can bypass model scheduling. GitHub publish cards display remote, branch, Actions-monitoring mode, percentage, phase, full progress message, and bounded output. Every job can display prompt-to-tool, credential lookup, queue, SSH, command, and total timing. This is deliberate: the UI gets bounded live state while the model remains asleep. Clients without MCP Apps support can still use every data tool.
 
 ## GitHub publish lifecycle
 
@@ -107,7 +107,9 @@ An optional `githubToken` is sent through daemon RPC and the child environment o
 
 The resident daemon lets jobs survive MCP shim and Codex task restarts. State transitions are persisted immediately while high-frequency output updates are coalesced. Arbitrary metadata and output-derived progress messages are excluded by default; metadata requires `RJM_PERSIST_METADATA=true` and is sanitized before persistence. Output persistence is disabled unless `RJM_PERSIST_OUTPUT=true`, because logs commonly contain secrets. Terminal history is bounded by `RJM_MAX_RETAINED_JOBS` (default 1000).
 
-The MCP shim and daemon perform an explicit lifecycle protocol-version handshake. A mismatched resident daemon is rejected instead of silently serving an updated plugin with old lifecycle semantics.
+The MCP shim and daemon perform a protocol v4 handshake with a build ID and comparable plugin cachebuster version. A newer client can replace an idle older daemon, but an older client refuses a newer protocol/build and cannot downgrade it. Active or queued jobs block every automatic upgrade. Same-version/different-build mismatches fail closed and require a new cachebuster.
+
+The prompt Hook generates `requestTraceId` and `requestReceivedAt` for operational remote requests. The MCP shim records its own arrival and credential-resolution timestamps; the daemon adds command-start, SSH-ready, and first-output timestamps. Lifecycle startup deduplicates by request trace before command execution, independently of the caller's cross-request `idempotencyKey`. Timing contains no credential or output data and is safe to persist.
 
 If the daemon process itself crashes or the machine reboots, local child processes and SSH channels cannot be reattached generically. Previously active records are marked `orphaned` on recovery instead of falsely reported as running.
 
