@@ -46,13 +46,13 @@ sequenceDiagram
   C->>M: job_wait(jobId) once
   M->>D: wait for terminal event
   P-->>D: output, progress, exit event
-  U->>M: job_list (direct MCP calls)
+  U->>M: job_snapshot(current jobId)
   M->>D: snapshots
   D-->>M: terminal result
   M-->>C: tool result; continue next step
 ```
 
-The dashboard still refreshes locally every 1.5 seconds, but those calls run between the MCP App and the MCP server. They do not invoke the model and do not spend model tokens. The model-facing path is event-driven.
+The dashboard still refreshes locally every 1.5 seconds, but those calls run between the MCP App and the MCP server. Each dashboard is bound to the job that opened it and refreshes only that `jobId` through `job_snapshot`; it never loads historical jobs. These calls do not invoke the model and do not spend model tokens. The model-facing path is event-driven.
 
 For latency-sensitive exact commands, open the dashboard and use **Run on default SSH**. The app calls `job_start` directly, preserves shell text verbatim, disables duplicate clicks, and reuses the same request trace if a tool response is lost. This removes prompt-to-tool model scheduling from the critical path. Each job card separates `prompt→tool`, credential lookup, queue, SSH handshake, command runtime, and total time so a slow model turn cannot be mistaken for slow remote execution.
 

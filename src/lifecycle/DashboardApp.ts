@@ -56,7 +56,7 @@ export function createDashboardHtml(): string {
     </div>
     <div id="launch-status">The command stays in this app and is sent directly to RunBeacon.</div>
   </section>
-  <main id="jobs"><div class="empty">Loading tracked jobs...</div></main>
+  <main id="jobs"><div class="empty">Waiting for the current task...</div></main>
   <script>
     (() => {
       const jobsEl = document.getElementById('jobs');
@@ -71,6 +71,7 @@ export function createDashboardHtml(): string {
       let refreshTimer;
       let renderedSignature = null;
       let latestJobs = [];
+      let focusedJobId;
       let launcherAttempt;
       const pending = new Map();
 
@@ -96,12 +97,16 @@ export function createDashboardHtml(): string {
         }
         if (message.method === 'ui/notifications/tool-result') {
           const data = structured(message.params);
-          if (data?.jobs) {
-            render(data.jobs);
-            scheduleRefresh();
-          } else if (data?.job) {
+          if (data?.dashboardJobId && data?.job?.id === data.dashboardJobId) {
+            focusedJobId = data.dashboardJobId;
             render([data.job]);
             scheduleRefresh(isTerminal(data.job.state) ? 5000 : 0);
+          } else if (focusedJobId && data?.job?.id === focusedJobId) {
+            render([data.job]);
+            scheduleRefresh(isTerminal(data.job.state) ? 5000 : 0);
+          } else if (data?.dashboardJobId === null) {
+            focusedJobId = undefined;
+            render([]);
           }
         }
       }, { passive:true });
@@ -158,7 +163,7 @@ export function createDashboardHtml(): string {
         if (signature === renderedSignature) return;
         renderedSignature = signature;
         if (!jobs?.length) {
-          jobsEl.innerHTML = '<div class="empty">No tracked jobs yet.</div>';
+          jobsEl.innerHTML = '<div class="empty">Waiting for the current task...</div>';
           return;
         }
         jobsEl.innerHTML = jobs.map((job) => {
@@ -203,11 +208,18 @@ export function createDashboardHtml(): string {
 
       async function refresh() {
         if (refreshing) return;
+        if (!focusedJobId) {
+          connectionEl.textContent = 'Waiting for current task';
+          return;
+        }
         refreshing = true;
+        const requestedJobId = focusedJobId;
         try {
-          const response = await callTool('job_list', { tailLines:6, limit:12 });
+          const response = await callTool('job_snapshot', { jobId:requestedJobId, tailLines:6 });
           const data = structured(response);
-          if (data?.jobs) render(data.jobs);
+          if (focusedJobId === requestedJobId && data?.job?.id === requestedJobId) {
+            render([data.job]);
+          }
           connectionEl.textContent = 'Live | no model polling';
         } catch (error) {
           connectionEl.textContent = 'Waiting for MCP connection';
@@ -264,8 +276,9 @@ export function createDashboardHtml(): string {
           const data = structured(response);
           if (!data?.job) throw new Error('RunBeacon returned no job');
           launcherAttempt = undefined;
+          focusedJobId = data.job.id;
           launchStatusEl.textContent = 'Started job ' + data.job.id.slice(0,8) + '. Live updates use no model polling.';
-          render([data.job, ...latestJobs.filter((job) => job.id !== data.job.id)]);
+          render([data.job]);
           scheduleRefresh(0);
         } catch (error) {
           launchStatusEl.textContent = 'Start failed. Retry keeps the same request trace and cannot duplicate the job.';

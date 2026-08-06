@@ -628,8 +628,10 @@ describe('lifecycle safety and UI helpers', () => {
     expect(() => new Script(script)).not.toThrow();
     expect(html).toContain("request('ui/initialize'");
     expect(html).toContain("request('tools/call'");
-    expect(html).toContain("callTool('job_list'");
-    expect(html).toContain('tailLines:6, limit:12');
+    expect(html).toContain("callTool('job_snapshot'");
+    expect(html).toContain('jobId:requestedJobId, tailLines:6');
+    expect(html).not.toContain("callTool('job_list'");
+    expect(html).toContain('focusedJobId');
     expect(html).toContain('document.hidden');
     expect(html).toContain('renderedSignature');
     expect(html).toContain('scheduleRefresh(0)');

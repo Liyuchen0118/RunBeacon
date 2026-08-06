@@ -23,7 +23,7 @@ For a request that already contains a complete command and explicitly selects th
 
 Never issue a second `job_start` to repair quoting, progress parsing, or unexpected output. Report the first job result and ask for a new user request when a changed command must run. `${name}`, `$name`, `$()` and shell quoting must reach the remote shell exactly as supplied by the user.
 
-Use `job_snapshot` only when the user explicitly asks for current status. Do not call `job_dashboard` after a normal `job_start` merely to show the same UI because the start tool already mounts it. Use `job_dashboard` to reopen the dashboard when there is no new job to start or when the user explicitly asks to reopen it; the dashboard calls MCP directly and does not create model turns.
+Use `job_snapshot` only when the user explicitly asks for current status. Do not call `job_dashboard` after a normal `job_start` merely to show the same UI because the start tool already mounts it. Use `job_dashboard` with the known `jobId` to reopen that task when the user explicitly asks; without a `jobId`, it only selects the newest non-terminal task. Every dashboard instance is bound to one job and never displays job history. The dashboard calls MCP directly and does not create model turns.
 
 If an SSH cancellation returns `cancellationVerified: false`, report that the channel was closed but the remote process may still exist. Do not claim that the remote process was killed; durable scheduler adapters are required for verified remote cancellation.
 

@@ -32,7 +32,11 @@ import {
   MCP_APP_MIME_TYPE,
 } from '../lifecycle/DashboardApp.js';
 import { safeErrorMessage } from '../lifecycle/security.js';
-import { SshJobTarget, StartJobInput } from '../lifecycle/types.js';
+import {
+  isTerminalJobState,
+  SshJobTarget,
+  StartJobInput,
+} from '../lifecycle/types.js';
 import { RUNBEACON_VERSION } from '../lifecycle/protocol.js';
 
 process.env.MCP_SERVER_MODE = 'true';
@@ -641,7 +645,7 @@ const tools: Tool[] = [
   {
     name: 'job_list',
     description:
-      'List tracked jobs with bounded output tails. The dashboard calls this directly without model tokens.',
+      'List tracked job history with bounded output tails. Live dashboards use job_snapshot for their single focused task.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -676,8 +680,16 @@ const tools: Tool[] = [
   {
     name: 'job_dashboard',
     description:
-      'Render the live RunBeacon dashboard. The UI refreshes by calling job_list directly, so updates do not create model turns or consume model tokens.',
-    inputSchema: { type: 'object', properties: {} },
+      'Render one live RunBeacon task. Pass jobId to reopen a known task; without it, the newest non-terminal task is selected. The UI calls job_snapshot directly, so updates do not create model turns or expose job history.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: {
+          type: 'string',
+          description: 'Tracked task to display without showing other jobs.',
+        },
+      },
+    },
     annotations: {
       title: 'Open Job Dashboard',
       readOnlyHint: true,
@@ -957,7 +969,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           },
         });
         return reply(
-          { job },
+          { job, dashboardJobId: job.id },
           `GitHub publish job ${job.id} started. The dashboard tracks commit, push, and Actions without model polling; call job_wait once if you need to continue automatically.`
         );
       }
@@ -971,7 +983,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         );
         const job = await manager.start(input);
         return reply(
-          { job },
+          { job, dashboardJobId: job.id },
           `Tracked job ${job.id} queued. Call job_wait once to resume when it finishes; do not poll.`
         );
       }
@@ -1000,8 +1012,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         return reply({ job }, `Cancellation requested for job ${job.id}.`);
       }
       case 'job_dashboard': {
-        const jobs = await manager.list(8);
-        return reply({ jobs }, 'Opened the live job dashboard.');
+        const requestedJobId = optionalString(args.jobId);
+        const job = requestedJobId
+          ? await manager.snapshot(requestedJobId, 8)
+          : (await manager.list(8, 100)).find(
+              (candidate) => !isTerminalJobState(candidate.state)
+            );
+        return reply(
+          { job: job ?? null, dashboardJobId: job?.id ?? null },
+          job
+            ? `Opened the live dashboard for job ${job.id}.`
+            : 'No active tracked task is available to display.'
+        );
       }
       default:
         throw new Error(`Unknown tool: ${request.params.name}`);

@@ -134,6 +134,7 @@ try {
   assert.notEqual(started.isError, true);
   const jobId = started.structuredContent?.job?.id;
   assert.equal(typeof jobId, 'string');
+  assert.equal(started.structuredContent?.dashboardJobId, jobId);
   assert.equal(
     started.structuredContent?.job?.timing?.requestTraceId,
     requestTraceId
@@ -321,10 +322,29 @@ try {
     /^(failed|timed_out)$/
   );
 
-  const dashboardWithPasswordJob = await client.callTool({
+  const dashboardWithoutActiveJob = await client.callTool({
     name: 'job_dashboard',
     arguments: {},
   });
+  assert.equal(dashboardWithoutActiveJob.structuredContent?.job, null);
+  assert.equal(
+    dashboardWithoutActiveJob.structuredContent?.dashboardJobId,
+    null
+  );
+
+  const dashboardWithPasswordJob = await client.callTool({
+    name: 'job_dashboard',
+    arguments: { jobId: matchedPasswordJob.structuredContent?.job?.id },
+  });
+  assert.equal(
+    dashboardWithPasswordJob.structuredContent?.dashboardJobId,
+    matchedPasswordJob.structuredContent?.job?.id
+  );
+  assert.equal(
+    dashboardWithPasswordJob.structuredContent?.job?.id,
+    matchedPasswordJob.structuredContent?.job?.id
+  );
+  assert.equal(dashboardWithPasswordJob.structuredContent?.jobs, undefined);
   assert.doesNotMatch(
     JSON.stringify(dashboardWithPasswordJob),
     new RegExp(sshPasswordCanary)
@@ -359,6 +379,7 @@ try {
   assert.notEqual(publishing.isError, true);
   const publishJobId = publishing.structuredContent?.job?.id;
   assert.equal(typeof publishJobId, 'string');
+  assert.equal(publishing.structuredContent?.dashboardJobId, publishJobId);
   assert.equal(
     publishing.structuredContent?.job?.metadata?.kind,
     'github_publish'
@@ -423,7 +444,9 @@ try {
   const html = resource.contents[0]?.text ?? '';
   assert.match(html, /ui\/initialize/);
   assert.match(html, /tools\/call/);
-  assert.match(html, /tailLines:6, limit:12/);
+  assert.match(html, /callTool\('job_snapshot'/);
+  assert.doesNotMatch(html, /callTool\('job_list'/);
+  assert.match(html, /focusedJobId/);
   assert.match(html, /document\.hidden/);
   assert.doesNotMatch(html, /setInterval\(refresh/);
 
