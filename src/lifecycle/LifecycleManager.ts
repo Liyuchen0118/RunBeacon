@@ -31,6 +31,7 @@ interface LifecycleManagerOptions {
   sshClientFactory?: () => Client;
   sshHandshakeAttempts?: number;
   sshRetryBaseDelayMs?: number;
+  sshReadyTimeoutMs?: number;
 }
 
 interface ExecutionResult {
@@ -67,7 +68,18 @@ const MAX_PROGRESS_LINE_LENGTH = 16 * 1024;
 const MAX_WAITERS_PER_JOB = 8;
 const MAX_WAITERS_GLOBAL = 128;
 const DEFAULT_SSH_HANDSHAKE_ATTEMPTS = 5;
-const DEFAULT_SSH_RETRY_BASE_DELAY_MS = 1_000;
+const DEFAULT_SSH_RETRY_BASE_DELAY_MS = 250;
+const DEFAULT_SSH_READY_TIMEOUT_MS = 12_000;
+
+function boundedInteger(
+  value: number | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number
+): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(minimum, Math.min(maximum, Math.trunc(value!)));
+}
 
 export class LifecycleManager extends EventEmitter {
   private readonly jobs = new Map<string, JobRecord>();
@@ -85,6 +97,7 @@ export class LifecycleManager extends EventEmitter {
   private readonly sshClientFactory: () => Client;
   private readonly sshHandshakeAttempts: number;
   private readonly sshRetryBaseDelayMs: number;
+  private readonly sshReadyTimeoutMs: number;
   private readonly progressRemainders = new Map<string, string>();
   private readonly progressPatterns = new Map<string, RE2JS>();
   private readonly waitCoordinators = new Map<string, WaitCoordinator>();
@@ -115,19 +128,23 @@ export class LifecycleManager extends EventEmitter {
       options.cancellationGraceMs ?? 5_000
     );
     this.sshClientFactory = options.sshClientFactory ?? (() => new Client());
-    this.sshHandshakeAttempts = Math.max(
+    this.sshHandshakeAttempts = boundedInteger(
+      options.sshHandshakeAttempts,
+      DEFAULT_SSH_HANDSHAKE_ATTEMPTS,
       1,
-      Math.min(
-        5,
-        options.sshHandshakeAttempts ?? DEFAULT_SSH_HANDSHAKE_ATTEMPTS
-      )
+      5
     );
-    this.sshRetryBaseDelayMs = Math.max(
+    this.sshRetryBaseDelayMs = boundedInteger(
+      options.sshRetryBaseDelayMs,
+      DEFAULT_SSH_RETRY_BASE_DELAY_MS,
       0,
-      Math.min(
-        30_000,
-        options.sshRetryBaseDelayMs ?? DEFAULT_SSH_RETRY_BASE_DELAY_MS
-      )
+      30_000
+    );
+    this.sshReadyTimeoutMs = boundedInteger(
+      options.sshReadyTimeoutMs,
+      DEFAULT_SSH_READY_TIMEOUT_MS,
+      1_000,
+      30_000
     );
     this.store = new JobStore(
       options.statePath,
@@ -547,7 +564,13 @@ export class LifecycleManager extends EventEmitter {
         password: target.password,
         passphrase: target.passphrase,
         agent: target.agent,
-        readyTimeout: Math.min(input.timeoutMs ?? 30_000, 30_000),
+        readyTimeout: Math.max(
+          1,
+          Math.min(
+            input.timeoutMs ?? this.sshReadyTimeoutMs,
+            this.sshReadyTimeoutMs
+          )
+        ),
         keepaliveInterval: 10_000,
         keepaliveCountMax: 6,
       };

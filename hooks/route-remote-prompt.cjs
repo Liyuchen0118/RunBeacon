@@ -1,6 +1,9 @@
 'use strict';
 
-const { randomUUID } = require('node:crypto');
+const {
+  clearPendingTracesForSession,
+  rememberPendingTrace,
+} = require('./pending-trace.cjs');
 
 let input = '';
 process.stdin.setEncoding('utf8');
@@ -12,9 +15,19 @@ process.stdin.on('end', () => {
   try {
     const event = JSON.parse(input || '{}');
     const prompt = String(event.prompt || '').slice(0, 128 * 1024);
-    if (!isRemoteExecutionRequest(prompt)) return;
-    const requestTraceId = randomUUID();
-    const requestReceivedAt = new Date().toISOString();
+    if (!isRemoteExecutionRequest(prompt)) {
+      try {
+        clearPendingTracesForSession(event);
+      } catch {
+        // Trace cleanup must not affect an unrelated prompt.
+      }
+      return;
+    }
+    try {
+      rememberPendingTrace(event);
+    } catch {
+      // Keep routing active even if the optional timing store is unavailable.
+    }
     const useDefault = /\b(?:default|common|usual)\b|默认|常用|平时使用/i.test(
       prompt
     );
@@ -22,8 +35,7 @@ process.stdin.on('end', () => {
       ? 'RunBeacon default-SSH fast path: if job_start is exposed, make job_start the first task action. Use the user-supplied command verbatim with useDefaultCredential=true. Do not inspect the working directory, README, tests, plugin files, tool registries, or credential profiles. Do not reconstruct or escape the command in JavaScript. After job_start returns, make job_wait the very next tool call exactly once; do not insert commentary, planning, or status calls between them.'
       : 'Default remote-execution route: use the RunBeacon job_start MCP tool first for non-interactive work on another machine. Pass the complete remote command verbatim and the selected SSH target, then call job_wait exactly once when the workflow must continue after completion. Do not inspect unrelated repository files or launch raw ssh, scp, sftp, or plink through the shell. Preserve normal approval and host-key verification requirements for the underlying action.';
     const traceContext =
-      ` Pass requestTraceId="${requestTraceId}" and requestReceivedAt="${requestReceivedAt}" unchanged to job_start. ` +
-      'Reuse the same requestTraceId for any tool retry. Never issue a second job_start to correct output or progress; report the first job result instead.';
+      ' RunBeacon attaches the prompt trace to job_start automatically; do not synthesize or replace trace fields. Never issue a second job_start to correct output or progress; report the first job result instead.';
 
     process.stdout.write(
       JSON.stringify({

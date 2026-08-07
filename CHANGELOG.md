@@ -23,6 +23,8 @@
 * add prompt-to-tool, credential, queue, SSH, command, and total timing to the live dashboard
 * add a dashboard launcher that sends an exact command directly to the default SSH profile without a model turn
 * bind each dashboard instance to its current job so unrelated task history is never loaded or displayed
+* inject prompt traces into `job_start` with a session/turn-scoped Hook instead of model-dependent argument copying
+* reduce failed SSH handshake latency with a bounded 12-second ready timeout and 250ms initial retry backoff
 
 ## [1.1.3](https://github.com/ooples/mcp-console-automation/compare/v1.1.2...v1.1.3) (2026-07-15)
 

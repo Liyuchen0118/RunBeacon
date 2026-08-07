@@ -1,5 +1,5 @@
 {
-  "description": "Select RunBeacon by default for remote execution and prevent untracked raw SSH commands.",
+  "description": "Select RunBeacon by default, attach prompt timing to tracked jobs, and prevent untracked raw SSH commands.",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -15,6 +15,18 @@
       }
     ],
     "PreToolUse": [
+      {
+        "matcher": "^mcp__(?:runbeacon|remote[-_]job[-_]monitor)__job_start$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/inject-job-trace.cjs\"",
+            "commandWindows": "node \"%PLUGIN_ROOT%\\hooks\\inject-job-trace.cjs\"",
+            "timeout": 5,
+            "statusMessage": "Attaching RunBeacon request timing"
+          }
+        ]
+      },
       {
         "matcher": "^Bash$",
         "hooks": [

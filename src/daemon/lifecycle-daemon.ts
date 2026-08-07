@@ -40,6 +40,9 @@ const manager = new LifecycleManager({
   persistenceDebounceMs: Number(process.env.RJM_PERSIST_DEBOUNCE_MS || 250),
   maxRetainedJobs: Number(process.env.RJM_MAX_RETAINED_JOBS || 1000),
   cancellationGraceMs: Number(process.env.RJM_CANCEL_GRACE_MS || 5000),
+  sshHandshakeAttempts: Number(process.env.RJM_SSH_HANDSHAKE_ATTEMPTS || 5),
+  sshRetryBaseDelayMs: Number(process.env.RJM_SSH_RETRY_BASE_DELAY_MS || 250),
+  sshReadyTimeoutMs: Number(process.env.RJM_SSH_READY_TIMEOUT_MS || 12_000),
 });
 
 interface RpcRequest {

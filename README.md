@@ -2,7 +2,7 @@
 
 RunBeacon turns long-running local and SSH commands into tracked jobs for Codex. The Codex plugin keeps the stable ID `remote-job-monitor`: Codex starts a job once, calls `job_wait` once, and resumes when the resident daemon reports a terminal event. A live MCP Apps dashboard refreshes by calling the MCP server directly, so dashboard updates and intermediate status checks do not create model turns.
 
-For non-interactive remote execution, RunBeacon is the default route. Its skill description makes Codex prefer `job_start` for server/SSH requests, a `UserPromptSubmit` Hook adds the routing policy when a prompt contains remote-execution intent, and a `PreToolUse` Hook blocks raw `ssh`, `scp`, `sftp`, or `plink` commands that would bypass lifecycle tracking. Plugin Hooks must be reviewed and trusted by the user after installation.
+For non-interactive remote execution, RunBeacon is the default route. Its skill description makes Codex prefer `job_start` for server/SSH requests, a `UserPromptSubmit` Hook adds the routing policy and records a short-lived prompt trace, and a `PreToolUse` Hook attaches that trace to `job_start` without relying on the model to copy fields. A second `PreToolUse` policy blocks raw `ssh`, `scp`, `sftp`, or `plink` commands that would bypass lifecycle tracking. Plugin Hooks must be reviewed and trusted by the user after installation.
 
 Plugin version 1.0.0 and npm version 2.0.0 add security-bounded RE2 progress parsing, shared `job_wait` coordination, entry-point log redaction, verified TLS-only VNC challenge authentication, and strict HTTPS Xen XAPI access. This is a breaking security release; see the [2.0 security migration guide](docs/SECURITY_MIGRATION_2.0.md).
 
@@ -18,6 +18,7 @@ Plugin version 1.0.0 and npm version 2.0.0 add security-bounded RE2 progress par
 - Dashboard-tracked Git commit, push, and GitHub Actions phases through `github_publish_start`
 - `PreToolUse` Hook that blocks untracked raw `ssh`, `scp`, `sftp`, and `plink`
 - `UserPromptSubmit` Hook that selects RunBeacon for operational remote-server requests
+- Turn-scoped `PreToolUse` trace injection for reliable prompt-to-tool timing and retry deduplication
 - Memory-only inline SSH passwords/passphrases and pinned host-key support
 - `credential_profile_*` tools for SSH agent/private-key references and safe OS-managed credential references
 - `ssh_password_save` and `ssh_password_delete` for IP/host, username, and OS-managed SSH password profiles
@@ -56,7 +57,9 @@ The dashboard still refreshes locally every 1.5 seconds, but those calls run bet
 
 For latency-sensitive exact commands, open the dashboard and use **Run on default SSH**. The app calls `job_start` directly, preserves shell text verbatim, disables duplicate clicks, and reuses the same request trace if a tool response is lost. This removes prompt-to-tool model scheduling from the critical path. Each job card separates `prompt→tool`, credential lookup, queue, SSH handshake, command runtime, and total time so a slow model turn cannot be mistaken for slow remote execution.
 
-The `UserPromptSubmit` Hook attaches a UUID and timestamp to natural-language remote requests. Codex passes them unchanged to `job_start`; the lifecycle manager returns the existing job when the same trace is submitted again, even if a retry changes the command or idempotency key. A changed command requires a new user request instead of an automatic second execution.
+The `UserPromptSubmit` Hook records a UUID and timestamp for natural-language remote requests. A matching `PreToolUse` Hook injects them into `job_start` for the same Codex session and turn, so timing no longer depends on the model copying optional arguments. The short-lived state contains only hashed session/turn keys and timing fields, never prompts, commands, or credentials. The lifecycle manager returns the existing job when the same trace is submitted again, even if a retry changes the command or idempotency key. A changed command requires a new user request instead of an automatic second execution.
+
+SSH handshakes use a 12-second per-attempt ready timeout and retry pre-ready failures up to five times with a 250ms bounded exponential backoff. Override these conservative defaults with `RJM_SSH_READY_TIMEOUT_MS` (1,000-30,000), `RJM_SSH_RETRY_BASE_DELAY_MS` (0-30,000), or `RJM_SSH_HANDSHAKE_ATTEMPTS` (1-5). RunBeacon never retries after SSH becomes ready because the command may already have reached the host.
 
 ## GitHub publishing dashboard
 

@@ -1,6 +1,6 @@
 {
   "name": "remote-job-monitor",
-  "version": "1.0.0+codex.20260806113919",
+  "version": "1.0.0+codex.20260806132614",
   "description": "Security-hardened tracked routing for local, SSH, and GitHub jobs with OS-managed credentials and a token-free dashboard.",
   "author": {
     "name": "RunBeacon contributors"

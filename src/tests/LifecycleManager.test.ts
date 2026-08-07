@@ -559,6 +559,115 @@ describe('LifecycleManager', () => {
     );
   });
 
+  test('bounds the configurable SSH ready timeout by the job timeout', async () => {
+    const observedTimeouts: number[] = [];
+    const manager = new LifecycleManager({
+      statePath,
+      sshReadyTimeoutMs: 7_000,
+      sshClientFactory: () =>
+        createFakeSshClient(
+          (client, config) => {
+            observedTimeouts.push(config.readyTimeout!);
+            setImmediate(() => client.emit('ready'));
+          },
+          (_client, _command, callback) => {
+            const channel = createSuccessfulChannel();
+            callback(undefined, channel);
+            setImmediate(() => channel.emit('close', 0));
+          }
+        ),
+    });
+    const first = manager.start({
+      command: 'run-training',
+      target: {
+        kind: 'ssh',
+        host: 'example.test',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+    await manager.waitForTerminal(first.id, 5_000);
+
+    const second = manager.start({
+      command: 'run-training',
+      timeoutMs: 2_000,
+      target: {
+        kind: 'ssh',
+        host: 'example.test',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+    await manager.waitForTerminal(second.id, 5_000);
+
+    const defaultManager = new LifecycleManager({
+      statePath,
+      sshClientFactory: () =>
+        createFakeSshClient(
+          (client, config) => {
+            observedTimeouts.push(config.readyTimeout!);
+            setImmediate(() => client.emit('ready'));
+          },
+          (_client, _command, callback) => {
+            const channel = createSuccessfulChannel();
+            callback(undefined, channel);
+            setImmediate(() => channel.emit('close', 0));
+          }
+        ),
+    });
+    const defaultTimeout = defaultManager.start({
+      command: 'run-training',
+      target: {
+        kind: 'ssh',
+        host: 'example.test',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+    await defaultManager.waitForTerminal(defaultTimeout.id, 5_000);
+
+    expect(observedTimeouts).toEqual([7_000, 2_000, 12_000]);
+  });
+
+  test('uses a short default backoff only before SSH becomes ready', async () => {
+    let clientsCreated = 0;
+    const manager = new LifecycleManager({
+      statePath,
+      sshClientFactory: () => {
+        clientsCreated += 1;
+        const attempt = clientsCreated;
+        return createFakeSshClient(
+          (client) =>
+            setImmediate(() =>
+              attempt === 1
+                ? client.emit('error', new Error('transient handshake failure'))
+                : client.emit('ready')
+            ),
+          (_client, _command, callback) => {
+            const channel = createSuccessfulChannel();
+            callback(undefined, channel);
+            setImmediate(() => channel.emit('close', 0));
+          }
+        );
+      },
+    });
+    const started = manager.start({
+      command: 'run-training',
+      target: {
+        kind: 'ssh',
+        host: 'example.test',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+    const completed = await manager.waitForTerminal(started.id, 5_000, 20);
+
+    expect(completed.job.state).toBe('succeeded');
+    expect(completed.job.tail.map((chunk) => chunk.data).join('')).toContain(
+      'retrying in 250 ms'
+    );
+  });
+
   test('never retries after SSH is ready and exec may have reached the host', async () => {
     let clientsCreated = 0;
     let execCalls = 0;
@@ -739,10 +848,10 @@ describe('lifecycle safety and UI helpers', () => {
       /Do not inspect the working directory, README, tests/
     );
     expect(decision.hookSpecificOutput.additionalContext).toMatch(
-      /requestTraceId="[0-9a-f-]{36}"/
+      /attaches the prompt trace to job_start automatically/
     );
-    expect(decision.hookSpecificOutput.additionalContext).toMatch(
-      /requestReceivedAt="\d{4}-\d{2}-\d{2}T/
+    expect(decision.hookSpecificOutput.additionalContext).not.toMatch(
+      /requestTraceId="/
     );
     expect(decision.hookSpecificOutput.additionalContext).toMatch(
       /Never issue a second job_start/
