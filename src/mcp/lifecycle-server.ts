@@ -448,6 +448,12 @@ const tools: Tool[] = [
           description:
             'Discover and monitor GitHub Actions after the push. Disable for non-GitHub remotes.',
         },
+        requireActions: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Fail the publish job when no eligible workflow exists or Actions monitoring is unavailable. Actual workflow failures always fail the job.',
+        },
         githubToken: {
           type: 'string',
           description:
@@ -896,6 +902,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         if (!cwd) throw new Error('cwd is required');
         const remote = String(args.remote ?? 'origin');
         const watchActions = args.watchActions !== false;
+        const requireActions = args.requireActions === true;
         const branch = optionalString(args.branch);
         const commitMessage = optionalString(args.commitMessage);
         const actionsTimeoutMs = numericArgument(
@@ -915,6 +922,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           remote,
           '--watch-actions',
           String(watchActions),
+          '--require-actions',
+          String(requireActions),
           '--actions-timeout-ms',
           String(actionsTimeoutMs),
           '--discovery-timeout-ms',
@@ -968,6 +977,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             remote,
             branch: branch ?? 'current',
             watchActions,
+            requireActions,
             credentialProfile: credentialProfile?.id,
           },
         });

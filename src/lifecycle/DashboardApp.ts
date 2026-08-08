@@ -180,6 +180,7 @@ export function createDashboardHtml(): string {
             ? '<div class="github">GitHub | remote ' + escapeHtml(job.metadata.remote || 'origin') +
               ' | branch ' + escapeHtml(job.metadata.branch || 'current') +
               ' | Actions ' + (job.metadata.watchActions === false ? 'not monitored' : 'monitored') +
+              (job.metadata.requireActions ? ' (required)' : ' (best effort)') +
               (job.metadata.credentialProfile ? ' | credential ' + escapeHtml(job.metadata.credentialProfile) : '') + '</div>'
             : '';
           const credential = job.metadata?.credentialProfile && job.metadata?.kind !== 'github_publish'

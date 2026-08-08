@@ -388,6 +388,27 @@ try {
     publishing.structuredContent?.job?.metadata?.credentialProfile,
     'github-main'
   );
+  assert.equal(
+    publishing.structuredContent?.job?.metadata?.requireActions,
+    false
+  );
+
+  const publishingReattached = await client.callTool({
+    name: 'github_publish_start',
+    arguments: {
+      cwd: repository,
+      commitMessage: 'test: dashboard publish',
+      watchActions: false,
+      githubToken: 'GITHUB_TOKEN_MUST_NOT_PERSIST_4862',
+      credentialProfile: 'github-main',
+      idempotencyKey: 'lifecycle-mcp-smoke-publish',
+    },
+  });
+  assert.equal(
+    publishingReattached.structuredContent?.job?.id,
+    publishJobId,
+    'reattachment must not create a second commit or push job'
+  );
 
   const published = await client.callTool({
     name: 'job_wait',

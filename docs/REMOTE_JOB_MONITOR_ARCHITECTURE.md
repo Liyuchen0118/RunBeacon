@@ -56,7 +56,7 @@ stateDiagram-v2
 
 ## GitHub publish lifecycle
 
-`github_publish_start` starts a normal tracked local job whose executable is the bundled publish runner. The runner validates the Git repository and branch, optionally commits the existing index, runs `git push --progress` without force, and then queries the GitHub Actions REST API by pushed commit SHA.
+`github_publish_start` starts a normal tracked local job whose executable is the bundled publish runner. The runner validates the Git repository and branch, optionally commits the existing index, runs `git push --progress` without force, and then parses local workflow YAML plus open pull requests before querying the GitHub Actions REST API by pushed commit SHA.
 
 ```mermaid
 stateDiagram-v2
@@ -66,8 +66,9 @@ stateDiagram-v2
   commit --> push
   push --> pushed
   pushed --> complete: Actions disabled
-  pushed --> actions-discovery: Actions enabled
-  actions-discovery --> complete: no run discovered
+  pushed --> no-workflows: no eligible branch or PR trigger
+  pushed --> actions-discovery: eligible or uncertain trigger
+  actions-discovery --> monitoring-degraded: API unavailable or no run discovered
   actions-discovery --> actions: run discovered
   actions --> complete: all accepted conclusions
   actions --> actions-failed: failed conclusion
@@ -76,7 +77,11 @@ stateDiagram-v2
 
 Each runner phase emits one structured progress line such as `70% [actions] build: in_progress`. `LifecycleManager` parses this into percentage, phase, and a bounded message. Git's own transfer percentages are excluded by the runner-specific progress pattern, preventing object-upload progress from being mistaken for end-to-end completion.
 
-The model may call `job_wait` once to continue after the terminal event. All repeated Actions API checks happen inside the runner. Anonymous access is limited to one request per 60 seconds; authenticated access uses the configured interval with a 10-second floor.
+The model may call `job_wait` once to continue after the terminal event. All repeated Actions API checks happen inside the runner. Anonymous access is limited to one request per 60 seconds; authenticated access uses the configured interval with a 10-second floor. Each API call is bounded to five attempts and a 15-second per-attempt timeout, with retry only for transport failures, HTTP 408/429/5xx, jittered exponential backoff, and `Retry-After` support.
+
+The API transport resolves proxies in this order: `RUNBEACON_GITHUB_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, Git URL-specific proxy, `git http.proxy`, direct. `NO_PROXY` overrides the selected proxy. Diagnostics expose only stable failure codes, never Authorization data or proxy userinfo.
+
+The push outcome and observation outcome are independent. Confirmed push plus unavailable monitoring is a successful `monitoring-degraded` job by default; a confidently ineligible workflow is a successful `no-workflows` job. `requireActions: true` turns either condition into a gate failure. An observed failing or timed-out workflow always fails regardless of that option.
 
 ## SSH and credentials
 
@@ -129,6 +134,8 @@ If the daemon process itself crashes or the machine reboots, local child process
 - `npx jest src/tests/LifecycleManager.test.ts --runInBand --coverage=false`: lifecycle, timeout, SSH safety, Hook, and UI tests.
 - `npm run test:lifecycle:mcp`: real MCP client/server and UI-resource smoke test.
 - `src/tests/GitHubPublish.test.ts`: GitHub remote parsing, push failure classification, and accepted Actions conclusions.
+- `src/tests/GitHubApiClient.test.ts`, `GitHubActionsMonitor.test.ts`, and `GitHubWorkflowEligibility.test.ts`: retry, proxy, redaction, monitoring outcome, workflow trigger, and draft-PR coverage.
+- `npm run test:github-publish`: offline real-runner verification of fast `no-workflows`, `requireActions`, secret-free output, and a single remote commit.
 - The lifecycle MCP smoke test creates a temporary worktree and local bare remote, then exercises staged commit and push through `github_publish_start` without external credentials.
 - `npm run test:lifecycle:daemon`: second-client reattachment to a resident daemon.
 - The lifecycle MCP and daemon smoke tests run on Windows, Linux, and macOS in CI.

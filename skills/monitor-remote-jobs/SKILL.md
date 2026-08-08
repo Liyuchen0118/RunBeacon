@@ -37,7 +37,9 @@ The tool never stages files. If a new commit is requested, ensure the intended f
 
 Leave `watchActions` enabled for GitHub remotes. Public repositories need no API credential. Prefer a saved GitHub profile for private repositories. Use the one-job `githubToken` override only when the user explicitly requests temporary use; never echo it or place it in a command, label, metadata, or status message.
 
-The tool result opens the same live dashboard automatically. Call `job_wait` once when Codex should continue after the push and Actions reach a terminal outcome. The runner performs all Actions discovery and status polling in the background, so do not call `job_snapshot` repeatedly.
+By default, a confirmed push remains successful when Actions monitoring is temporarily unavailable (`monitoring-degraded`) or no workflow can run for that branch/PR (`no-workflows`). Actual workflow failures still fail the job. Pass `requireActions: true` for release or security gates where unavailable or missing Actions monitoring must also fail. The runner parses workflow triggers, checks open PRs, reuses configured HTTP/Git proxies, and performs bounded retries internally; do not repair a monitoring error with another publish call.
+
+The tool result opens the same live dashboard automatically. Call `job_wait` once when Codex should continue after the push and Actions reach a terminal outcome. The runner performs all Actions discovery and status polling in the background, so do not call `job_snapshot` repeatedly. If an MCP response is lost, reuse the same `idempotencyKey`; never create a second commit/push job merely to recover the dashboard or monitoring result.
 
 ## SSH routing
 

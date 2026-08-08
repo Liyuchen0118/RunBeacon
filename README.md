@@ -16,6 +16,7 @@ Plugin version 1.0.0 and npm version 2.0.0 add security-bounded RE2 progress par
 - Direct default-SSH launcher in the dashboard, bypassing model scheduling for exact commands
 - End-to-end prompt, credential, queue, SSH, command, and total latency breakdowns
 - Dashboard-tracked Git commit, push, and GitHub Actions phases through `github_publish_start`
+- Retry-bounded GitHub API monitoring with proxy reuse, workflow eligibility detection, and distinct push/monitoring outcomes
 - `PreToolUse` Hook that blocks untracked raw `ssh`, `scp`, `sftp`, and `plink`
 - `UserPromptSubmit` Hook that selects RunBeacon for operational remote-server requests
 - Turn-scoped `PreToolUse` trace injection for reliable prompt-to-tool timing and retry deduplication
@@ -71,11 +72,18 @@ Call `github_publish_start` with a repository directory. If `commitMessage` is s
   "remote": "origin",
   "commitMessage": "feat: add dashboard",
   "watchActions": true,
+  "requireActions": false,
   "idempotencyKey": "publish-dashboard-v1"
 }
 ```
 
-The attached MCP App shows `preflight`, `commit`, `push`, `pushed`, `actions-discovery`, `actions`, and terminal phases. For a public repository, Actions discovery works anonymously at a rate-limit-safe interval. A private repository can use the memory-only `githubToken` argument; the token is passed only to the runner environment and is never added to the command, job metadata, output, or persistent state.
+The attached MCP App shows `preflight`, `commit`, `push`, `pushed`, `actions-discovery`, `actions`, and terminal phases. Before polling, RunBeacon parses local workflow YAML and checks open pull requests. A feature-branch push with no eligible push or pull-request workflow finishes quickly as `no-workflows` instead of waiting for a run that cannot exist. Draft pull requests are included.
+
+GitHub API calls use a 15-second per-attempt timeout, at most five retry attempts within the caller deadline, exponential backoff with jitter, and `Retry-After` for HTTP 429. Network failures plus HTTP 408, 429, and 5xx are retried; authentication and permission responses are not blindly repeated. Proxy precedence is `RUNBEACON_GITHUB_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, Git URL-specific proxy, `git http.proxy`, then direct. `NO_PROXY` is respected, and proxy credentials are never emitted.
+
+Push and monitoring results are separate. A push failure or an actual failing Actions conclusion fails the job. After a confirmed push, unavailable API monitoring ends as `monitoring-degraded` by default, while no eligible workflow ends as `no-workflows`; both remain successful publish jobs. Set `requireActions: true` when missing or unavailable Actions monitoring must fail a release gate.
+
+For a public repository, Actions discovery works anonymously at a rate-limit-safe interval. A private repository can use the memory-only `githubToken` argument; the token is passed only to the runner environment and is never added to the command, job metadata, output, or persistent state.
 
 Use `job_wait` once with the returned job ID when Codex should automatically continue to the next reasoning step after publishing. Merely watching the dashboard requires no model turns.
 
@@ -154,6 +162,7 @@ npm run build
 npx jest src/tests/LifecycleManager.test.ts --runInBand --coverage=false
 npm run test:lifecycle:mcp
 npm run test:lifecycle:daemon
+npm run test:github-publish
 ```
 
 The plugin entry point is `.codex-plugin/plugin.json`; its bundled MCP server is declared in `.mcp.json`, its routing policy is in `hooks/hooks.json`, and its workflow guidance is in `skills/monitor-remote-jobs/SKILL.md`.
@@ -252,6 +261,7 @@ This server can execute arbitrary commands and open remote SSH sessions. Treat i
 ## Quick Installation
 
 ### Windows
+
 ```powershell
 git clone https://github.com/ooples/mcp-console-automation.git
 cd mcp-console-automation
@@ -259,6 +269,7 @@ cd mcp-console-automation
 ```
 
 ### macOS/Linux
+
 ```bash
 git clone https://github.com/ooples/mcp-console-automation.git
 cd mcp-console-automation
@@ -267,6 +278,7 @@ chmod +x install.sh
 ```
 
 ### Manual Installation
+
 ```bash
 git clone https://github.com/ooples/mcp-console-automation.git
 cd mcp-console-automation
@@ -310,6 +322,7 @@ This MCP server provides **40 comprehensive tools** organized into 6 categories:
 ### Tool Categories
 
 #### 🖥️ Session Management (9 tools)
+
 - `console_create_session` - Create local or SSH console sessions
 - `console_send_input` - Send text input to sessions
 - `console_send_key` - Send special keys (Enter, Ctrl+C, etc.)
@@ -321,6 +334,7 @@ This MCP server provides **40 comprehensive tools** organized into 6 categories:
 - `console_cleanup_sessions` - Clean up inactive sessions
 
 #### ⚡ Command Execution (6 tools)
+
 - `console_execute_command` - Execute commands with output capture
 - `console_detect_errors` - Analyze output for errors
 - `console_get_resource_usage` - Get system resource stats
@@ -329,6 +343,7 @@ This MCP server provides **40 comprehensive tools** organized into 6 categories:
 - `console_get_command_history` - View command history
 
 #### 📊 Monitoring & Alerts (6 tools)
+
 - `console_get_system_metrics` - Comprehensive system metrics
 - `console_get_session_metrics` - Session-specific metrics
 - `console_get_alerts` - Active monitoring alerts
@@ -337,12 +352,14 @@ This MCP server provides **40 comprehensive tools** organized into 6 categories:
 - `console_stop_monitoring` - Stop monitoring
 
 #### 📁 Profile Management (4 tools)
+
 - `console_save_profile` - Save SSH/app connection profiles
 - `console_list_profiles` - List saved profiles
 - `console_remove_profile` - Remove profiles
 - `console_use_profile` - Quick connect with saved profiles
 
 #### 🔄 Background Jobs (9 tools)
+
 - `console_execute_async` - Execute commands asynchronously
 - `console_get_job_status` - Check job status
 - `console_get_job_output` - Get job output
@@ -354,6 +371,7 @@ This MCP server provides **40 comprehensive tools** organized into 6 categories:
 - `console_cleanup_jobs` - Clean up completed jobs
 
 #### ✅ Test Automation (6 tools)
+
 - `console_assert_output` - Assert output matches criteria
 - `console_assert_exit_code` - Assert exit codes
 - `console_assert_no_errors` - Verify no errors occurred
@@ -364,51 +382,55 @@ This MCP server provides **40 comprehensive tools** organized into 6 categories:
 ### Quick Start Examples
 
 #### Create a Local Session
+
 ```javascript
 const session = await console_create_session({
-  command: "npm",
-  args: ["run", "dev"],
-  detectErrors: true
+  command: 'npm',
+  args: ['run', 'dev'],
+  detectErrors: true,
 });
 ```
 
 #### Connect via SSH
+
 ```javascript
 const session = await console_create_session({
-  command: "bash",
-  consoleType: "ssh",
+  command: 'bash',
+  consoleType: 'ssh',
   sshOptions: {
-    host: "example.com",
-    username: "user",
-    privateKeyPath: "~/.ssh/id_rsa"
-  }
+    host: 'example.com',
+    username: 'user',
+    privateKeyPath: '~/.ssh/id_rsa',
+  },
 });
 ```
 
 #### Run Tests with Assertions
+
 ```javascript
 const session = await console_create_session({
-  command: "npm",
-  args: ["test"]
+  command: 'npm',
+  args: ['test'],
 });
 
 await console_assert_output({
   sessionId: session.sessionId,
-  assertionType: "contains",
-  expected: "All tests passed"
+  assertionType: 'contains',
+  expected: 'All tests passed',
 });
 ```
 
 #### Background Job Execution
+
 ```javascript
 const job = await console_execute_async({
   sessionId: session.sessionId,
-  command: "npm run build",
-  priority: 8
+  command: 'npm run build',
+  priority: 8,
 });
 
 const status = await console_get_job_status({
-  jobId: job.jobId
+  jobId: job.jobId,
 });
 ```
 
@@ -417,96 +439,100 @@ For more examples, see [docs/EXAMPLES.md](docs/EXAMPLES.md)
 ## Use Cases
 
 ### 1. Running and monitoring a development server
+
 ```javascript
 // Create a session for the dev server
 const session = await console_create_session({
-  command: "npm",
-  args: ["run", "dev"],
-  detectErrors: true
+  command: 'npm',
+  args: ['run', 'dev'],
+  detectErrors: true,
 });
 
 // Wait for server to start
 await console_wait_for_output({
   sessionId: session.sessionId,
-  pattern: "Server running on",
-  timeout: 10000
+  pattern: 'Server running on',
+  timeout: 10000,
 });
 
 // Monitor for errors
 const errors = await console_detect_errors({
-  sessionId: session.sessionId
+  sessionId: session.sessionId,
 });
 ```
 
 ### 2. Interactive debugging session
+
 ```javascript
 // Start a Python debugging session
 const session = await console_create_session({
-  command: "python",
-  args: ["-m", "pdb", "script.py"]
+  command: 'python',
+  args: ['-m', 'pdb', 'script.py'],
 });
 
 // Set a breakpoint
 await console_send_input({
   sessionId: session.sessionId,
-  input: "b main\n"
+  input: 'b main\n',
 });
 
 // Continue execution
 await console_send_input({
   sessionId: session.sessionId,
-  input: "c\n"
+  input: 'c\n',
 });
 
 // Step through code
 await console_send_key({
   sessionId: session.sessionId,
-  key: "n"
+  key: 'n',
 });
 ```
 
 ### 3. Automated testing with error detection
+
 ```javascript
 // Run tests
 const result = await console_execute_command({
-  command: "pytest",
-  args: ["tests/"],
-  timeout: 30000
+  command: 'pytest',
+  args: ['tests/'],
+  timeout: 30000,
 });
 
 // Check for test failures
 const errors = await console_detect_errors({
-  text: result.output
+  text: result.output,
 });
 
 if (errors.hasErrors) {
-  console.log("Test failures detected:", errors);
+  console.log('Test failures detected:', errors);
 }
 ```
 
 ### 4. Interactive CLI tool automation
+
 ```javascript
 // Start an interactive CLI tool
 const session = await console_create_session({
-  command: "mysql",
-  args: ["-u", "root", "-p"]
+  command: 'mysql',
+  args: ['-u', 'root', '-p'],
 });
 
 // Enter password
 await console_wait_for_output({
   sessionId: session.sessionId,
-  pattern: "Enter password:"
+  pattern: 'Enter password:',
 });
 
 await console_send_input({
   sessionId: session.sessionId,
-  input: "mypassword\n"
+  input: 'mypassword\n',
 });
 
 // Run SQL commands
 await console_send_input({
   sessionId: session.sessionId,
-  input: "SHOW DATABASES;\n"
+  input: 'SHOW DATABASES;\n',
 });
 ```
 
@@ -530,27 +556,32 @@ The server includes built-in patterns for detecting common error types:
 ## Development
 
 ### Building from source
+
 ```bash
 npm install
 npm run build
 ```
 
 ### Running in development mode
+
 ```bash
 npm run dev
 ```
 
 ### Running tests
+
 ```bash
 npm test
 ```
 
 ### Type checking
+
 ```bash
 npm run typecheck
 ```
 
 ### Linting
+
 ```bash
 npm run lint
 ```
@@ -558,6 +589,7 @@ npm run lint
 ## Architecture
 
 The server is built with:
+
 - **Node child processes and ssh2**: For local command execution and SSH sessions
 - **@modelcontextprotocol/sdk**: MCP protocol implementation
 - **TypeScript**: For type safety and better developer experience
@@ -579,6 +611,7 @@ The server is built with:
 ## Testing
 
 Run static validation, the build, MCP smoke tests, and the test suite:
+
 ```bash
 npm run lint
 npm run typecheck

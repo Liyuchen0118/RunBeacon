@@ -1,13 +1,21 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import {
   classifyGitPushFailure,
-  isSuccessfulActionsConclusion,
   parseGitCredentialOutput,
   parseGitHubRepository,
 } from '../lifecycle/GitHubPublish.js';
+import {
+  createGitHubDispatcher,
+  GitHubApiClient,
+  resolveGitHubProxy,
+} from '../lifecycle/GitHubApiClient.js';
+import {
+  monitorGitHubActions,
+  monitoringOutcomeFails,
+} from '../lifecycle/GitHubActionsMonitor.js';
+import { determineWorkflowEligibility } from '../lifecycle/GitHubWorkflowEligibility.js';
 import { redactPersistedText } from '../lifecycle/security.js';
 
 interface RunnerOptions {
@@ -16,6 +24,7 @@ interface RunnerOptions {
   branch?: string;
   commitMessage?: string;
   watchActions: boolean;
+  requireActions: boolean;
   actionsTimeoutMs: number;
   discoveryTimeoutMs: number;
   pollIntervalMs: number;
@@ -25,15 +34,6 @@ interface GitResult {
   code: number;
   stdout: string;
   stderr: string;
-}
-
-interface WorkflowRun {
-  id: number;
-  name: string;
-  status: string;
-  conclusion: string | null;
-  html_url: string;
-  head_sha: string;
 }
 
 const options = parseArguments(process.argv.slice(2));
@@ -112,107 +112,102 @@ async function publish(input: RunnerOptions): Promise<void> {
     );
   }
 
-  await watchActions(repository.owner, repository.repository, sha, input);
-}
-
-async function watchActions(
-  owner: string,
-  repository: string,
-  sha: string,
-  input: RunnerOptions
-): Promise<void> {
   const token =
     process.env.RUNBEACON_GITHUB_TOKEN?.trim() ||
     (await resolveGitHubTokenFromCredentialManager(
       process.env.RUNBEACON_GITHUB_USERNAME?.trim()
     ));
-  const pollIntervalMs = token
-    ? Math.max(10_000, input.pollIntervalMs)
-    : Math.max(60_000, input.pollIntervalMs);
-  const discoveryDeadline = Date.now() + input.discoveryTimeoutMs;
-  let runs: WorkflowRun[] = [];
+  const gitUrlProxy = await optionalGitConfig(cwd, [
+    '--get-urlmatch',
+    'http.proxy',
+    remoteUrl,
+  ]);
+  const gitProxy = await optionalGitConfig(cwd, ['--get', 'http.proxy']);
+  const proxy = resolveGitHubProxy(process.env, gitUrlProxy, gitProxy);
+  const dispatcher = createGitHubDispatcher(proxy);
+  const client = new GitHubApiClient({ token, dispatcher });
 
-  phase(65, 'actions-discovery', 'Waiting for GitHub Actions runs to appear');
-  while (Date.now() < discoveryDeadline) {
-    runs = await fetchWorkflowRuns(owner, repository, sha, token);
-    if (runs.length > 0) break;
-    await delay(
-      Math.min(pollIntervalMs, Math.max(1, discoveryDeadline - Date.now()))
-    );
-  }
-  if (runs.length === 0) {
-    phase(
-      100,
-      'complete',
-      'Push completed; no GitHub Actions run was discovered'
-    );
-    return;
-  }
-
-  const deadline = Date.now() + input.actionsTimeoutMs;
-  for (;;) {
-    const summary = runs
-      .map(
-        (run) =>
-          `${run.name}: ${run.status}${run.conclusion ? `/${run.conclusion}` : ''}`
-      )
-      .join(' | ')
-      .slice(0, 1_000);
-    const completed = runs.every((run) => run.status === 'completed');
-    if (completed) {
-      const failed = runs.filter(
-        (run) => !isSuccessfulActionsConclusion(run.conclusion)
-      );
-      if (failed.length > 0) {
-        phase(99, 'actions-failed', summary);
-        throw new Error(`GitHub Actions failed: ${summary}`);
+  try {
+    const eligibility = await determineWorkflowEligibility({
+      cwd,
+      owner: repository.owner,
+      repository: repository.repository,
+      branch,
+      sha,
+      client,
+      deadlineAt: Date.now() + Math.min(30_000, input.discoveryTimeoutMs),
+    });
+    if (!eligibility.eligible) {
+      const message =
+        'Push completed; no workflow is eligible for this branch or open pull request';
+      if (input.requireActions) {
+        phase(99, 'no-workflows', message);
+        throw new Error(`${message}; requireActions is enabled`);
       }
-      phase(100, 'complete', `GitHub Actions passed: ${summary}`);
+      phase(100, 'no-workflows', message);
+      return;
+    }
+    if (eligibility.unavailableCode) {
+      if (input.requireActions) {
+        throw new Error(
+          `GitHub Actions monitoring is required but unavailable (${eligibility.unavailableCode})`
+        );
+      }
+      phase(
+        100,
+        'monitoring-degraded',
+        `Push completed; GitHub Actions monitoring is unavailable (${eligibility.unavailableCode})`
+      );
       return;
     }
 
-    if (Date.now() >= deadline) {
-      phase(95, 'actions-timeout', summary);
-      throw new Error(`Timed out waiting for GitHub Actions: ${summary}`);
+    const outcome = await monitorGitHubActions({
+      owner: repository.owner,
+      repository: repository.repository,
+      sha,
+      authenticated: Boolean(token),
+      client,
+      discoveryTimeoutMs: input.discoveryTimeoutMs,
+      actionsTimeoutMs: input.actionsTimeoutMs,
+      pollIntervalMs: input.pollIntervalMs,
+      onProgress: phase,
+    });
+    if (outcome.kind === 'passed') {
+      phase(100, 'complete', `GitHub Actions passed: ${outcome.summary}`);
+      return;
     }
-    const elapsed = input.actionsTimeoutMs - (deadline - Date.now());
-    const percentage = Math.min(
-      95,
-      70 + Math.round((25 * elapsed) / input.actionsTimeoutMs)
+    if (outcome.kind === 'failed') {
+      phase(99, 'actions-failed', outcome.summary);
+      throw new Error(`GitHub Actions failed: ${outcome.summary}`);
+    }
+    if (outcome.kind === 'timed-out') {
+      phase(95, 'actions-timeout', outcome.summary);
+      throw new Error(
+        `Timed out waiting for GitHub Actions: ${outcome.summary}`
+      );
+    }
+    if (monitoringOutcomeFails(outcome, input.requireActions)) {
+      throw new Error(
+        `GitHub Actions monitoring is required but unavailable (${outcome.code})`
+      );
+    }
+    phase(
+      100,
+      'monitoring-degraded',
+      `Push completed; GitHub Actions monitoring is unavailable (${outcome.code})`
     );
-    phase(percentage, 'actions', summary);
-    await delay(pollIntervalMs);
-    runs = await fetchWorkflowRuns(owner, repository, sha, token);
+  } finally {
+    await dispatcher?.close().catch(() => undefined);
   }
 }
 
-async function fetchWorkflowRuns(
-  owner: string,
-  repository: string,
-  sha: string,
-  token?: string
-): Promise<WorkflowRun[]> {
-  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/actions/runs?head_sha=${encodeURIComponent(sha)}&per_page=50`;
-  const headers: Record<string, string> = {
-    Accept: 'application/vnd.github+json',
-    'User-Agent': 'RunBeacon',
-    'X-GitHub-Api-Version': '2022-11-28',
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-  const response = await fetch(url, {
-    headers,
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!response.ok) {
-    if (response.status === 404) {
-      throw new Error(
-        'GitHub Actions API returned 404. For a private repository, sign in through Git Credential Manager or provide a memory-only githubToken.'
-      );
-    }
-    throw new Error(`GitHub Actions API failed with HTTP ${response.status}`);
-  }
-  const body = (await response.json()) as { workflow_runs?: WorkflowRun[] };
-  return (body.workflow_runs ?? []).filter((run) => run.head_sha === sha);
+async function optionalGitConfig(
+  cwd: string,
+  args: string[]
+): Promise<string | undefined> {
+  const result = await runGit(cwd, ['config', ...args]);
+  if (result.code !== 0) return undefined;
+  return result.stdout.trim() || undefined;
 }
 
 async function resolveGitHubTokenFromCredentialManager(
@@ -341,6 +336,7 @@ function parseArguments(args: string[]): RunnerOptions {
     branch: values.get('branch') || undefined,
     commitMessage: values.get('commit-message') || undefined,
     watchActions: values.get('watch-actions') !== 'false',
+    requireActions: values.get('require-actions') === 'true',
     actionsTimeoutMs: boundedNumber(
       values.get('actions-timeout-ms'),
       30 * 60_000,
