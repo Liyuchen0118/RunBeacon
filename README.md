@@ -2,7 +2,7 @@
 
 RunBeacon turns long-running local and SSH commands into tracked jobs for Codex. The Codex plugin keeps the stable ID `remote-job-monitor`: Codex starts a job once, calls `job_wait` once, and resumes when the resident daemon reports a terminal event. A live MCP Apps dashboard refreshes by calling the MCP server directly, so dashboard updates and intermediate status checks do not create model turns.
 
-For non-interactive remote execution, RunBeacon is the default route. Its skill description makes Codex prefer `job_start` for server/SSH requests, a `UserPromptSubmit` Hook adds the routing policy when a prompt contains remote-execution intent, and a `PreToolUse` Hook blocks raw `ssh`, `scp`, `sftp`, or `plink` commands that would bypass lifecycle tracking. Plugin Hooks must be reviewed and trusted by the user after installation.
+For non-interactive remote execution, RunBeacon is the default route. Its skill description makes Codex prefer `job_start` for server/SSH requests, a `UserPromptSubmit` Hook adds the routing policy and records a short-lived prompt trace, and a `PreToolUse` Hook attaches that trace to `job_start` without relying on the model to copy fields. A second `PreToolUse` policy blocks raw `ssh`, `scp`, `sftp`, or `plink` commands that would bypass lifecycle tracking. Plugin Hooks must be reviewed and trusted by the user after installation.
 
 Plugin version 1.0.0 and npm version 2.0.0 add security-bounded RE2 progress parsing, shared `job_wait` coordination, entry-point log redaction, verified TLS-only VNC challenge authentication, and strict HTTPS Xen XAPI access. This is a breaking security release; see the [2.0 security migration guide](docs/SECURITY_MIGRATION_2.0.md).
 
@@ -13,15 +13,22 @@ Plugin version 1.0.0 and npm version 2.0.0 add security-bounded RE2 progress par
 - Local process and SSH channel ownership, output capture, cancellation, and timeout handling
 - Lifecycle assessment with active/stalled state, elapsed time, progress, and linear ETA
 - MCP Apps dashboard whose refresh loop consumes no model tokens
+- Direct default-SSH launcher in the dashboard, bypassing model scheduling for exact commands
+- End-to-end prompt, credential, queue, SSH, command, and total latency breakdowns
 - Dashboard-tracked Git commit, push, and GitHub Actions phases through `github_publish_start`
+- Retry-bounded GitHub API monitoring with proxy reuse, workflow eligibility detection, and distinct push/monitoring outcomes
 - `PreToolUse` Hook that blocks untracked raw `ssh`, `scp`, `sftp`, and `plink`
 - `UserPromptSubmit` Hook that selects RunBeacon for operational remote-server requests
+- Turn-scoped `PreToolUse` trace injection for reliable prompt-to-tool timing and retry deduplication
 - Memory-only inline SSH passwords/passphrases and pinned host-key support
-- Passwordless `credential_profile_*` tools for SSH agent/private-key references and Git Credential Manager
+- `credential_profile_*` tools for SSH agent/private-key references and safe OS-managed credential references
+- `ssh_password_save` and `ssh_password_delete` for IP/host, username, and OS-managed SSH password profiles
 - `github_token_save` and `github_token_delete` for OS-managed GitHub PAT credentials
 - Independent default SSH and GitHub profiles with explicit set/clear tools
 - Persistent redacted job metadata; command output persistence is off by default
 - Reattachment from a new MCP client to jobs owned by the resident daemon
+- Protocol v4 monotonic daemon upgrades; an older Codex task cannot downgrade a newer resident build
+- Prompt-trace idempotency that binds one remote execution request to one job
 - RE2-compatible progress patterns compiled once per job and matched against a bounded 16 KiB line tail
 - Pre-sink structured log redaction with depth, key, array, and string limits
 
@@ -41,13 +48,19 @@ sequenceDiagram
   C->>M: job_wait(jobId) once
   M->>D: wait for terminal event
   P-->>D: output, progress, exit event
-  U->>M: job_list (direct MCP calls)
+  U->>M: job_snapshot(current jobId)
   M->>D: snapshots
   D-->>M: terminal result
   M-->>C: tool result; continue next step
 ```
 
-The dashboard still refreshes locally every 1.5 seconds, but those calls run between the MCP App and the MCP server. They do not invoke the model and do not spend model tokens. The model-facing path is event-driven.
+The dashboard still refreshes locally every 1.5 seconds, but those calls run between the MCP App and the MCP server. Each dashboard is bound to the job that opened it and refreshes only that `jobId` through `job_snapshot`; it never loads historical jobs. These calls do not invoke the model and do not spend model tokens. The model-facing path is event-driven.
+
+For latency-sensitive exact commands, open the dashboard and use **Run on default SSH**. The app calls `job_start` directly, preserves shell text verbatim, disables duplicate clicks, and reuses the same request trace if a tool response is lost. This removes prompt-to-tool model scheduling from the critical path. Each job card separates `prompt→tool`, credential lookup, queue, SSH handshake, command runtime, and total time so a slow model turn cannot be mistaken for slow remote execution.
+
+The `UserPromptSubmit` Hook records a UUID and timestamp for natural-language remote requests. A matching `PreToolUse` Hook injects them into `job_start` for the same Codex session and turn, so timing no longer depends on the model copying optional arguments. The short-lived state contains only hashed session/turn keys and timing fields, never prompts, commands, or credentials. The lifecycle manager returns the existing job when the same trace is submitted again, even if a retry changes the command or idempotency key. A changed command requires a new user request instead of an automatic second execution.
+
+SSH handshakes use a 12-second per-attempt ready timeout and retry pre-ready failures up to five times with a 250ms bounded exponential backoff. Override these conservative defaults with `RJM_SSH_READY_TIMEOUT_MS` (1,000-30,000), `RJM_SSH_RETRY_BASE_DELAY_MS` (0-30,000), or `RJM_SSH_HANDSHAKE_ATTEMPTS` (1-5). RunBeacon never retries after SSH becomes ready because the command may already have reached the host.
 
 ## GitHub publishing dashboard
 
@@ -59,15 +72,22 @@ Call `github_publish_start` with a repository directory. If `commitMessage` is s
   "remote": "origin",
   "commitMessage": "feat: add dashboard",
   "watchActions": true,
+  "requireActions": false,
   "idempotencyKey": "publish-dashboard-v1"
 }
 ```
 
-The attached MCP App shows `preflight`, `commit`, `push`, `pushed`, `actions-discovery`, `actions`, and terminal phases. For a public repository, Actions discovery works anonymously at a rate-limit-safe interval. A private repository can use the memory-only `githubToken` argument; the token is passed only to the runner environment and is never added to the command, job metadata, output, or persistent state.
+The attached MCP App shows `preflight`, `commit`, `push`, `pushed`, `actions-discovery`, `actions`, and terminal phases. Before polling, RunBeacon parses local workflow YAML and checks open pull requests. A feature-branch push with no eligible push or pull-request workflow finishes quickly as `no-workflows` instead of waiting for a run that cannot exist. Draft pull requests are included.
+
+GitHub API calls use a 15-second per-attempt timeout, at most five retry attempts within the caller deadline, exponential backoff with jitter, and `Retry-After` for HTTP 429. Network failures plus HTTP 408, 429, and 5xx are retried; authentication and permission responses are not blindly repeated. Proxy precedence is `RUNBEACON_GITHUB_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, Git URL-specific proxy, `git http.proxy`, then direct. `NO_PROXY` is respected, and proxy credentials are never emitted.
+
+Push and monitoring results are separate. A push failure or an actual failing Actions conclusion fails the job. After a confirmed push, unavailable API monitoring ends as `monitoring-degraded` by default, while no eligible workflow ends as `no-workflows`; both remain successful publish jobs. Set `requireActions: true` when missing or unavailable Actions monitoring must fail a release gate.
+
+For a public repository, Actions discovery works anonymously at a rate-limit-safe interval. A private repository can use the memory-only `githubToken` argument; the token is passed only to the runner environment and is never added to the command, job metadata, output, or persistent state.
 
 Use `job_wait` once with the returned job ID when Codex should automatically continue to the next reasoning step after publishing. Merely watching the dashboard requires no model turns.
 
-## Passwordless credential profiles
+## Saved SSH credential profiles
 
 RunBeacon profiles store connection references, never secrets. Create an SSH profile with `credential_profile_save` using a host, username, pinned host-key fingerprint, and either `agent: "auto"` or `privateKeyPath`. Then pass only `credentialProfile` to `job_start`; when a target contains a matching host and user but no inline authentication, RunBeacon also selects the unique matching SSH profile automatically.
 
@@ -83,6 +103,22 @@ RunBeacon profiles store connection references, never secrets. Create an SSH pro
 ```
 
 After the key is loaded into the OS `ssh-agent`, a tracked command needs only `command` and `credentialProfile: "production"`.
+
+When password authentication is required, call `ssh_password_save`. Prefer `passwordEnvVar`; use the memory-only `password` field only when the user deliberately supplies the password in the conversation:
+
+```json
+{
+  "id": "training-server",
+  "host": "192.0.2.10",
+  "port": 22,
+  "username": "trainer",
+  "passwordEnvVar": "RUNBEACON_SSH_PASSWORD",
+  "hostKeySha256": "SHA256:...",
+  "makeDefault": true
+}
+```
+
+RunBeacon sends the password to the configured Git credential helper over stdin and verifies it through a non-interactive read. The profile JSON stores only the IP/host, port, username, host-key policy, and `credentialKind: "password"`; `job_start` reads the password into memory only for the SSH connection. It is excluded from command arguments, environment metadata, job records, errors, logs, and dashboard responses. RunBeacon rejects the plaintext Git `credential-store` helper; configure Git Credential Manager or another OS-backed helper.
 
 For GitHub OAuth, sign in once through Git Credential Manager:
 
@@ -104,11 +140,11 @@ To import a GitHub PAT, prefer an environment variable that is already available
 
 Call `github_token_save` with that input. When the user explicitly chooses to paste a PAT into the conversation, the tool also accepts `token` instead of `tokenEnvVar`. In both modes the PAT travels to `git credential approve` over stdin, is verified through a non-interactive `git credential fill`, and is never placed in command arguments or RunBeacon persistence. Conversation history may retain a pasted token, so environment import or Git Credential Manager's login flow is safer.
 
-RunBeacon refuses the plaintext Git `credential-store` helper for PAT saving. Configure Git Credential Manager or another OS-backed helper first.
+RunBeacon refuses the plaintext Git `credential-store` helper for PAT and SSH-password saving. Configure Git Credential Manager or another OS-backed helper first.
 
 Use the resulting `credentialProfile: "github-pat"` with `github_publish_start`. `github_token_delete` removes both a PAT profile and its matching helper credential; it refuses to delete generic OAuth/login profiles.
 
-`credential_profile_list` returns only safe references. `credential_profile_delete` removes the RunBeacon reference but does not delete OS credentials, agent keys, or key files.
+`credential_profile_list` returns only safe references. `credential_profile_delete` removes the RunBeacon reference but does not delete OS credentials, agent keys, or key files. Use `ssh_password_delete` when both an SSH password profile and its matching OS-managed credential must be removed.
 
 ## Default credential profiles
 
@@ -126,6 +162,7 @@ npm run build
 npx jest src/tests/LifecycleManager.test.ts --runInBand --coverage=false
 npm run test:lifecycle:mcp
 npm run test:lifecycle:daemon
+npm run test:github-publish
 ```
 
 The plugin entry point is `.codex-plugin/plugin.json`; its bundled MCP server is declared in `.mcp.json`, its routing policy is in `hooks/hooks.json`, and its workflow guidance is in `skills/monitor-remote-jobs/SKILL.md`.
@@ -134,7 +171,7 @@ See [RunBeacon architecture](docs/REMOTE_JOB_MONITOR_ARCHITECTURE.md) for lifecy
 
 ## Important boundary
 
-The plugin can reliably monitor only commands that it launches through `job_start` or `github_publish_start`. A Hook can stop raw SSH before it starts, but no plugin can reconstruct a complete process lifecycle after an arbitrary command has already detached outside the plugin. Inline SSH passwords supplied by the user are accepted for a single tracked job, held in daemon memory, and never persisted; SSH agent or key-path authentication is preferred.
+The plugin can reliably monitor only commands that it launches through `job_start` or `github_publish_start`. A Hook can stop raw SSH before it starts, but no plugin can reconstruct a complete process lifecycle after an arbitrary command has already detached outside the plugin. Inline SSH passwords supplied to `job_start` remain single-job and memory-only. Passwords intentionally saved through `ssh_password_save` persist only in the OS credential manager and are read into memory for the selected job; SSH agent or key-path authentication remains preferred.
 
 ---
 
@@ -224,6 +261,7 @@ This server can execute arbitrary commands and open remote SSH sessions. Treat i
 ## Quick Installation
 
 ### Windows
+
 ```powershell
 git clone https://github.com/ooples/mcp-console-automation.git
 cd mcp-console-automation
@@ -231,6 +269,7 @@ cd mcp-console-automation
 ```
 
 ### macOS/Linux
+
 ```bash
 git clone https://github.com/ooples/mcp-console-automation.git
 cd mcp-console-automation
@@ -239,6 +278,7 @@ chmod +x install.sh
 ```
 
 ### Manual Installation
+
 ```bash
 git clone https://github.com/ooples/mcp-console-automation.git
 cd mcp-console-automation
@@ -282,6 +322,7 @@ This MCP server provides **40 comprehensive tools** organized into 6 categories:
 ### Tool Categories
 
 #### 🖥️ Session Management (9 tools)
+
 - `console_create_session` - Create local or SSH console sessions
 - `console_send_input` - Send text input to sessions
 - `console_send_key` - Send special keys (Enter, Ctrl+C, etc.)
@@ -293,6 +334,7 @@ This MCP server provides **40 comprehensive tools** organized into 6 categories:
 - `console_cleanup_sessions` - Clean up inactive sessions
 
 #### ⚡ Command Execution (6 tools)
+
 - `console_execute_command` - Execute commands with output capture
 - `console_detect_errors` - Analyze output for errors
 - `console_get_resource_usage` - Get system resource stats
@@ -301,6 +343,7 @@ This MCP server provides **40 comprehensive tools** organized into 6 categories:
 - `console_get_command_history` - View command history
 
 #### 📊 Monitoring & Alerts (6 tools)
+
 - `console_get_system_metrics` - Comprehensive system metrics
 - `console_get_session_metrics` - Session-specific metrics
 - `console_get_alerts` - Active monitoring alerts
@@ -309,12 +352,14 @@ This MCP server provides **40 comprehensive tools** organized into 6 categories:
 - `console_stop_monitoring` - Stop monitoring
 
 #### 📁 Profile Management (4 tools)
+
 - `console_save_profile` - Save SSH/app connection profiles
 - `console_list_profiles` - List saved profiles
 - `console_remove_profile` - Remove profiles
 - `console_use_profile` - Quick connect with saved profiles
 
 #### 🔄 Background Jobs (9 tools)
+
 - `console_execute_async` - Execute commands asynchronously
 - `console_get_job_status` - Check job status
 - `console_get_job_output` - Get job output
@@ -326,6 +371,7 @@ This MCP server provides **40 comprehensive tools** organized into 6 categories:
 - `console_cleanup_jobs` - Clean up completed jobs
 
 #### ✅ Test Automation (6 tools)
+
 - `console_assert_output` - Assert output matches criteria
 - `console_assert_exit_code` - Assert exit codes
 - `console_assert_no_errors` - Verify no errors occurred
@@ -336,51 +382,55 @@ This MCP server provides **40 comprehensive tools** organized into 6 categories:
 ### Quick Start Examples
 
 #### Create a Local Session
+
 ```javascript
 const session = await console_create_session({
-  command: "npm",
-  args: ["run", "dev"],
-  detectErrors: true
+  command: 'npm',
+  args: ['run', 'dev'],
+  detectErrors: true,
 });
 ```
 
 #### Connect via SSH
+
 ```javascript
 const session = await console_create_session({
-  command: "bash",
-  consoleType: "ssh",
+  command: 'bash',
+  consoleType: 'ssh',
   sshOptions: {
-    host: "example.com",
-    username: "user",
-    privateKeyPath: "~/.ssh/id_rsa"
-  }
+    host: 'example.com',
+    username: 'user',
+    privateKeyPath: '~/.ssh/id_rsa',
+  },
 });
 ```
 
 #### Run Tests with Assertions
+
 ```javascript
 const session = await console_create_session({
-  command: "npm",
-  args: ["test"]
+  command: 'npm',
+  args: ['test'],
 });
 
 await console_assert_output({
   sessionId: session.sessionId,
-  assertionType: "contains",
-  expected: "All tests passed"
+  assertionType: 'contains',
+  expected: 'All tests passed',
 });
 ```
 
 #### Background Job Execution
+
 ```javascript
 const job = await console_execute_async({
   sessionId: session.sessionId,
-  command: "npm run build",
-  priority: 8
+  command: 'npm run build',
+  priority: 8,
 });
 
 const status = await console_get_job_status({
-  jobId: job.jobId
+  jobId: job.jobId,
 });
 ```
 
@@ -389,96 +439,100 @@ For more examples, see [docs/EXAMPLES.md](docs/EXAMPLES.md)
 ## Use Cases
 
 ### 1. Running and monitoring a development server
+
 ```javascript
 // Create a session for the dev server
 const session = await console_create_session({
-  command: "npm",
-  args: ["run", "dev"],
-  detectErrors: true
+  command: 'npm',
+  args: ['run', 'dev'],
+  detectErrors: true,
 });
 
 // Wait for server to start
 await console_wait_for_output({
   sessionId: session.sessionId,
-  pattern: "Server running on",
-  timeout: 10000
+  pattern: 'Server running on',
+  timeout: 10000,
 });
 
 // Monitor for errors
 const errors = await console_detect_errors({
-  sessionId: session.sessionId
+  sessionId: session.sessionId,
 });
 ```
 
 ### 2. Interactive debugging session
+
 ```javascript
 // Start a Python debugging session
 const session = await console_create_session({
-  command: "python",
-  args: ["-m", "pdb", "script.py"]
+  command: 'python',
+  args: ['-m', 'pdb', 'script.py'],
 });
 
 // Set a breakpoint
 await console_send_input({
   sessionId: session.sessionId,
-  input: "b main\n"
+  input: 'b main\n',
 });
 
 // Continue execution
 await console_send_input({
   sessionId: session.sessionId,
-  input: "c\n"
+  input: 'c\n',
 });
 
 // Step through code
 await console_send_key({
   sessionId: session.sessionId,
-  key: "n"
+  key: 'n',
 });
 ```
 
 ### 3. Automated testing with error detection
+
 ```javascript
 // Run tests
 const result = await console_execute_command({
-  command: "pytest",
-  args: ["tests/"],
-  timeout: 30000
+  command: 'pytest',
+  args: ['tests/'],
+  timeout: 30000,
 });
 
 // Check for test failures
 const errors = await console_detect_errors({
-  text: result.output
+  text: result.output,
 });
 
 if (errors.hasErrors) {
-  console.log("Test failures detected:", errors);
+  console.log('Test failures detected:', errors);
 }
 ```
 
 ### 4. Interactive CLI tool automation
+
 ```javascript
 // Start an interactive CLI tool
 const session = await console_create_session({
-  command: "mysql",
-  args: ["-u", "root", "-p"]
+  command: 'mysql',
+  args: ['-u', 'root', '-p'],
 });
 
 // Enter password
 await console_wait_for_output({
   sessionId: session.sessionId,
-  pattern: "Enter password:"
+  pattern: 'Enter password:',
 });
 
 await console_send_input({
   sessionId: session.sessionId,
-  input: "mypassword\n"
+  input: 'mypassword\n',
 });
 
 // Run SQL commands
 await console_send_input({
   sessionId: session.sessionId,
-  input: "SHOW DATABASES;\n"
+  input: 'SHOW DATABASES;\n',
 });
 ```
 
@@ -502,27 +556,32 @@ The server includes built-in patterns for detecting common error types:
 ## Development
 
 ### Building from source
+
 ```bash
 npm install
 npm run build
 ```
 
 ### Running in development mode
+
 ```bash
 npm run dev
 ```
 
 ### Running tests
+
 ```bash
 npm test
 ```
 
 ### Type checking
+
 ```bash
 npm run typecheck
 ```
 
 ### Linting
+
 ```bash
 npm run lint
 ```
@@ -530,6 +589,7 @@ npm run lint
 ## Architecture
 
 The server is built with:
+
 - **Node child processes and ssh2**: For local command execution and SSH sessions
 - **@modelcontextprotocol/sdk**: MCP protocol implementation
 - **TypeScript**: For type safety and better developer experience
@@ -551,6 +611,7 @@ The server is built with:
 ## Testing
 
 Run static validation, the build, MCP smoke tests, and the test suite:
+
 ```bash
 npm run lint
 npm run typecheck

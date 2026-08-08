@@ -35,6 +35,7 @@
     "test:mcp": "node scripts/mcp-smoke-test.mjs",
     "test:lifecycle:mcp": "node scripts/lifecycle-mcp-smoke-test.mjs",
     "test:lifecycle:daemon": "node scripts/lifecycle-daemon-smoke-test.mjs",
+    "test:github-publish": "node scripts/github-publish-runner-smoke-test.mjs",
     "test:logger": "node scripts/logger-smoke-test.mjs",
     "test:security:performance": "node --expose-gc scripts/security-performance-test.mjs",
     "test:installer": "node scripts/installer-smoke-test.mjs",
@@ -70,6 +71,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "axios": "^1.18.1",
     "eventemitter3": "^5.0.4",
+    "minimatch": "^9.0.9",
     "nodemailer": "^9.0.3",
     "p-queue": "^8.1.1",
     "re2js": "2.8.6",
@@ -77,8 +79,10 @@
     "ssh2": "^1.17.0",
     "strip-ansi": "^7.2.0",
     "systeminformation": "^5.31.17",
+    "undici": "^6.28.0",
     "uuid": "^11.1.0",
-    "winston": "^3.19.0"
+    "winston": "^3.19.0",
+    "yaml": "^2.9.0"
   },
   "peerDependencies": {
     "@aws-sdk/client-cloudwatch-logs": ">=3.987.0",
@@ -207,7 +211,7 @@
   "overrides": {
     "@hono/node-server": "^2.0.12",
     "minimatch@3.1.5": {
-      "brace-expansion": "1.1.17"
+      "brace-expansion": "1.1.18"
     },
     "minimatch@10.2.5": {
       "brace-expansion": "^5.0.8"

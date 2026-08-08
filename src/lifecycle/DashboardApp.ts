@@ -16,6 +16,12 @@ export function createDashboardHtml(): string {
     header { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; }
     h1 { font-size:18px; margin:0; }
     #connection { font-size:12px; opacity:.7; }
+    .launcher { border:1px solid color-mix(in srgb, #2563eb 28%, transparent); border-radius:12px; padding:12px; margin-bottom:14px; background:color-mix(in srgb, #2563eb 6%, Canvas); }
+    .launcher-title { font-size:13px; font-weight:700; margin-bottom:7px; }
+    .launcher textarea { box-sizing:border-box; width:100%; min-height:84px; resize:vertical; border:1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius:8px; padding:8px; background:Canvas; color:CanvasText; font:12px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .launcher-row { display:flex; align-items:center; gap:8px; margin-top:8px; }
+    .launcher-row input { flex:1; min-width:0; border:1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius:7px; padding:6px 8px; background:Canvas; color:CanvasText; }
+    #launch-status { font-size:12px; opacity:.75; margin-top:7px; min-height:1.2em; }
     #jobs { display:grid; gap:10px; }
     .empty { opacity:.7; border:1px dashed color-mix(in srgb, CanvasText 25%, transparent); border-radius:10px; padding:22px; text-align:center; }
     .job { border:1px solid color-mix(in srgb, CanvasText 18%, transparent); border-radius:12px; padding:12px; background:color-mix(in srgb, Canvas 96%, CanvasText 4%); }
@@ -32,6 +38,7 @@ export function createDashboardHtml(): string {
     .progress-info { display:flex; align-items:center; gap:7px; margin-top:7px; font-size:12px; overflow-wrap:anywhere; }
     .phase { border-radius:999px; padding:2px 7px; background:#2563eb18; color:#2563eb; font-weight:700; white-space:nowrap; }
     .github { margin-top:7px; font-size:12px; padding:6px 8px; border-radius:7px; background:color-mix(in srgb, #2563eb 8%, transparent); }
+    .timing { margin-top:7px; font-size:12px; padding:6px 8px; border-radius:7px; background:color-mix(in srgb, #16a34a 8%, transparent); overflow-wrap:anywhere; }
     pre { max-height:150px; overflow:auto; margin:10px 0 0; padding:9px; border-radius:8px; background:color-mix(in srgb, CanvasText 7%, transparent); font:11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
     button { border:1px solid color-mix(in srgb, CanvasText 20%, transparent); background:transparent; color:inherit; border-radius:7px; padding:5px 9px; cursor:pointer; }
     button:hover { background:color-mix(in srgb, CanvasText 8%, transparent); }
@@ -40,14 +47,32 @@ export function createDashboardHtml(): string {
 </head>
 <body>
   <header><h1>RunBeacon</h1><span id="connection">Connecting...</span></header>
-  <main id="jobs"><div class="empty">Loading tracked jobs...</div></main>
+  <section class="launcher">
+    <div class="launcher-title">Direct default SSH start | bypasses model scheduling</div>
+    <textarea id="launch-command" spellcheck="false" placeholder="Paste the remote shell command exactly as it should run"></textarea>
+    <div class="launcher-row">
+      <input id="launch-progress" aria-label="Progress pattern" placeholder="Optional progress regex, e.g. (\\d+)%" />
+      <button id="launch-button" type="button">Run on default SSH</button>
+    </div>
+    <div id="launch-status">The command stays in this app and is sent directly to RunBeacon.</div>
+  </section>
+  <main id="jobs"><div class="empty">Waiting for the current task...</div></main>
   <script>
     (() => {
       const jobsEl = document.getElementById('jobs');
       const connectionEl = document.getElementById('connection');
+      const launchCommandEl = document.getElementById('launch-command');
+      const launchProgressEl = document.getElementById('launch-progress');
+      const launchButtonEl = document.getElementById('launch-button');
+      const launchStatusEl = document.getElementById('launch-status');
       let rpcId = 0;
       let ready;
       let refreshing = false;
+      let refreshTimer;
+      let renderedSignature = null;
+      let latestJobs = [];
+      let focusedJobId;
+      let launcherAttempt;
       const pending = new Map();
 
       const notify = (method, params) => window.parent.postMessage({ jsonrpc:'2.0', method, params }, '*');
@@ -72,8 +97,17 @@ export function createDashboardHtml(): string {
         }
         if (message.method === 'ui/notifications/tool-result') {
           const data = structured(message.params);
-          if (data?.jobs) render(data.jobs);
-          else if (data?.job) render([data.job]);
+          if (data?.dashboardJobId && data?.job?.id === data.dashboardJobId) {
+            focusedJobId = data.dashboardJobId;
+            render([data.job]);
+            scheduleRefresh(isTerminal(data.job.state) ? 5000 : 0);
+          } else if (focusedJobId && data?.job?.id === focusedJobId) {
+            render([data.job]);
+            scheduleRefresh(isTerminal(data.job.state) ? 5000 : 0);
+          } else if (data?.dashboardJobId === null) {
+            focusedJobId = undefined;
+            render([]);
+          }
         }
       }, { passive:true });
 
@@ -90,10 +124,46 @@ export function createDashboardHtml(): string {
         const minutes = Math.floor(seconds / 60);
         return minutes + 'm ' + (seconds % 60) + 's';
       };
+      const between = (start, end) => {
+        const startMs = Date.parse(start || '');
+        const endMs = Date.parse(end || '');
+        return Number.isFinite(startMs) && Number.isFinite(endMs)
+          ? Math.max(0, endMs - startMs)
+          : null;
+      };
+      const requestId = () => globalThis.crypto?.randomUUID?.() ||
+        '00000000-0000-4000-8000-' + Date.now().toString(16).padStart(12, '0').slice(-12);
+
+      function timingHtml(job) {
+        const timing = job.timing || {};
+        const finishedOrNow = job.finishedAt || new Date().toISOString();
+        const segments = [
+          ['prompt→tool', between(timing.requestReceivedAt, timing.toolReceivedAt)],
+          ['credential', between(timing.toolReceivedAt, timing.credentialsResolvedAt)],
+          ['queue', between(job.createdAt, job.startedAt)],
+          ['SSH', between(job.startedAt, timing.sshReadyAt)],
+          ['command', between(timing.commandStartedAt || job.startedAt, finishedOrNow)],
+          ['total', between(timing.requestReceivedAt || job.createdAt, finishedOrNow)],
+        ].filter((entry) => entry[1] !== null);
+        return segments.length
+          ? '<div class="timing">Timing | ' + segments.map((entry) =>
+              escapeHtml(entry[0]) + ' ' + duration(entry[1])
+            ).join(' | ') + '</div>'
+          : '';
+      }
 
       function render(jobs) {
+        latestJobs = jobs || [];
+        const signature = latestJobs.map((job) => {
+          const elapsedBucket = isTerminal(job.state)
+            ? 'terminal'
+            : Math.floor((job.assessment?.elapsedMs || 0) / 5000);
+          return job.id + ':' + job.version + ':' + elapsedBucket;
+        }).join('|');
+        if (signature === renderedSignature) return;
+        renderedSignature = signature;
         if (!jobs?.length) {
-          jobsEl.innerHTML = '<div class="empty">No tracked jobs yet.</div>';
+          jobsEl.innerHTML = '<div class="empty">Waiting for the current task...</div>';
           return;
         }
         jobsEl.innerHTML = jobs.map((job) => {
@@ -110,11 +180,13 @@ export function createDashboardHtml(): string {
             ? '<div class="github">GitHub | remote ' + escapeHtml(job.metadata.remote || 'origin') +
               ' | branch ' + escapeHtml(job.metadata.branch || 'current') +
               ' | Actions ' + (job.metadata.watchActions === false ? 'not monitored' : 'monitored') +
+              (job.metadata.requireActions ? ' (required)' : ' (best effort)') +
               (job.metadata.credentialProfile ? ' | credential ' + escapeHtml(job.metadata.credentialProfile) : '') + '</div>'
             : '';
           const credential = job.metadata?.credentialProfile && job.metadata?.kind !== 'github_publish'
             ? '<div class="github">Credential profile | ' + escapeHtml(job.metadata.credentialProfile) + '</div>'
             : '';
+          const timing = timingHtml(job);
           const output = tail ? '<pre>' + escapeHtml(tail) + '</pre>' : '';
           const cancel = isTerminal(job.state) ? ''
             : '<div style="margin-top:9px"><button data-cancel="' + escapeHtml(job.id) + '">Cancel</button></div>';
@@ -124,7 +196,7 @@ export function createDashboardHtml(): string {
               '<div class="meta">' + escapeHtml(targetLabel(job.target)) + ' | ' + escapeHtml(job.id.slice(0,8)) + ' | elapsed ' + duration(job.assessment?.elapsedMs) + ' | ' + escapeHtml(job.assessment?.health || '') + '</div>' +
               '<div class="meta">' + escapeHtml(job.assessment?.summary || '') + '</div></div>' +
               '<span class="state ' + escapeHtml(job.state) + '">' + escapeHtml(job.state) + '</span>' +
-            '</div>' + github + credential + progressBar + progressInfo +
+            '</div>' + github + credential + timing + progressBar + progressInfo +
             (job.error ? '<div class="meta">' + escapeHtml(job.error) + '</div>' : '') +
             output + cancel + '</section>';
         }).join('');
@@ -137,11 +209,18 @@ export function createDashboardHtml(): string {
 
       async function refresh() {
         if (refreshing) return;
+        if (!focusedJobId) {
+          connectionEl.textContent = 'Waiting for current task';
+          return;
+        }
         refreshing = true;
+        const requestedJobId = focusedJobId;
         try {
-          const response = await callTool('job_list', { tailLines:8 });
+          const response = await callTool('job_snapshot', { jobId:requestedJobId, tailLines:6 });
           const data = structured(response);
-          if (data?.jobs) render(data.jobs);
+          if (focusedJobId === requestedJobId && data?.job?.id === requestedJobId) {
+            render([data.job]);
+          }
           connectionEl.textContent = 'Live | no model polling';
         } catch (error) {
           connectionEl.textContent = 'Waiting for MCP connection';
@@ -150,12 +229,63 @@ export function createDashboardHtml(): string {
         }
       }
 
+      function refreshDelay() {
+        if (document.hidden) return 15000;
+        return latestJobs.some((job) => !isTerminal(job.state)) ? 1500 : 5000;
+      }
+
+      function scheduleRefresh(delay = refreshDelay()) {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(async () => {
+          await refresh();
+          scheduleRefresh();
+        }, delay);
+      }
+
       jobsEl.addEventListener('click', async (event) => {
         const button = event.target.closest('button[data-cancel]');
         if (!button) return;
         button.disabled = true;
         try { await callTool('job_cancel', { jobId:button.dataset.cancel }); }
-        finally { await refresh(); }
+        finally { await refresh(); scheduleRefresh(); }
+      });
+
+      launchButtonEl.addEventListener('click', async () => {
+        const command = launchCommandEl.value;
+        const progressPattern = launchProgressEl.value.trim();
+        if (!command.trim()) {
+          launchStatusEl.textContent = 'Enter a remote command first.';
+          return;
+        }
+        if (!launcherAttempt || launcherAttempt.command !== command) {
+          launcherAttempt = {
+            command,
+            requestTraceId:requestId(),
+            requestReceivedAt:new Date().toISOString(),
+          };
+        }
+        launchButtonEl.disabled = true;
+        launchStatusEl.textContent = 'Starting through the default SSH profile...';
+        try {
+          const response = await callTool('job_start', {
+            command,
+            useDefaultCredential:true,
+            requestTraceId:launcherAttempt.requestTraceId,
+            requestReceivedAt:launcherAttempt.requestReceivedAt,
+            ...(progressPattern ? { progressPattern } : {}),
+          });
+          const data = structured(response);
+          if (!data?.job) throw new Error('RunBeacon returned no job');
+          launcherAttempt = undefined;
+          focusedJobId = data.job.id;
+          launchStatusEl.textContent = 'Started job ' + data.job.id.slice(0,8) + '. Live updates use no model polling.';
+          render([data.job]);
+          scheduleRefresh(0);
+        } catch (error) {
+          launchStatusEl.textContent = 'Start failed. Retry keeps the same request trace and cannot duplicate the job.';
+        } finally {
+          launchButtonEl.disabled = false;
+        }
       });
 
       ready = request('ui/initialize', {
@@ -163,8 +293,10 @@ export function createDashboardHtml(): string {
         appCapabilities:{},
         protocolVersion:'2026-01-26'
       }).then(() => notify('ui/notifications/initialized', {}));
-      ready.then(refresh).catch(() => { connectionEl.textContent = 'MCP Apps bridge unavailable'; });
-      setInterval(refresh, 1500);
+      ready.then(() => scheduleRefresh(0)).catch(() => { connectionEl.textContent = 'MCP Apps bridge unavailable'; });
+      document.addEventListener('visibilitychange', () => {
+        scheduleRefresh(document.hidden ? 15000 : 0);
+      }, { passive:true });
     })();
   </script>
 </body>

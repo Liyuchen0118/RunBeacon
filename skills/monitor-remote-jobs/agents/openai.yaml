@@ -5,3 +5,9 @@ interface:
 
 policy:
   allow_implicit_invocation: true
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "runbeacon"
+      description: "RunBeacon tracked jobs, SSH credentials, waits, and live dashboard"

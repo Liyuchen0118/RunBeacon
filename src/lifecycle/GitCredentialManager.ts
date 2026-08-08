@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { parseGitCredentialOutput } from './GitHubPublish.js';
 
 export interface GitHubTokenCredential {
@@ -13,12 +13,18 @@ export interface GitCredentialCommandOptions {
   timeoutMs?: number;
 }
 
+export interface SshPasswordCredential {
+  profileId: string;
+  username: string;
+  password: string;
+}
+
 export async function saveGitHubTokenCredential(
   input: GitHubTokenCredential,
   options: GitCredentialCommandOptions = {}
 ): Promise<void> {
   const credential = normalizeCredential(input);
-  await rejectPlaintextCredentialStore(options);
+  await rejectPlaintextCredentialStore(options, 'a GitHub token');
   await runGitCredential(
     'approve',
     credentialPayload(credential, true),
@@ -44,8 +50,65 @@ export async function saveGitHubTokenCredential(
   }
 }
 
+export async function saveSshPasswordCredential(
+  input: SshPasswordCredential,
+  options: GitCredentialCommandOptions = {}
+): Promise<void> {
+  const credential = normalizeSshPasswordCredential(input);
+  await rejectPlaintextCredentialStore(options, 'an SSH password');
+  await runGitCredential(
+    'approve',
+    sshCredentialPayload(credential, true),
+    options
+  );
+  const resolved = await fillSshPasswordCredential(
+    credential.profileId,
+    credential.username,
+    options
+  );
+  if (!resolved || !secretEquals(resolved, credential.password)) {
+    await runGitCredential(
+      'reject',
+      sshCredentialPayload(credential, false),
+      options
+    ).catch(() => undefined);
+    throw new Error(
+      'The configured Git credential helper did not return the saved SSH password'
+    );
+  }
+}
+
+export async function readSshPasswordCredential(
+  profileId: string,
+  username: string,
+  options: GitCredentialCommandOptions = {}
+): Promise<string | undefined> {
+  return fillSshPasswordCredential(profileId, username, options);
+}
+
+export async function deleteSshPasswordCredential(
+  profileId: string,
+  username: string,
+  options: GitCredentialCommandOptions = {}
+): Promise<void> {
+  const credential = normalizeSshPasswordCredential(
+    {
+      profileId,
+      username,
+      password: '',
+    },
+    false
+  );
+  await runGitCredential(
+    'reject',
+    sshCredentialPayload(credential, false),
+    options
+  );
+}
+
 async function rejectPlaintextCredentialStore(
-  options: GitCredentialCommandOptions
+  options: GitCredentialCommandOptions,
+  secretDescription: string
 ): Promise<void> {
   const helpers = await runGitCommand(
     ['config', '--get-all', 'credential.helper'],
@@ -57,7 +120,7 @@ async function rejectPlaintextCredentialStore(
       .some((helper) => /(?:^|[\s/-])store(?:\s|$)/i.test(helper.trim()))
   ) {
     throw new Error(
-      'Refusing to save a GitHub token with the plaintext Git credential store; configure Git Credential Manager or another OS-backed helper'
+      `Refusing to save ${secretDescription} with the plaintext Git credential store; configure Git Credential Manager or another OS-backed helper`
     );
   }
 }
@@ -109,6 +172,27 @@ async function fillGitHubCredential(
       options
     );
     return parseGitCredentialOutput(output);
+  } catch {
+    return undefined;
+  }
+}
+
+async function fillSshPasswordCredential(
+  profileId: string,
+  username: string,
+  options: GitCredentialCommandOptions
+): Promise<string | undefined> {
+  const credential = normalizeSshPasswordCredential(
+    { profileId, username, password: '' },
+    false
+  );
+  try {
+    const output = await runGitCredential(
+      'fill',
+      sshCredentialPayload(credential, false),
+      options
+    );
+    return parseGitCredentialOutput(output).password;
   } catch {
     return undefined;
   }
@@ -222,6 +306,27 @@ function normalizeCredential(
   };
 }
 
+function normalizeSshPasswordCredential(
+  input: SshPasswordCredential,
+  requirePassword = true
+): SshPasswordCredential {
+  return {
+    profileId: normalizeProfileId(input.profileId),
+    username: normalizeUsername(input.username, 'SSH'),
+    password: requirePassword ? normalizeSshPassword(input.password) : '',
+  };
+}
+
+function normalizeProfileId(value: string): string {
+  const id = String(value ?? '').trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id)) {
+    throw new Error(
+      'Credential profile id must contain 1 to 64 letters, numbers, dots, underscores, or hyphens'
+    );
+  }
+  return id;
+}
+
 function normalizeHost(host: string): 'github.com' {
   if (String(host).trim().toLowerCase() !== 'github.com') {
     throw new Error('GitHub token credentials currently support github.com');
@@ -229,11 +334,11 @@ function normalizeHost(host: string): 'github.com' {
   return 'github.com';
 }
 
-function normalizeUsername(username: string): string {
+function normalizeUsername(username: string, kind = 'GitHub'): string {
   const normalized = String(username ?? '').trim();
   if (!normalized || normalized.length > 128 || /[\r\n\0]/.test(normalized)) {
     throw new Error(
-      'GitHub username is required and must not exceed 128 characters'
+      `${kind} username is required and must not exceed 128 characters`
     );
   }
   return normalized;
@@ -251,6 +356,20 @@ function normalizeToken(token: string): string {
   return normalized;
 }
 
+function normalizeSshPassword(password: string): string {
+  const normalized = String(password ?? '');
+  if (
+    normalized.length < 1 ||
+    normalized.length > 4_096 ||
+    /[\r\n\0]/.test(normalized)
+  ) {
+    throw new Error(
+      'SSH password is required, must not exceed 4096 characters, and cannot contain a line break or NUL byte'
+    );
+  }
+  return normalized;
+}
+
 function credentialPayload(
   credential: Required<GitHubTokenCredential>,
   includeToken: boolean
@@ -263,6 +382,26 @@ function credentialPayload(
     '',
     '',
   ].join('\n');
+}
+
+function sshCredentialPayload(
+  credential: SshPasswordCredential,
+  includePassword: boolean
+): string {
+  return [
+    'protocol=https',
+    `host=${sshPasswordCredentialHost(credential.profileId)}`,
+    `username=${credential.username}`,
+    ...(includePassword ? [`password=${credential.password}`] : []),
+    '',
+    '',
+  ].join('\n');
+}
+
+export function sshPasswordCredentialHost(profileId: string): string {
+  const normalized = normalizeProfileId(profileId);
+  const digest = createHash('sha256').update(normalized).digest('hex');
+  return `runbeacon-ssh-${digest.slice(0, 24)}.invalid`;
 }
 
 function secretEquals(left: string, right: string): boolean {

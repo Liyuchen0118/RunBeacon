@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CredentialProfileStore } from '../lifecycle/CredentialProfileStore.js';
@@ -76,6 +76,58 @@ describe('CredentialProfileStore', () => {
       } as never)
     ).toThrow(/never store token/);
     expect(store.list()).toEqual([]);
+  });
+
+  test('persists only a safe reference for SSH password profiles', () => {
+    const store = new CredentialProfileStore(profilePath);
+    const marker = 'SSH_PASSWORD_CANARY_MUST_NOT_PERSIST_4928';
+    const profile = store.save(
+      {
+        id: 'training-server',
+        kind: 'ssh',
+        host: '192.0.2.10',
+        port: 22,
+        username: 'trainer',
+        credentialKind: 'password',
+        hostKeySha256: 'SHA256:test',
+      },
+      true
+    );
+
+    expect(profile).toMatchObject({
+      kind: 'ssh',
+      credentialKind: 'password',
+    });
+    expect(store.getDefault('ssh')?.id).toBe('training-server');
+    const persisted = readFileSync(profilePath, 'utf8');
+    expect(persisted).toContain('"credentialKind": "password"');
+    expect(persisted).not.toContain(marker);
+    expect(persisted).not.toMatch(/"password"\s*:/i);
+  });
+
+  test('rolls back in-memory changes when profile persistence fails', () => {
+    const blockingFile = join(root, 'not-a-directory');
+    writeFileSync(blockingFile, 'blocked');
+    const store = new CredentialProfileStore(
+      join(blockingFile, 'profiles.json')
+    );
+
+    expect(() =>
+      store.save(
+        {
+          id: 'training-server',
+          kind: 'ssh',
+          host: '192.0.2.10',
+          port: 22,
+          username: 'trainer',
+          credentialKind: 'password',
+          allowUnverifiedHostKey: true,
+        },
+        true
+      )
+    ).toThrow();
+    expect(store.list()).toEqual([]);
+    expect(store.defaults()).toEqual({});
   });
 
   test('deletes only the RunBeacon reference profile', () => {

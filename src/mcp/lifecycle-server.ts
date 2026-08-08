@@ -25,13 +25,18 @@ import {
   deleteGitHubTokenCredential,
   saveGitHubTokenCredential,
 } from '../lifecycle/GitCredentialManager.js';
+import { SshPasswordProfileManager } from '../lifecycle/SshPasswordProfileManager.js';
 import {
   createDashboardHtml,
   DASHBOARD_RESOURCE_URI,
   MCP_APP_MIME_TYPE,
 } from '../lifecycle/DashboardApp.js';
 import { safeErrorMessage } from '../lifecycle/security.js';
-import { SshJobTarget, StartJobInput } from '../lifecycle/types.js';
+import {
+  isTerminalJobState,
+  SshJobTarget,
+  StartJobInput,
+} from '../lifecycle/types.js';
 import { RUNBEACON_VERSION } from '../lifecycle/protocol.js';
 
 process.env.MCP_SERVER_MODE = 'true';
@@ -46,6 +51,7 @@ const githubPublishRunner = fileURLToPath(
 const credentialProfiles = new CredentialProfileStore(
   join(pluginData, 'credential-profiles.json')
 );
+const sshPasswordProfiles = new SshPasswordProfileManager(credentialProfiles);
 
 let manager: LifecycleService;
 if (process.env.RJM_INLINE_MANAGER === 'true') {
@@ -58,6 +64,9 @@ if (process.env.RJM_INLINE_MANAGER === 'true') {
     persistenceDebounceMs: Number(process.env.RJM_PERSIST_DEBOUNCE_MS || 250),
     maxRetainedJobs: Number(process.env.RJM_MAX_RETAINED_JOBS || 1000),
     cancellationGraceMs: Number(process.env.RJM_CANCEL_GRACE_MS || 5000),
+    sshHandshakeAttempts: Number(process.env.RJM_SSH_HANDSHAKE_ATTEMPTS || 5),
+    sshRetryBaseDelayMs: Number(process.env.RJM_SSH_RETRY_BASE_DELAY_MS || 250),
+    sshReadyTimeoutMs: Number(process.env.RJM_SSH_READY_TIMEOUT_MS || 12_000),
   });
 } else {
   const daemon = new DaemonClient(
@@ -244,6 +253,93 @@ const tools: Tool[] = [
     },
   },
   {
+    name: 'ssh_password_save',
+    description:
+      'Store an SSH password in the configured OS-backed Git credential helper and create a safe RunBeacon profile containing only host, port, username, host-key policy, and credentialKind="password". Prefer passwordEnvVar so the password never appears in conversation. The password is never written to RunBeacon profiles, jobs, dashboard state, logs, command arguments, or environment metadata.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'string',
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$',
+          description: 'Reusable SSH credential profile name.',
+        },
+        host: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 253,
+          description: 'SSH server IP address or hostname.',
+        },
+        port: { type: 'integer', minimum: 1, maximum: 65535, default: 22 },
+        username: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 128,
+          description: 'SSH account name.',
+        },
+        passwordEnvVar: {
+          type: 'string',
+          pattern: '^[A-Za-z_][A-Za-z0-9_]{0,127}$',
+          description:
+            'Preferred: read the password from this MCP server environment variable.',
+        },
+        password: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 4096,
+          description:
+            'Explicit memory-only password input. Use only when the user deliberately supplies it in this conversation.',
+        },
+        hostKeySha256: {
+          type: 'string',
+          description: 'Pinned SSH host-key fingerprint.',
+        },
+        allowUnverifiedHostKey: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Explicit insecure override when no fingerprint is available.',
+        },
+        makeDefault: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Make this password profile the default SSH credential after saving.',
+        },
+      },
+      required: ['id', 'host', 'username'],
+    },
+    annotations: {
+      title: 'Save SSH Password',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'ssh_password_delete',
+    description:
+      'Delete an SSH password created through ssh_password_save from the configured OS credential helper and remove its RunBeacon profile reference. Passwordless SSH profiles are rejected.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'string',
+          description: 'RunBeacon SSH password profile to delete.',
+        },
+      },
+      required: ['id'],
+    },
+    annotations: {
+      title: 'Delete SSH Password',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  {
     name: 'github_token_save',
     description:
       'Store a GitHub personal access token in the configured Git credential helper and create a safe RunBeacon profile reference. Prefer tokenEnvVar so the token never appears in conversation; use token only when the user explicitly provides it. The token is never written to RunBeacon profiles, jobs, dashboard state, or logs.',
@@ -352,6 +448,12 @@ const tools: Tool[] = [
           description:
             'Discover and monitor GitHub Actions after the push. Disable for non-GitHub remotes.',
         },
+        requireActions: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Fail the publish job when no eligible workflow exists or Actions monitoring is unavailable. Actual workflow failures always fail the job.',
+        },
         githubToken: {
           type: 'string',
           description:
@@ -401,12 +503,13 @@ const tools: Tool[] = [
     },
     _meta: {
       ui: { resourceUri: DASHBOARD_RESOURCE_URI },
+      'openai/outputTemplate': DASHBOARD_RESOURCE_URI,
     },
   } as Tool,
   {
     name: 'job_start',
     description:
-      'Start a tracked local or SSH command. This is the default tool for non-interactive remote execution: use it instead of raw shell/ssh whenever Codex calls a remote server so lifecycle events, output, progress, cancellation, and event-driven waiting remain available.',
+      'Start one tracked local or SSH command. Pass remote shell commands verbatim without adding escapes. For a RunBeacon prompt trace, reuse requestTraceId on every retry so the server returns the original job instead of executing twice. When the user requests the default SSH server, set useDefaultCredential=true and call this tool directly without listing profiles first.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -471,7 +574,19 @@ const tools: Tool[] = [
           type: 'boolean',
           default: false,
           description:
-            'Use the default SSH profile for an explicitly remote request. Leave false for local commands.',
+            'Fast path for an explicitly requested default SSH server. Set true directly without calling credential_profile_list first. Leave false for local commands.',
+        },
+        requestTraceId: {
+          type: 'string',
+          minLength: 36,
+          maxLength: 64,
+          description:
+            'Opaque request UUID supplied by the RunBeacon prompt hook. Reuse it unchanged; a second start with the same trace returns the first job.',
+        },
+        requestReceivedAt: {
+          type: 'string',
+          description:
+            'ISO timestamp supplied by the RunBeacon prompt hook for end-to-end latency measurement.',
         },
       },
       required: ['command'],
@@ -483,11 +598,15 @@ const tools: Tool[] = [
       idempotentHint: false,
       openWorldHint: true,
     },
-  },
+    _meta: {
+      ui: { resourceUri: DASHBOARD_RESOURCE_URI },
+      'openai/outputTemplate': DASHBOARD_RESOURCE_URI,
+    },
+  } as Tool,
   {
     name: 'job_wait',
     description:
-      'Wait inside the MCP server until a tracked job reaches a terminal state. This is event-driven and consumes no repeated model turns while waiting. Call once after job_start, then continue the workflow from the returned result.',
+      'Wait inside the MCP server until a tracked job reaches a terminal state. This is event-driven and consumes no repeated model turns while waiting. Call it immediately as the next tool call after job_start, without intermediate commentary, profile listing, status checks, or extra planning.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -535,7 +654,7 @@ const tools: Tool[] = [
   {
     name: 'job_list',
     description:
-      'List tracked jobs with bounded output tails. The dashboard calls this directly without model tokens.',
+      'List tracked job history with bounded output tails. Live dashboards use job_snapshot for their single focused task.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -570,8 +689,16 @@ const tools: Tool[] = [
   {
     name: 'job_dashboard',
     description:
-      'Render the live RunBeacon dashboard. The UI refreshes by calling job_list directly, so updates do not create model turns or consume model tokens.',
-    inputSchema: { type: 'object', properties: {} },
+      'Render one live RunBeacon task. Pass jobId to reopen a known task; without it, the newest non-terminal task is selected. The UI calls job_snapshot directly, so updates do not create model turns or expose job history.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: {
+          type: 'string',
+          description: 'Tracked task to display without showing other jobs.',
+        },
+      },
+    },
     annotations: {
       title: 'Open Job Dashboard',
       readOnlyHint: true,
@@ -581,6 +708,7 @@ const tools: Tool[] = [
     },
     _meta: {
       ui: { resourceUri: DASHBOARD_RESOURCE_URI },
+      'openai/outputTemplate': DASHBOARD_RESOURCE_URI,
     },
   } as Tool,
 ];
@@ -631,10 +759,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         const makeDefault = args.makeDefault === true;
         const profileInput = { ...args };
         delete profileInput.makeDefault;
+        if (
+          profileInput.kind === 'ssh' &&
+          profileInput.credentialKind === 'password'
+        ) {
+          throw new Error(
+            'Use ssh_password_save to create an SSH password profile so its password is stored in the OS credential manager'
+          );
+        }
         const profile = credentialProfiles.save(
-          profileInput as SaveCredentialProfileInput
+          profileInput as SaveCredentialProfileInput,
+          makeDefault
         );
-        if (makeDefault) credentialProfiles.setDefault(profile.id);
         return reply(
           { profile, isDefault: makeDefault },
           `Saved passwordless ${profile.kind} credential profile ${profile.id}${makeDefault ? ' as the default' : ''}. No secret material was stored.`
@@ -680,6 +816,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             : `No default ${kind} credential profile was configured.`
         );
       }
+      case 'ssh_password_save': {
+        const makeDefault = args.makeDefault === true;
+        const password = resolveSshPasswordInput(args);
+        const profile = await sshPasswordProfiles.save({
+          id: String(args.id ?? ''),
+          host: String(args.host ?? ''),
+          port: args.port === undefined ? 22 : Number(args.port),
+          username: String(args.username ?? ''),
+          password,
+          hostKeySha256: optionalString(args.hostKeySha256),
+          allowUnverifiedHostKey:
+            args.allowUnverifiedHostKey === true ? true : undefined,
+          makeDefault,
+        });
+        return reply(
+          { profile, credentialStored: true, isDefault: makeDefault },
+          `Saved SSH password profile ${profile.id}${makeDefault ? ' as the default' : ''} in the configured OS credential helper. RunBeacon stored only the safe connection reference.`
+        );
+      }
+      case 'ssh_password_delete': {
+        const deleted = await sshPasswordProfiles.delete(String(args.id ?? ''));
+        return reply(
+          {
+            profileId: deleted.profile.id,
+            credentialDeleted: deleted.credentialDeleted,
+          },
+          `Deleted SSH password profile ${deleted.profile.id} from the configured OS credential helper and RunBeacon.`
+        );
+      }
       case 'github_token_save': {
         const id = String(args.id ?? '').trim();
         if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id)) {
@@ -701,16 +866,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           username,
           token,
         });
-        const profile = credentialProfiles.save({
-          id,
-          kind: 'github',
-          host: 'github.com',
-          credentialSource: 'git',
-          username,
-          credentialKind: 'pat',
-        });
         const makeDefault = args.makeDefault === true;
-        if (makeDefault) credentialProfiles.setDefault(profile.id);
+        const profile = credentialProfiles.save(
+          {
+            id,
+            kind: 'github',
+            host: 'github.com',
+            credentialSource: 'git',
+            username,
+            credentialKind: 'pat',
+          },
+          makeDefault
+        );
         return reply(
           { profile, credentialStored: true, isDefault: makeDefault },
           `Saved GitHub PAT profile ${profile.id}${makeDefault ? ' as the default' : ''} in the configured Git credential helper. RunBeacon stored only the safe profile reference.`
@@ -735,6 +902,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         if (!cwd) throw new Error('cwd is required');
         const remote = String(args.remote ?? 'origin');
         const watchActions = args.watchActions !== false;
+        const requireActions = args.requireActions === true;
         const branch = optionalString(args.branch);
         const commitMessage = optionalString(args.commitMessage);
         const actionsTimeoutMs = numericArgument(
@@ -754,6 +922,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           remote,
           '--watch-actions',
           String(watchActions),
+          '--require-actions',
+          String(requireActions),
           '--actions-timeout-ms',
           String(actionsTimeoutMs),
           '--discovery-timeout-ms',
@@ -807,18 +977,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             remote,
             branch: branch ?? 'current',
             watchActions,
+            requireActions,
             credentialProfile: credentialProfile?.id,
           },
         });
         return reply(
-          { job },
+          { job, dashboardJobId: job.id },
           `GitHub publish job ${job.id} started. The dashboard tracks commit, push, and Actions without model polling; call job_wait once if you need to continue automatically.`
         );
       }
       case 'job_start': {
-        const job = await manager.start(resolveJobStartInput(args));
+        const toolReceivedAt = new Date().toISOString();
+        const input = await resolveJobStartInput(args);
+        input.timing = resolveRequestTiming(
+          args,
+          toolReceivedAt,
+          new Date().toISOString()
+        );
+        const job = await manager.start(input);
         return reply(
-          { job },
+          { job, dashboardJobId: job.id },
           `Tracked job ${job.id} queued. Call job_wait once to resume when it finishes; do not poll.`
         );
       }
@@ -847,8 +1025,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         return reply({ job }, `Cancellation requested for job ${job.id}.`);
       }
       case 'job_dashboard': {
-        const jobs = await manager.list(8);
-        return reply({ jobs }, 'Opened the live job dashboard.');
+        const requestedJobId = optionalString(args.jobId);
+        const job = requestedJobId
+          ? await manager.snapshot(requestedJobId, 8)
+          : (await manager.list(8, 100)).find(
+              (candidate) => !isTerminalJobState(candidate.state)
+            );
+        return reply(
+          { job: job ?? null, dashboardJobId: job?.id ?? null },
+          job
+            ? `Opened the live dashboard for job ${job.id}.`
+            : 'No active tracked task is available to display.'
+        );
       }
       default:
         throw new Error(`Unknown tool: ${request.params.name}`);
@@ -896,6 +1084,28 @@ function resolveGitHubTokenInput(args: Record<string, any>): string {
   return token;
 }
 
+function resolveSshPasswordInput(args: Record<string, any>): string {
+  const inlinePassword =
+    typeof args.password === 'string' && args.password.length > 0
+      ? args.password
+      : undefined;
+  const environmentName = optionalString(args.passwordEnvVar);
+  if (Boolean(inlinePassword) === Boolean(environmentName)) {
+    throw new Error('Provide exactly one of passwordEnvVar or password');
+  }
+  if (inlinePassword !== undefined) return inlinePassword;
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(environmentName ?? '')) {
+    throw new Error('passwordEnvVar must be a valid environment variable name');
+  }
+  const password = process.env[environmentName!];
+  if (!password) {
+    throw new Error(
+      `SSH password environment variable ${environmentName} is not available to the MCP server`
+    );
+  }
+  return password;
+}
+
 function numericArgument(value: unknown, fallback: number): number {
   if (value === undefined) return fallback;
   const parsed = Number(value);
@@ -919,10 +1129,14 @@ function requireGitHubProfile(id: string): GitHubCredentialProfile {
   return profile;
 }
 
-function resolveJobStartInput(args: Record<string, any>): StartJobInput {
+async function resolveJobStartInput(
+  args: Record<string, any>
+): Promise<StartJobInput> {
   const input = { ...args } as Record<string, any>;
   delete input.credentialProfile;
   delete input.useDefaultCredential;
+  delete input.requestTraceId;
+  delete input.requestReceivedAt;
   const requestedProfile = optionalString(args.credentialProfile);
   const useDefaultCredential = args.useDefaultCredential === true;
   if (requestedProfile && useDefaultCredential) {
@@ -984,12 +1198,25 @@ function resolveJobStartInput(args: Record<string, any>): StartJobInput {
         `SSH profile ${profile.id} is for ${profile.host}, not ${String(target.host)}`
       );
     }
-    if (
-      target?.username &&
-      String(target.username).toLowerCase() !== profile.username.toLowerCase()
-    ) {
+    if (target?.username && String(target.username) !== profile.username) {
       throw new Error(
         `SSH profile ${profile.id} is for user ${profile.username}, not ${String(target.username)}`
+      );
+    }
+    const hasInlineAuthentication = Boolean(
+      target?.password || target?.privateKeyPath || target?.agent
+    );
+    const savedPassword =
+      profile.credentialKind === 'password' && !hasInlineAuthentication
+        ? await sshPasswordProfiles.read(profile)
+        : undefined;
+    if (
+      profile.credentialKind === 'password' &&
+      !hasInlineAuthentication &&
+      !savedPassword
+    ) {
+      throw new Error(
+        `SSH password for credential profile ${profile.id} is unavailable in the OS credential manager; save it again with ssh_password_save`
       );
     }
     target = {
@@ -997,6 +1224,7 @@ function resolveJobStartInput(args: Record<string, any>): StartJobInput {
       host: profile.host,
       port: profile.port,
       username: profile.username,
+      ...(savedPassword ? { password: savedPassword } : {}),
       privateKeyPath: profile.privateKeyPath,
       agent: profile.agent,
       hostKeySha256: profile.hostKeySha256,
@@ -1021,7 +1249,7 @@ function resolveJobStartInput(args: Record<string, any>): StartJobInput {
     if (target.agent === 'auto') target.agent = resolveSshAgent();
     if (!target.password && !target.privateKeyPath && !target.agent) {
       throw new Error(
-        'SSH authentication is missing. Save a passwordless credential profile with credential_profile_save, or provide a memory-only password for this job.'
+        'SSH authentication is missing. Save a credential with ssh_password_save or credential_profile_save, or provide a memory-only password for this job.'
       );
     }
     input.target = target as unknown as SshJobTarget;
@@ -1030,6 +1258,47 @@ function resolveJobStartInput(args: Record<string, any>): StartJobInput {
   }
 
   return input as StartJobInput;
+}
+
+function resolveRequestTiming(
+  args: Record<string, any>,
+  toolReceivedAt: string,
+  credentialsResolvedAt: string
+): StartJobInput['timing'] {
+  const requestTraceId = optionalString(args.requestTraceId);
+  const requestReceivedAt = optionalString(args.requestReceivedAt);
+  if (!requestTraceId && !requestReceivedAt) {
+    return { toolReceivedAt, credentialsResolvedAt };
+  }
+  if (!requestTraceId || !requestReceivedAt) {
+    throw new Error(
+      'requestTraceId and requestReceivedAt must be supplied together'
+    );
+  }
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      requestTraceId
+    )
+  ) {
+    throw new Error('requestTraceId must be a UUID');
+  }
+  const receivedMs = Date.parse(requestReceivedAt);
+  const toolMs = Date.parse(toolReceivedAt);
+  if (
+    !Number.isFinite(receivedMs) ||
+    receivedMs > toolMs + 5 * 60_000 ||
+    receivedMs < toolMs - 24 * 60 * 60_000
+  ) {
+    throw new Error(
+      'requestReceivedAt must be a valid timestamp within the last 24 hours'
+    );
+  }
+  return {
+    requestTraceId,
+    requestReceivedAt: new Date(receivedMs).toISOString(),
+    toolReceivedAt,
+    credentialsResolvedAt,
+  };
 }
 
 function resolveSshAgent(): string {

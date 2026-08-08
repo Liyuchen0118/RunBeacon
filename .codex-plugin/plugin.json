@@ -1,7 +1,7 @@
 {
   "name": "remote-job-monitor",
-  "version": "1.0.0+codex.20260803075712",
-  "description": "Security-hardened tracked routing for local, SSH, and GitHub jobs with reusable default credentials and a token-free dashboard.",
+  "version": "1.0.0+codex.20260808071336",
+  "description": "Security-hardened tracked routing for local, SSH, and GitHub jobs with OS-managed credentials and a token-free dashboard.",
   "author": {
     "name": "RunBeacon contributors"
   },
@@ -17,7 +17,7 @@
   "interface": {
     "displayName": "RunBeacon",
     "shortDescription": "Default tracked route for SSH, remote jobs, and publishing.",
-    "longDescription": "Automatically prefers tracked RunBeacon jobs for non-interactive remote execution. Independent default SSH and GitHub profiles remove repeated credential selection while preserving explicit overrides. RE2-compatible progress parsing and bounded shared wait coordination keep untrusted job output and concurrent waits resource-safe. Passwordless profiles reference ssh-agent and private-key paths; GitHub PAT profiles delegate secret storage to the configured Git credential helper. RunBeacon owns command and publishing lifecycles and renders a live dashboard without repeated model turns.",
+    "longDescription": "Automatically prefers one trace-bound RunBeacon job for non-interactive remote execution. A protocol-v4 resident daemon cannot be downgraded by older Codex tasks. Independent default SSH and GitHub profiles remove repeated credential selection while preserving explicit overrides. The live dashboard shows prompt, credential, queue, SSH, command, and total timing, and its direct default-SSH launcher bypasses model scheduling for exact commands. GitHub publishing separates a confirmed push from retry-bounded Actions monitoring, including fast workflow eligibility checks and optional strict gating. RE2-compatible progress parsing, bounded waits, and OS-managed SSH/GitHub credentials preserve the security boundary without repeated model turns.",
     "developerName": "RunBeacon contributors",
     "category": "Developer Tools",
     "capabilities": [
@@ -28,10 +28,8 @@
       "GitHub"
     ],
     "defaultPrompt": [
-      "Run this command on my SSH server through RunBeacon and continue when it finishes.",
-      "Save my GitHub PAT through the system credential manager without persisting it in RunBeacon.",
-      "Make my common SSH and GitHub profiles the defaults for future tracked jobs.",
-      "Open the live dashboard for my remote jobs.",
+      "Run this command on my default SSH server through RunBeacon, show the live dashboard, and continue when it finishes.",
+      "Save this SSH server IP, username, and password in the OS credential manager and make it my default.",
       "Push my staged commit and monitor GitHub Actions in the dashboard."
     ]
   },

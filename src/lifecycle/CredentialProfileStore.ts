@@ -20,6 +20,7 @@ export interface SshCredentialProfile extends CredentialProfileBase {
   host: string;
   port: number;
   username: string;
+  credentialKind?: 'password';
   privateKeyPath?: string;
   agent?: string;
   hostKeySha256?: string;
@@ -92,22 +93,42 @@ export class CredentialProfileStore {
 
   setDefault(id: string): CredentialProfile {
     const profile = this.get(id);
+    const previous = this.defaultProfileIds[profile.kind];
     this.defaultProfileIds[profile.kind] = profile.id;
-    this.persist();
+    try {
+      this.persist();
+    } catch (error) {
+      if (previous) this.defaultProfileIds[profile.kind] = previous;
+      else delete this.defaultProfileIds[profile.kind];
+      throw error;
+    }
     return profile;
   }
 
   clearDefault(kind: CredentialProfile['kind']): CredentialProfile | undefined {
     const profile = this.getDefault(kind);
     delete this.defaultProfileIds[kind];
-    this.persist();
+    try {
+      this.persist();
+    } catch (error) {
+      if (profile) this.defaultProfileIds[kind] = profile.id;
+      throw error;
+    }
     return profile;
   }
 
-  save(input: SaveCredentialProfileInput): CredentialProfile {
+  validate(input: SaveCredentialProfileInput): SaveCredentialProfileInput {
     rejectSecretFields(input as unknown as Record<string, unknown>);
-    const normalized = normalizeProfile(input);
+    return normalizeProfile(input);
+  }
+
+  save(
+    input: SaveCredentialProfileInput,
+    makeDefault = false
+  ): CredentialProfile {
+    const normalized = this.validate(input);
     const existing = this.profiles.get(normalized.id);
+    const previousDefault = this.defaultProfileIds[normalized.kind];
     const now = new Date().toISOString();
     const profile: CredentialProfile = {
       ...normalized,
@@ -115,29 +136,49 @@ export class CredentialProfileStore {
       updatedAt: now,
     } as CredentialProfile;
     this.profiles.set(profile.id, profile);
-    this.persist();
+    if (makeDefault) this.defaultProfileIds[profile.kind] = profile.id;
+    try {
+      this.persist();
+    } catch (error) {
+      if (existing) this.profiles.set(existing.id, existing);
+      else this.profiles.delete(profile.id);
+      if (previousDefault) {
+        this.defaultProfileIds[profile.kind] = previousDefault;
+      } else {
+        delete this.defaultProfileIds[profile.kind];
+      }
+      throw error;
+    }
     return profile;
   }
 
   delete(id: string): CredentialProfile {
     const profile = this.get(id);
+    const previousDefault = this.defaultProfileIds[profile.kind];
     this.profiles.delete(profile.id);
     if (this.defaultProfileIds[profile.kind] === profile.id) {
       delete this.defaultProfileIds[profile.kind];
     }
-    this.persist();
+    try {
+      this.persist();
+    } catch (error) {
+      this.profiles.set(profile.id, profile);
+      if (previousDefault) {
+        this.defaultProfileIds[profile.kind] = previousDefault;
+      }
+      throw error;
+    }
     return profile;
   }
 
   findSsh(host: string, username?: string): SshCredentialProfile[] {
     const normalizedHost = host.trim().toLowerCase();
-    const normalizedUsername = username?.trim().toLowerCase();
+    const normalizedUsername = username?.trim();
     return this.list('ssh').filter(
       (profile): profile is SshCredentialProfile =>
         profile.kind === 'ssh' &&
         profile.host.toLowerCase() === normalizedHost &&
-        (!normalizedUsername ||
-          profile.username.toLowerCase() === normalizedUsername)
+        (!normalizedUsername || profile.username === normalizedUsername)
     );
   }
 
@@ -217,9 +258,22 @@ function normalizeProfile(
   }
   const privateKeyPath = normalizeOptional(input.privateKeyPath, 4_000);
   const agent = normalizeOptional(input.agent, 4_000);
-  if (!privateKeyPath && !agent) {
+  if (
+    input.credentialKind !== undefined &&
+    input.credentialKind !== 'password'
+  ) {
+    throw new Error('Unsupported SSH credential kind');
+  }
+  const credentialKind =
+    input.credentialKind === 'password' ? 'password' : undefined;
+  if (credentialKind && (privateKeyPath || agent)) {
     throw new Error(
-      'SSH profile requires privateKeyPath or agent="auto"/an SSH agent path; passwords are never stored'
+      'SSH password profiles cannot also contain a private-key path or SSH agent reference'
+    );
+  }
+  if (!credentialKind && !privateKeyPath && !agent) {
+    throw new Error(
+      'SSH profile requires credentialKind="password", privateKeyPath, or agent="auto"/an SSH agent path; passwords are never stored in the profile'
     );
   }
   const hostKeySha256 = normalizeOptional(input.hostKeySha256, 200);
@@ -234,6 +288,7 @@ function normalizeProfile(
     host,
     port,
     username,
+    credentialKind,
     privateKeyPath,
     agent,
     hostKeySha256,

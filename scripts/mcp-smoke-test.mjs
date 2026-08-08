@@ -20,6 +20,29 @@ const sessionPersistenceFile = path.join(
   'data',
   'sessions.json'
 );
+const transientCleanupCodes = new Set(['EBUSY', 'ENOTEMPTY', 'EPERM']);
+
+async function removeTemporaryDirectory(directory) {
+  let lastError;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      await fs.promises.rm(directory, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      if (!transientCleanupCodes.has(error?.code)) throw error;
+      lastError = error;
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(100 * (attempt + 1), 500))
+      );
+    }
+  }
+
+  if (process.platform !== 'win32') throw lastError;
+  process.stderr.write(
+    `Temporary smoke-test cleanup deferred after Windows kept the directory locked (${lastError?.code ?? 'unknown'}).\n`
+  );
+}
 
 assert.ok(fs.existsSync(serverPath), `Missing built MCP server: ${serverPath}`);
 
@@ -363,10 +386,5 @@ try {
   );
 } finally {
   await client.close();
-  fs.rmSync(temporaryHome, {
-    recursive: true,
-    force: true,
-    maxRetries: 20,
-    retryDelay: 100,
-  });
+  await removeTemporaryDirectory(temporaryHome);
 }

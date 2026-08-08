@@ -88,6 +88,9 @@ jobs:
       - name: Verify RunBeacon resident daemon reattachment
         run: npm run test:lifecycle:daemon
 
+      - name: Verify GitHub publish result separation
+        run: npm run test:github-publish
+
       - name: Verify MCP handshake and credential redaction
         run: npm run test:mcp
 

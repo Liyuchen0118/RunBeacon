@@ -28,6 +28,10 @@ interface LifecycleManagerOptions {
   persistenceDebounceMs?: number;
   maxRetainedJobs?: number;
   cancellationGraceMs?: number;
+  sshClientFactory?: () => Client;
+  sshHandshakeAttempts?: number;
+  sshRetryBaseDelayMs?: number;
+  sshReadyTimeoutMs?: number;
 }
 
 interface ExecutionResult {
@@ -63,6 +67,19 @@ const MAX_PROGRESS_PATTERN_LENGTH = 256;
 const MAX_PROGRESS_LINE_LENGTH = 16 * 1024;
 const MAX_WAITERS_PER_JOB = 8;
 const MAX_WAITERS_GLOBAL = 128;
+const DEFAULT_SSH_HANDSHAKE_ATTEMPTS = 5;
+const DEFAULT_SSH_RETRY_BASE_DELAY_MS = 250;
+const DEFAULT_SSH_READY_TIMEOUT_MS = 12_000;
+
+function boundedInteger(
+  value: number | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number
+): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(minimum, Math.min(maximum, Math.trunc(value!)));
+}
 
 export class LifecycleManager extends EventEmitter {
   private readonly jobs = new Map<string, JobRecord>();
@@ -77,6 +94,10 @@ export class LifecycleManager extends EventEmitter {
   private readonly persistenceDebounceMs: number;
   private readonly maxRetainedJobs: number;
   private readonly cancellationGraceMs: number;
+  private readonly sshClientFactory: () => Client;
+  private readonly sshHandshakeAttempts: number;
+  private readonly sshRetryBaseDelayMs: number;
+  private readonly sshReadyTimeoutMs: number;
   private readonly progressRemainders = new Map<string, string>();
   private readonly progressPatterns = new Map<string, RE2JS>();
   private readonly waitCoordinators = new Map<string, WaitCoordinator>();
@@ -105,6 +126,25 @@ export class LifecycleManager extends EventEmitter {
     this.cancellationGraceMs = Math.max(
       250,
       options.cancellationGraceMs ?? 5_000
+    );
+    this.sshClientFactory = options.sshClientFactory ?? (() => new Client());
+    this.sshHandshakeAttempts = boundedInteger(
+      options.sshHandshakeAttempts,
+      DEFAULT_SSH_HANDSHAKE_ATTEMPTS,
+      1,
+      5
+    );
+    this.sshRetryBaseDelayMs = boundedInteger(
+      options.sshRetryBaseDelayMs,
+      DEFAULT_SSH_RETRY_BASE_DELAY_MS,
+      0,
+      30_000
+    );
+    this.sshReadyTimeoutMs = boundedInteger(
+      options.sshReadyTimeoutMs,
+      DEFAULT_SSH_READY_TIMEOUT_MS,
+      1_000,
+      30_000
     );
     this.store = new JobStore(
       options.statePath,
@@ -135,6 +175,12 @@ export class LifecycleManager extends EventEmitter {
     if (!input.command?.trim()) throw new Error('command is required');
     if (input.timeoutMs !== undefined && input.timeoutMs <= 0) {
       throw new Error('timeoutMs must be greater than zero');
+    }
+    if (input.timing?.requestTraceId) {
+      const existing = Array.from(this.jobs.values()).find(
+        (job) => job.timing?.requestTraceId === input.timing?.requestTraceId
+      );
+      if (existing) return this.snapshot(existing.id);
     }
     if (input.idempotencyKey !== undefined) {
       const key = input.idempotencyKey.trim();
@@ -172,6 +218,7 @@ export class LifecycleManager extends EventEmitter {
       outputLines: 0,
       outputTruncated: false,
       metadata: input.metadata,
+      timing: input.timing,
     };
 
     this.jobs.set(id, record);
@@ -278,6 +325,13 @@ export class LifecycleManager extends EventEmitter {
       waiters: this.totalWaiters,
       jobs: this.waitCoordinators.size,
       timers,
+    };
+  }
+
+  runtimeStatus() {
+    return {
+      activeJobs: this.activeJobs.size,
+      queuedJobs: this.queue.length,
     };
   }
 
@@ -442,6 +496,10 @@ export class LifecycleManager extends EventEmitter {
       }
 
       job.pid = child.pid;
+      job.timing = {
+        ...job.timing,
+        commandStartedAt: new Date().toISOString(),
+      };
       this.changed(job);
       child.stdout?.on('data', (data) =>
         this.append(job, 'stdout', stdoutDecoder.write(data), input)
@@ -483,14 +541,18 @@ export class LifecycleManager extends EventEmitter {
       let settled = false;
       let timedOut = false;
       let channel: ClientChannel | undefined;
-      const client = new Client();
+      let client: Client | undefined;
+      let retryTimer: NodeJS.Timeout | undefined;
+      let attempt = 0;
       const stdoutDecoder = new StringDecoder('utf8');
       const stderrDecoder = new StringDecoder('utf8');
       const settle = (result?: ExecutionResult, error?: unknown) => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
-        client.end();
+        if (retryTimer) clearTimeout(retryTimer);
+        retryTimer = undefined;
+        client?.end();
         if (error) reject(error);
         else resolve(result!);
       };
@@ -502,9 +564,15 @@ export class LifecycleManager extends EventEmitter {
         password: target.password,
         passphrase: target.passphrase,
         agent: target.agent,
-        readyTimeout: Math.min(input.timeoutMs ?? 30_000, 30_000),
-        keepaliveInterval: 15_000,
-        keepaliveCountMax: 4,
+        readyTimeout: Math.max(
+          1,
+          Math.min(
+            input.timeoutMs ?? this.sshReadyTimeoutMs,
+            this.sshReadyTimeoutMs
+          )
+        ),
+        keepaliveInterval: 10_000,
+        keepaliveCountMax: 6,
       };
       if (target.privateKeyPath) {
         config.privateKey = readFileSync(target.privateKeyPath);
@@ -517,55 +585,108 @@ export class LifecycleManager extends EventEmitter {
         config.hostVerifier = () => Boolean(target.allowUnverifiedHostKey);
       }
 
-      client.once('ready', () => {
-        client.exec(input.command, (error, stream) => {
-          if (error) {
+      const connect = () => {
+        if (settled) return;
+        attempt += 1;
+        const currentClient = this.sshClientFactory();
+        client = currentClient;
+        let ready = false;
+        let failureHandled = false;
+
+        const failAttempt = (error: Error) => {
+          if (settled || failureHandled || currentClient !== client) return;
+          failureHandled = true;
+          currentClient.end();
+
+          // Once SSH is ready, an exec request may have reached the server. Never
+          // retry at that point because doing so could duplicate training/deploys.
+          if (ready || attempt >= this.sshHandshakeAttempts || timedOut) {
             settle(undefined, error);
             return;
           }
-          channel = stream;
-          stream.on('data', (data: Buffer) =>
-            this.append(job, 'stdout', stdoutDecoder.write(data), input)
+
+          const delayMs = this.sshRetryBaseDelayMs * 2 ** (attempt - 1);
+          this.append(
+            job,
+            'system',
+            `SSH handshake attempt ${attempt}/${this.sshHandshakeAttempts} failed; retrying in ${delayMs} ms.\n`,
+            input
           );
-          stream.stderr.on('data', (data: Buffer) =>
-            this.append(job, 'stderr', stderrDecoder.write(data), input)
-          );
-          stream.once('error', (streamError: Error) =>
-            settle(undefined, streamError)
-          );
-          stream.once('close', (code: number | null, signal?: string) => {
-            this.append(job, 'stdout', stdoutDecoder.end(), input);
-            this.append(job, 'stderr', stderrDecoder.end(), input);
-            settle({ exitCode: code, signal, timedOut });
+          retryTimer = setTimeout(() => {
+            retryTimer = undefined;
+            connect();
+          }, delayMs);
+          retryTimer.unref?.();
+        };
+
+        currentClient.once('ready', () => {
+          if (settled || currentClient !== client) return;
+          ready = true;
+          const readyAt = new Date().toISOString();
+          job.timing = {
+            ...job.timing,
+            sshReadyAt: readyAt,
+            commandStartedAt: readyAt,
+          };
+          this.changed(job);
+          currentClient.exec(input.command, (error, stream) => {
+            if (settled || currentClient !== client) {
+              stream?.close();
+              return;
+            }
+            if (error) {
+              failAttempt(error);
+              return;
+            }
+            channel = stream;
+            stream.on('data', (data: Buffer) =>
+              this.append(job, 'stdout', stdoutDecoder.write(data), input)
+            );
+            stream.stderr.on('data', (data: Buffer) =>
+              this.append(job, 'stderr', stderrDecoder.write(data), input)
+            );
+            stream.once('error', (streamError: Error) =>
+              settle(undefined, streamError)
+            );
+            stream.once('close', (code: number | null, signal?: string) => {
+              this.append(job, 'stdout', stdoutDecoder.end(), input);
+              this.append(job, 'stderr', stderrDecoder.end(), input);
+              settle({ exitCode: code, signal, timedOut });
+            });
           });
         });
-      });
-      client.once('error', (error) => settle(undefined, error));
-      client.once('close', () => {
-        if (!settled) {
-          settle(
-            undefined,
-            new Error('SSH connection closed before job completion')
-          );
-        }
-      });
+        currentClient.once('error', (error) => failAttempt(error));
+        currentClient.once('close', () =>
+          failAttempt(
+            new Error(
+              ready
+                ? 'SSH connection closed before job completion'
+                : 'SSH connection closed before handshake'
+            )
+          )
+        );
+        currentClient.connect(config);
+      };
 
       this.runtimeHandles.set(job.id, {
         cancellationVerified: false,
         cancel: () => {
+          if (retryTimer) clearTimeout(retryTimer);
+          retryTimer = undefined;
           channel?.close();
-          client.end();
+          client?.end();
+          settle({ exitCode: null, signal: 'cancelled' });
         },
       });
 
       const timeout = setTimeout(() => {
         timedOut = true;
         channel?.close();
-        client.end();
+        client?.end();
         settle({ exitCode: null, signal: 'timeout', timedOut: true });
       }, input.timeoutMs ?? DEFAULT_TIMEOUT_MS);
       timeout.unref?.();
-      client.connect(config);
+      connect();
     });
   }
 
@@ -587,7 +708,12 @@ export class LifecycleManager extends EventEmitter {
     job.output.push(chunk);
     job.outputBytes += Buffer.byteLength(chunk.data);
     job.outputLines += Math.max(1, chunk.data.split(/\r\n|\r|\n/).length - 1);
-    if (stream !== 'system') job.lastOutputAt = chunk.timestamp;
+    if (stream !== 'system') {
+      job.lastOutputAt = chunk.timestamp;
+      if (!job.timing?.firstOutputAt) {
+        job.timing = { ...job.timing, firstOutputAt: chunk.timestamp };
+      }
+    }
 
     this.trimOutputBuffer(job);
 

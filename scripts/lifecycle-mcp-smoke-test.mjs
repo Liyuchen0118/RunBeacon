@@ -8,10 +8,39 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const serverPath = path.join(root, 'dist', 'mcp', 'lifecycle-server.js');
+const serverPath = process.env.RUNBEACON_SERVER_PATH
+  ? path.resolve(process.env.RUNBEACON_SERVER_PATH)
+  : path.join(root, 'dist', 'mcp', 'lifecycle-server.js');
 const temporaryData = fs.mkdtempSync(
   path.join(os.tmpdir(), 'remote-job-monitor-mcp-')
 );
+const credentialHelperPath = path.join(temporaryData, 'credential-helper.cjs');
+const credentialHelperState = path.join(
+  temporaryData,
+  'credential-helper-state.json'
+);
+fs.writeFileSync(
+  credentialHelperPath,
+  [
+    "'use strict';",
+    "const fs = require('node:fs');",
+    'const [statePath, action] = process.argv.slice(2);',
+    "let input = '';",
+    "const parse = text => Object.fromEntries(text.split(/\\r?\\n/).filter(Boolean).map(line => { const at = line.indexOf('='); return [line.slice(0, at), line.slice(at + 1)]; }));",
+    "const load = () => fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : {};",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', chunk => { input += chunk; });",
+    "process.stdin.on('end', () => {",
+    '  const query = parse(input);',
+    "  const key = [query.protocol || '', query.host || '', query.username || ''].join('|');",
+    '  const entries = load();',
+    "  if (action === 'store') { entries[key] = input; fs.writeFileSync(statePath, JSON.stringify(entries)); }",
+    "  if (action === 'get' && entries[key]) process.stdout.write(entries[key]);",
+    "  if (action === 'erase') { delete entries[key]; fs.writeFileSync(statePath, JSON.stringify(entries)); }",
+    '});',
+  ].join('\n')
+);
+const credentialHelperCommand = `!node ${credentialHelperPath.replaceAll('\\', '/')} ${credentialHelperState.replaceAll('\\', '/')}`;
 
 assert.ok(fs.existsSync(serverPath), `Missing built server: ${serverPath}`);
 
@@ -28,6 +57,11 @@ const transport = new StdioClientTransport({
     MCP_SERVER_MODE: 'true',
     PLUGIN_DATA: temporaryData,
     RJM_INLINE_MANAGER: 'true',
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'credential.helper',
+    GIT_CONFIG_VALUE_0: '',
+    GIT_CONFIG_KEY_1: 'credential.helper',
+    GIT_CONFIG_VALUE_1: credentialHelperCommand,
   },
 });
 
@@ -51,17 +85,41 @@ try {
     'credential_profile_delete',
     'credential_profile_set_default',
     'credential_profile_clear_default',
+    'ssh_password_save',
+    'ssh_password_delete',
     'github_token_save',
     'github_token_delete',
   ]) {
     assert.ok(toolNames.has(name), `Missing tool: ${name}`);
   }
 
+  const jobStartTool = tools.find((tool) => tool.name === 'job_start');
+  assert.equal(
+    jobStartTool?._meta?.ui?.resourceUri,
+    'ui://remote-job-monitor/dashboard.html'
+  );
+  assert.equal(
+    jobStartTool?._meta?.['openai/outputTemplate'],
+    'ui://remote-job-monitor/dashboard.html'
+  );
+  assert.match(jobStartTool?.description ?? '', /without listing profiles/);
+  assert.match(
+    jobStartTool?.description ?? '',
+    /Pass remote shell commands verbatim/
+  );
+  const jobWaitTool = tools.find((tool) => tool.name === 'job_wait');
+  assert.match(
+    jobWaitTool?.description ?? '',
+    /immediately as the next tool call/
+  );
+
   const script = [
     "console.log('25% boot')",
     "setTimeout(() => console.log('75% work'), 40)",
     "setTimeout(() => { console.log('100% complete'); process.exit(0) }, 90)",
   ].join(';');
+  const requestTraceId = 'deef1e83-7276-48bd-b528-e30b52884acc';
+  const requestReceivedAt = new Date(Date.now() - 1_000).toISOString();
   const started = await client.callTool({
     name: 'job_start',
     arguments: {
@@ -69,11 +127,30 @@ try {
       args: ['-e', script],
       shell: false,
       label: 'mcp-smoke',
+      requestTraceId,
+      requestReceivedAt,
     },
   });
   assert.notEqual(started.isError, true);
   const jobId = started.structuredContent?.job?.id;
   assert.equal(typeof jobId, 'string');
+  assert.equal(started.structuredContent?.dashboardJobId, jobId);
+  assert.equal(
+    started.structuredContent?.job?.timing?.requestTraceId,
+    requestTraceId
+  );
+
+  const duplicate = await client.callTool({
+    name: 'job_start',
+    arguments: {
+      command: process.execPath,
+      args: ['-e', "throw new Error('DUPLICATE_MUST_NOT_RUN')"],
+      shell: false,
+      requestTraceId,
+      requestReceivedAt,
+    },
+  });
+  assert.equal(duplicate.structuredContent?.job?.id, jobId);
 
   const completed = await client.callTool({
     name: 'job_wait',
@@ -83,6 +160,14 @@ try {
   assert.equal(completed.structuredContent?.timedOut, false);
   assert.equal(completed.structuredContent?.job?.state, 'succeeded');
   assert.equal(completed.structuredContent?.job?.progress?.percentage, 100);
+  assert.equal(
+    completed.structuredContent?.job?.timing?.requestTraceId,
+    requestTraceId
+  );
+  assert.equal(
+    typeof completed.structuredContent?.job?.timing?.firstOutputAt,
+    'string'
+  );
 
   const rejectedProfile = await client.callTool({
     name: 'credential_profile_save',
@@ -108,6 +193,29 @@ try {
   });
   assert.equal(rejectedTokenImport.isError, true);
 
+  const sshPasswordCanary = 'SSH_PASSWORD_MUST_NOT_LEAVE_OS_STORE_5926';
+  const savedPasswordProfile = await client.callTool({
+    name: 'ssh_password_save',
+    arguments: {
+      id: 'ssh-password-smoke',
+      host: '127.0.0.1',
+      port: 1,
+      username: 'test',
+      password: sshPasswordCanary,
+      allowUnverifiedHostKey: true,
+      makeDefault: true,
+    },
+  });
+  assert.notEqual(savedPasswordProfile.isError, true);
+  assert.equal(
+    savedPasswordProfile.structuredContent?.profile?.credentialKind,
+    'password'
+  );
+  assert.doesNotMatch(
+    JSON.stringify(savedPasswordProfile),
+    new RegExp(sshPasswordCanary)
+  );
+
   for (const profile of [
     {
       id: 'github-main',
@@ -117,9 +225,9 @@ try {
       username: 'runbeacon-smoke',
     },
     {
-      id: 'ssh-smoke',
+      id: 'ssh-key-smoke',
       kind: 'ssh',
-      host: '127.0.0.1',
+      host: '127.0.0.2',
       port: 1,
       username: 'test',
       privateKeyPath: path.join(temporaryData, 'missing-test-key'),
@@ -132,7 +240,7 @@ try {
     });
     assert.notEqual(saved.isError, true);
   }
-  for (const id of ['github-main', 'ssh-smoke']) {
+  for (const id of ['github-main']) {
     const selected = await client.callTool({
       name: 'credential_profile_set_default',
       arguments: { id },
@@ -143,11 +251,12 @@ try {
     name: 'credential_profile_list',
     arguments: {},
   });
-  assert.equal(profiles.structuredContent?.profiles?.length, 2);
+  assert.equal(profiles.structuredContent?.profiles?.length, 3);
   assert.deepEqual(profiles.structuredContent?.defaults, {
     github: 'github-main',
-    ssh: 'ssh-smoke',
+    ssh: 'ssh-password-smoke',
   });
+  assert.doesNotMatch(JSON.stringify(profiles), new RegExp(sshPasswordCanary));
 
   const profileJob = await client.callTool({
     name: 'job_start',
@@ -161,7 +270,11 @@ try {
   assert.equal(profileJob.structuredContent?.job?.target?.kind, 'ssh');
   assert.equal(
     profileJob.structuredContent?.job?.metadata?.credentialProfile,
-    'ssh-smoke'
+    'ssh-password-smoke'
+  );
+  assert.doesNotMatch(
+    JSON.stringify(profileJob),
+    new RegExp(sshPasswordCanary)
   );
   const profileJobResult = await client.callTool({
     name: 'job_wait',
@@ -170,7 +283,72 @@ try {
       timeoutMs: 5_000,
     },
   });
-  assert.equal(profileJobResult.structuredContent?.job?.state, 'failed');
+  assert.match(
+    profileJobResult.structuredContent?.job?.state ?? '',
+    /^(failed|timed_out)$/
+  );
+  assert.doesNotMatch(
+    JSON.stringify(profileJobResult),
+    new RegExp(sshPasswordCanary)
+  );
+
+  const matchedPasswordJob = await client.callTool({
+    name: 'job_start',
+    arguments: {
+      command: 'echo matched-password-profile',
+      target: {
+        kind: 'ssh',
+        host: '127.0.0.1',
+        port: 1,
+        username: 'test',
+      },
+      timeoutMs: 1_000,
+    },
+  });
+  assert.notEqual(matchedPasswordJob.isError, true);
+  assert.equal(
+    matchedPasswordJob.structuredContent?.job?.metadata?.credentialProfile,
+    'ssh-password-smoke'
+  );
+  const matchedPasswordResult = await client.callTool({
+    name: 'job_wait',
+    arguments: {
+      jobId: matchedPasswordJob.structuredContent?.job?.id,
+      timeoutMs: 5_000,
+    },
+  });
+  assert.match(
+    matchedPasswordResult.structuredContent?.job?.state ?? '',
+    /^(failed|timed_out)$/
+  );
+
+  const dashboardWithoutActiveJob = await client.callTool({
+    name: 'job_dashboard',
+    arguments: {},
+  });
+  assert.equal(dashboardWithoutActiveJob.structuredContent?.job, null);
+  assert.equal(
+    dashboardWithoutActiveJob.structuredContent?.dashboardJobId,
+    null
+  );
+
+  const dashboardWithPasswordJob = await client.callTool({
+    name: 'job_dashboard',
+    arguments: { jobId: matchedPasswordJob.structuredContent?.job?.id },
+  });
+  assert.equal(
+    dashboardWithPasswordJob.structuredContent?.dashboardJobId,
+    matchedPasswordJob.structuredContent?.job?.id
+  );
+  assert.equal(
+    dashboardWithPasswordJob.structuredContent?.job?.id,
+    matchedPasswordJob.structuredContent?.job?.id
+  );
+  assert.equal(dashboardWithPasswordJob.structuredContent?.jobs, undefined);
+  assert.doesNotMatch(
+    JSON.stringify(dashboardWithPasswordJob),
+    new RegExp(sshPasswordCanary)
+  );
 
   const repository = path.join(temporaryData, 'publish-worktree');
   const remote = path.join(temporaryData, 'publish-remote.git');
@@ -201,6 +379,7 @@ try {
   assert.notEqual(publishing.isError, true);
   const publishJobId = publishing.structuredContent?.job?.id;
   assert.equal(typeof publishJobId, 'string');
+  assert.equal(publishing.structuredContent?.dashboardJobId, publishJobId);
   assert.equal(
     publishing.structuredContent?.job?.metadata?.kind,
     'github_publish'
@@ -208,6 +387,27 @@ try {
   assert.equal(
     publishing.structuredContent?.job?.metadata?.credentialProfile,
     'github-main'
+  );
+  assert.equal(
+    publishing.structuredContent?.job?.metadata?.requireActions,
+    false
+  );
+
+  const publishingReattached = await client.callTool({
+    name: 'github_publish_start',
+    arguments: {
+      cwd: repository,
+      commitMessage: 'test: dashboard publish',
+      watchActions: false,
+      githubToken: 'GITHUB_TOKEN_MUST_NOT_PERSIST_4862',
+      credentialProfile: 'github-main',
+      idempotencyKey: 'lifecycle-mcp-smoke-publish',
+    },
+  });
+  assert.equal(
+    publishingReattached.structuredContent?.job?.id,
+    publishJobId,
+    'reattachment must not create a second commit or push job'
   );
 
   const published = await client.callTool({
@@ -265,6 +465,11 @@ try {
   const html = resource.contents[0]?.text ?? '';
   assert.match(html, /ui\/initialize/);
   assert.match(html, /tools\/call/);
+  assert.match(html, /callTool\('job_snapshot'/);
+  assert.doesNotMatch(html, /callTool\('job_list'/);
+  assert.match(html, /focusedJobId/);
+  assert.match(html, /document\.hidden/);
+  assert.doesNotMatch(html, /setInterval\(refresh/);
 
   const stateFile = path.join(temporaryData, 'jobs.json');
   assert.ok(fs.existsSync(stateFile));
@@ -272,6 +477,10 @@ try {
   assert.doesNotMatch(
     fs.readFileSync(stateFile, 'utf8'),
     /GITHUB_TOKEN_MUST_NOT_PERSIST_4862/
+  );
+  assert.doesNotMatch(
+    fs.readFileSync(stateFile, 'utf8'),
+    new RegExp(sshPasswordCanary)
   );
   const credentialStateFile = path.join(
     temporaryData,
@@ -281,6 +490,24 @@ try {
   assert.doesNotMatch(
     fs.readFileSync(credentialStateFile, 'utf8'),
     /PROFILE_SECRET_MUST_NOT_PERSIST_7416/
+  );
+  assert.doesNotMatch(
+    fs.readFileSync(credentialStateFile, 'utf8'),
+    new RegExp(sshPasswordCanary)
+  );
+
+  const deletedPasswordProfile = await client.callTool({
+    name: 'ssh_password_delete',
+    arguments: { id: 'ssh-password-smoke' },
+  });
+  assert.notEqual(deletedPasswordProfile.isError, true);
+  assert.equal(
+    deletedPasswordProfile.structuredContent?.credentialDeleted,
+    true
+  );
+  assert.doesNotMatch(
+    fs.readFileSync(credentialHelperState, 'utf8'),
+    new RegExp(sshPasswordCanary)
   );
 
   process.stdout.write(

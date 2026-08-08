@@ -6,11 +6,24 @@ import { fileURLToPath } from 'node:url';
 import { DaemonClient } from '../dist/lifecycle/DaemonClient.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const daemonEntry = path.join(root, 'dist', 'daemon', 'lifecycle-daemon.js');
 const temporaryData = fs.mkdtempSync(
   path.join(os.tmpdir(), 'remote-job-monitor-daemon-')
 );
-const firstClient = new DaemonClient(temporaryData, daemonEntry);
+const originalBuildVersion = '1.0.0+codex.20260805000001';
+const upgradedBuildVersion = '1.0.0+codex.20260805000002';
+const daemonEntry = path.join(
+  root,
+  'dist',
+  'daemon',
+  `lifecycle-daemon.smoke-${process.pid}.js`
+);
+fs.copyFileSync(
+  path.join(root, 'dist', 'daemon', 'lifecycle-daemon.js'),
+  daemonEntry
+);
+const firstClient = new DaemonClient(temporaryData, daemonEntry, {
+  buildVersion: originalBuildVersion,
+});
 let daemonReady = false;
 
 try {
@@ -27,7 +40,9 @@ try {
   });
 
   // A fresh client simulates a restarted MCP shim attaching to the resident daemon.
-  const secondClient = new DaemonClient(temporaryData, daemonEntry);
+  const secondClient = new DaemonClient(temporaryData, daemonEntry, {
+    buildVersion: originalBuildVersion,
+  });
   await secondClient.ensureReady();
   const visible = await secondClient.list(5);
   assert.ok(visible.some((job) => job.id === started.id));
@@ -44,6 +59,12 @@ try {
     label: 'abort-propagation-smoke',
     idempotencyKey: 'daemon-smoke-abort-propagation',
   });
+  const originalStatus = await secondClient.status();
+  fs.appendFileSync(daemonEntry, '\n// daemon-build-upgrade-smoke\n');
+  const upgradedClient = new DaemonClient(temporaryData, daemonEntry, {
+    buildVersion: upgradedBuildVersion,
+  });
+  await assert.rejects(upgradedClient.ensureReady(), /job\(s\) are active/);
   const controller = new AbortController();
   const abandonedWait = secondClient.waitForTerminal(
     cancellable.id,
@@ -61,12 +82,28 @@ try {
   );
   assert.equal(cancelled.job.state, 'cancelled');
 
+  await upgradedClient.ensureReady();
+  const upgradedStatus = await upgradedClient.status();
+  assert.notEqual(upgradedStatus.pid, originalStatus.pid);
+  assert.notEqual(upgradedStatus.buildId, originalStatus.buildId);
+  assert.equal(upgradedStatus.buildVersion, upgradedBuildVersion);
+
+  await assert.rejects(
+    firstClient.ensureReady(),
+    /newer RunBeacon daemon build/
+  );
+  const downgradeProtectedStatus = await upgradedClient.status();
+  assert.equal(downgradeProtectedStatus.pid, upgradedStatus.pid);
+  assert.equal(downgradeProtectedStatus.buildId, upgradedStatus.buildId);
+
   process.stdout.write(
     `${JSON.stringify({
       residentDaemon: 'passed',
       secondClientReattach: 'passed',
       eventWait: 'passed',
       abortPropagation: 'passed',
+      daemonBuildUpgrade: 'passed',
+      daemonDowngradeProtection: 'passed',
     })}\n`
   );
 } finally {
@@ -84,4 +121,5 @@ try {
     maxRetries: 20,
     retryDelay: 100,
   });
+  fs.rmSync(daemonEntry, { force: true });
 }
