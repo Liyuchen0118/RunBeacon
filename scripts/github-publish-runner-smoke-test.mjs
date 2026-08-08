@@ -47,6 +47,10 @@ try {
     bestEffort.stdout + bestEffort.stderr,
     new RegExp(canary)
   );
+  assert.doesNotMatch(
+    bestEffort.stdout + bestEffort.stderr,
+    /experimental|UNDICI-EHPA/i
+  );
 
   const required = runner(true);
   assert.notEqual(required.status, 0);

@@ -1,8 +1,4 @@
-import {
-  EnvHttpProxyAgent,
-  fetch as undiciFetch,
-  type Dispatcher,
-} from 'undici';
+import { ProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
 
 export type GitHubApiErrorCode =
   | 'github_api_transport'
@@ -196,11 +192,7 @@ export function createGitHubDispatcher(
   proxy: ResolvedGitHubProxy
 ): Dispatcher | undefined {
   if (!proxy.url) return undefined;
-  return new EnvHttpProxyAgent({
-    httpProxy: proxy.url,
-    httpsProxy: proxy.url,
-    noProxy: proxy.noProxy,
-  });
+  return new ProxyAgent(proxy.url);
 }
 
 export function matchesNoProxy(hostname: string, value: string): boolean {
