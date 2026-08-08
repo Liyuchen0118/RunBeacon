@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { open, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { minimatch } from 'minimatch';
 import { parse } from 'yaml';
@@ -121,14 +121,23 @@ async function readWorkflowEvents(cwd: string): Promise<WorkflowEvents[]> {
     names.map(async (name): Promise<WorkflowEvents> => {
       const path = join(workflowDirectory, name);
       try {
-        const details = await stat(path);
-        if (!details.isFile() || details.size > 1024 * 1024) {
-          return { uncertain: true };
+        const handle = await open(path, 'r');
+        try {
+          const details = await handle.stat();
+          if (!details.isFile() || details.size > 1024 * 1024) {
+            return { uncertain: true };
+          }
+          const source = await handle.readFile({ encoding: 'utf8' });
+          if (Buffer.byteLength(source, 'utf8') > 1024 * 1024) {
+            return { uncertain: true };
+          }
+          const document = parse(source, {
+            maxAliasCount: 50,
+          }) as Record<string, unknown> | null;
+          return normalizeEvents(document?.on);
+        } finally {
+          await handle.close();
         }
-        const document = parse(await readFile(path, 'utf8'), {
-          maxAliasCount: 50,
-        }) as Record<string, unknown> | null;
-        return normalizeEvents(document?.on);
       } catch {
         return { uncertain: true };
       }

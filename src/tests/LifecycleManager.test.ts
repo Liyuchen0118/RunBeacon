@@ -732,7 +732,14 @@ describe('lifecycle safety and UI helpers', () => {
 
   test('dashboard uses the MCP Apps bridge and direct tool calls', () => {
     const html = createDashboardHtml();
-    const script = /<script>([\s\S]*)<\/script>/.exec(html)?.[1];
+    const scriptStartMarker = '<script>';
+    const scriptEndMarker = '</script>';
+    const scriptStart = html.indexOf(scriptStartMarker);
+    const scriptEnd = html.lastIndexOf(scriptEndMarker);
+    const script =
+      scriptStart >= 0 && scriptEnd > scriptStart
+        ? html.slice(scriptStart + scriptStartMarker.length, scriptEnd)
+        : undefined;
     expect(script).toBeDefined();
     expect(() => new Script(script)).not.toThrow();
     expect(html).toContain("request('ui/initialize'");

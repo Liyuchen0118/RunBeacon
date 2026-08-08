@@ -3,8 +3,11 @@
 const { createHash, randomUUID } = require('node:crypto');
 const {
   chmodSync,
+  closeSync,
   existsSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -52,14 +55,20 @@ function rememberPendingTrace(event, now = new Date()) {
 
 function readPendingTrace(event, now = new Date()) {
   const location = traceLocation(event);
-  if (!location || !existsSync(location.filePath)) return undefined;
+  if (!location) return undefined;
   try {
-    const stats = statSync(location.filePath);
-    if (stats.size <= 0 || stats.size > MAX_STATE_BYTES) {
-      rmSync(location.filePath, { force: true });
-      return undefined;
+    let serialized;
+    const descriptor = openSync(location.filePath, 'r');
+    try {
+      const stats = fstatSync(descriptor);
+      if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_STATE_BYTES) {
+        throw new Error('Invalid pending trace file');
+      }
+      serialized = readFileSync(descriptor, 'utf8');
+    } finally {
+      closeSync(descriptor);
     }
-    const trace = JSON.parse(readFileSync(location.filePath, 'utf8'));
+    const trace = JSON.parse(serialized);
     const createdAt = Date.parse(trace.createdAt);
     const requestReceivedAt = Date.parse(trace.requestReceivedAt);
     const ageMs = now.getTime() - createdAt;
