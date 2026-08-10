@@ -7,7 +7,10 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
 )
 
 func startSupervisor(executable, jobDir string, spec SupervisorSpec) (int, error) {
@@ -63,6 +66,43 @@ func processGroupExists(processGroupID int) bool {
 	}
 	err := syscall.Kill(-processGroupID, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func processGroupTerminationVerified(processGroupID int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !processGroupHasRunningMembers(processGroupID) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func processGroupHasRunningMembers(processGroupID int) bool {
+	if !processGroupExists(processGroupID) {
+		return false
+	}
+	output, err := exec.Command("ps", "-axo", "pgid=,stat=").Output()
+	if err != nil {
+		return true
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pgid, parseErr := strconv.Atoi(fields[0])
+		if parseErr != nil || pgid != processGroupID {
+			continue
+		}
+		if !strings.HasPrefix(fields[1], "Z") {
+			return true
+		}
+	}
+	return false
 }
 
 func processExists(pid int) bool {

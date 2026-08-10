@@ -147,10 +147,10 @@ func Supervise(jobDir string, spec SupervisorSpec) error {
 	message := ""
 	if timeoutRequested(jobDir) {
 		state = StateTimedOut
-		verified = !processGroupExists(command.Process.Pid)
+		verified = processGroupTerminationVerified(command.Process.Pid, 2*time.Second)
 	} else if cancellationRequested(jobDir) {
 		state = StateCancelled
-		verified = !processGroupExists(command.Process.Pid)
+		verified = processGroupTerminationVerified(command.Process.Pid, 2*time.Second)
 	} else if waitErr == nil && exitCode == 0 {
 		state = StateSucceeded
 	} else if waitErr != nil {
