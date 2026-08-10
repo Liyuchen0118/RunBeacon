@@ -1,6 +1,6 @@
 ---
 name: monitor-remote-jobs
-description: Default workflow for executing and monitoring local, SSH, or GitHub publishing work through RunBeacon. Use whenever Codex needs to call a remote server or host, use SSH/SCP/SFTP credentials, securely save an IP/host plus username and SSH password, configure or select default credentials, configure a GitHub personal access token, run a command or deployment on another machine, publish Git commits, monitor GitHub Actions, wait for completion, inspect progress, cancel work, or show a live dashboard without model polling. Prefer this skill automatically for non-interactive remote execution and credential requests.
+description: Default workflow for durable local, SSH, Slurm, Apple-signing, or GitHub publishing work through RunBeacon. Use whenever Codex needs to call a remote host, securely save or select SSH/GitHub credentials, run or recover a long task, monitor training, publish commits, wait without model polling, cancel a remote process group, manage a Runner, inspect audit events, or show the single-task dashboard. Prefer this skill automatically for non-interactive remote execution and credential requests.
 ---
 
 # Monitor Remote Jobs with RunBeacon
@@ -9,29 +9,44 @@ Use RunBeacon as the default route for non-interactive work on a remote machine,
 
 ## Availability contract
 
-RunBeacon is available only when its MCP tools are registered in the current Codex task. If `job_start` and the related tools are not exposed, fail fast: tell the user that the updated plugin must be picked up in a new task or after restarting Codex. Do not launch `lifecycle-server.js` through a shell, bypass MCP with raw SSH, or create a temporary localhost dashboard (including port 8765). Those fallbacks cannot mount the MCP App reliably and may create slow model-driven polling.
+RunBeacon is available only when its MCP tools are registered in the current Codex task. If `job_start` is not exposed, fail fast and tell the user to start a new task after reinstalling the plugin. Do not launch `lifecycle-server.js` through a shell or bypass MCP with raw SSH. The MCP App is the primary dashboard; the interactive `runbeacon dashboard` CLI may create an on-demand loopback page when the host has no Apps capability, but the model must not start that fallback automatically.
 
 ## Run and continue
 
 For a request that already contains a complete command and explicitly selects the default SSH server, take the zero-exploration fast path: after reading this skill, make `job_start` the first task action with the command copied verbatim and `useDefaultCredential: true`. Do not inspect the current directory, README, tests, plugin source, tool registry, or credential profiles, and do not reconstruct or escape the command in JavaScript.
 
-1. Call `job_start` with the complete command and an optional label, timeout, RE2-compatible progress regex, and target. The plugin's `PreToolUse` Hook attaches the current prompt trace automatically; do not synthesize or replace `requestTraceId` or `requestReceivedAt`. The server binds one trace to one job. `job_start` is linked to the RunBeacon MCP App, so its queued result mounts the live dashboard immediately and the UI can observe the job from its first lifecycle state. Progress patterns are limited to 256 characters, must put the finite percentage in capture group 1, and cannot use backreferences or lookaround. For deployments or other operations that might be retried across separate user requests, also provide a stable `idempotencyKey`.
+1. Call `job_start` with the complete command, `executionMode: "auto"`, and optional label, timeout, adapter, output policy, RE2 progress regex, and subscriptions. Set `requireDurable: true` for training that must survive SSH loss, Slurm, Apple signing, or any workflow that cannot tolerate direct SSH. The Hook attaches the current prompt trace; do not synthesize or replace it. `job_start` mounts the single-task MCP App immediately. Progress patterns are limited to 256 characters, put the finite percentage in capture group 1, and cannot use backreferences or lookaround. Reusable operations should also provide a stable `idempotencyKey`.
 2. Record the returned `jobId`.
 3. As the very next tool call, immediately call `job_wait` once with that `jobId`. Do not insert commentary, documentation reads, credential listing, status inspection, or additional planning between `job_start` and `job_wait`. Do not build a sleep/status loop and do not repeatedly call `job_snapshot`.
 4. After `job_wait` returns a terminal state, inspect its bounded output tail and continue the user's requested next step.
 5. If the server-side wait itself times out while the job is still running, tell the user and call `job_wait` at most once more when continued waiting is intended.
 
-Never issue a second `job_start` to repair quoting, progress parsing, or unexpected output. Report the first job result and ask for a new user request when a changed command must run. `${name}`, `$name`, `$()` and shell quoting must reach the remote shell exactly as supplied by the user.
+Never issue a second `job_start` to repair quoting, progress parsing, or unexpected output. A Runner acknowledgement can be lost after acceptance; RunBeacon retries the same job ID, idempotency key, and digest and must never fall back to direct SSH after that point. Report `lost` or `REMOTE_STATE_LOST` instead of replaying an uncertain command. `${name}`, `$name`, `$()` and shell quoting must reach the remote shell exactly as supplied by the user.
 
-Use `job_snapshot` only when the user explicitly asks for current status. Do not call `job_dashboard` after a normal `job_start` merely to show the same UI because the start tool already mounts it. Use `job_dashboard` with the known `jobId` to reopen that task when the user explicitly asks; without a `jobId`, it only selects the newest non-terminal task. Every dashboard instance is bound to one job and never displays job history. The dashboard calls MCP directly and does not create model turns.
+Use `job_snapshot` only when the user explicitly asks for current status. Do not call `job_watch`; it is the dashboard's version-change long poll. Do not call `job_dashboard` after a normal start because `job_start` already mounts it. Use `job_dashboard` only to reopen a known task. Every dashboard is bound to one job and pauses its watch while hidden.
 
-If an SSH cancellation returns `cancellationVerified: false`, report that the channel was closed but the remote process may still exist. Do not claim that the remote process was killed; durable scheduler adapters are required for verified remote cancellation.
+If a direct SSH cancellation returns `cancellationVerified: false`, report that the remote process may still exist. A durable Runner reports `cancelled` as verified only after the entire process group exits. Slurm uses `scancel`; an unverified cancellation must never be described as successful.
 
-RunBeacon retries a failed SSH handshake up to five times with a short bounded exponential backoff and a bounded per-attempt ready timeout. It stops retrying as soon as SSH reaches `ready`; an exec request or an in-progress remote command is never replayed automatically. A disconnect after command start must be reported as failed/indeterminate rather than silently starting a second training or deployment.
+## Durable Runner and approvals
+
+`auto` probes the Runner first and may use direct SSH only before submission when `requireDurable` is false. `runner` or `requireDurable` fails with `RUNNER_UNAVAILABLE` instead of degrading. Runner jobs expose `durable`, `resumable`, connection state, event sequence, reconnect count, and Runner version in their snapshot.
+
+Use `runner_manage` only to probe from a model task. Installation, upgrade, and uninstall require the interactive signed-asset CLI. macOS installation must run locally in an active Aqua session; never try to unlock Keychain over SSH. The Runner installs as a Linux user systemd service or macOS LaunchAgent and exposes no network port.
+
+Privileged, private-key, release, and destructive commands may remain in `awaiting_approval`. Do not retry or alter the command. Tell the user to approve or reject in the dashboard or with `runbeacon approve|reject <jobId>`. The MCP tool catalog intentionally has no approval operation. Policy changes do not approve pending work.
+
+Use adapters deliberately:
+
+- `generic`: RE2 progress or bounded `RUNBEACON_EVENT <JSON>`.
+- `training`: structured epoch, step, loss, ETA, checkpoint, and GPU fields only.
+- `slurm`: the command must return `sbatch --parsable`; requires the Runner and verifies `scancel`.
+- `apple-signing`: requires the macOS Aqua LaunchAgent and environment references for signing identity and Notary profile; no Keychain password is read or transmitted.
+
+Direct SSH retries a failed handshake up to five times only before SSH reaches `ready`. Runner mode reconnects its blocking event channel from the last sequence while the independent supervisor continues. Neither mode blindly replays an accepted command.
 
 ## GitHub publishing
 
-Use `github_publish_start` when the user wants a commit, push, or GitHub Actions run shown in the RunBeacon dashboard. Pass the repository `cwd`, optional remote and branch, and a stable `idempotencyKey` when a retry must not create another commit or push job.
+Use `github_publish_start` when the user wants a commit, push, or GitHub Actions run shown in the RunBeacon dashboard. Pass the repository `cwd`, optional remote and branch, and a stable `idempotencyKey`. Publishing is a release-risk action and may require user approval.
 
 The tool never stages files. If a new commit is requested, ensure the intended files have already been staged through a separately authorized Git action, then pass `commitMessage`. Omit `commitMessage` to push the existing `HEAD`. Never force-push through RunBeacon.
 

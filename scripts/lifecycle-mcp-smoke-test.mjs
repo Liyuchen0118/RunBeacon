@@ -56,7 +56,7 @@ const transport = new StdioClientTransport({
     ...process.env,
     MCP_SERVER_MODE: 'true',
     PLUGIN_DATA: temporaryData,
-    RJM_INLINE_MANAGER: 'true',
+    RUNBEACON_INLINE_MANAGER: 'true',
     GIT_CONFIG_COUNT: '2',
     GIT_CONFIG_KEY_0: 'credential.helper',
     GIT_CONFIG_VALUE_0: '',
@@ -68,13 +68,14 @@ const transport = new StdioClientTransport({
 try {
   await client.connect(transport);
   assert.equal(client.getServerVersion()?.name, 'remote-job-monitor');
-  assert.equal(client.getServerVersion()?.version, '1.0.0');
+  assert.equal(client.getServerVersion()?.version, '3.0.0');
 
   const { tools } = await client.listTools();
   const toolNames = new Set(tools.map((tool) => tool.name));
   for (const name of [
     'job_start',
     'job_wait',
+    'job_watch',
     'job_snapshot',
     'job_list',
     'job_cancel',
@@ -89,6 +90,10 @@ try {
     'ssh_password_delete',
     'github_token_save',
     'github_token_delete',
+    'runner_manage',
+    'policy_manage',
+    'event_subscription_manage',
+    'audit_query',
   ]) {
     assert.ok(toolNames.has(name), `Missing tool: ${name}`);
   }
@@ -465,7 +470,8 @@ try {
   const html = resource.contents[0]?.text ?? '';
   assert.match(html, /ui\/initialize/);
   assert.match(html, /tools\/call/);
-  assert.match(html, /callTool\('job_snapshot'/);
+  assert.match(html, /callTool\('job_watch'/);
+  assert.doesNotMatch(html, /callTool\('job_snapshot'/);
   assert.doesNotMatch(html, /callTool\('job_list'/);
   assert.match(html, /focusedJobId/);
   assert.match(html, /document\.hidden/);

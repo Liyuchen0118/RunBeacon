@@ -14,7 +14,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $installDir = $PSScriptRoot
-$serverPath = Join-Path $installDir 'dist\mcp\server.js'
+$serverPath = Join-Path $installDir 'dist\mcp\lifecycle-server.js'
 
 function Write-Step([string]$Message) {
     Write-Host $Message -ForegroundColor Cyan
@@ -72,7 +72,15 @@ function Resolve-Application([string[]]$Names) {
 }
 
 $node = Resolve-Application @('node.exe', 'node')
-$npm = Resolve-Application @('npm.cmd', 'npm')
+$npmCli = Join-Path (Split-Path -Parent $node) 'node_modules\npm\bin\npm-cli.js'
+if (Test-Path -LiteralPath $npmCli -PathType Leaf) {
+    $npm = $node
+    $npmPrefixArguments = @($npmCli)
+}
+else {
+    $npm = Resolve-Application @('npm.cmd', 'npm')
+    $npmPrefixArguments = @()
+}
 $previousErrorActionPreference = $ErrorActionPreference
 try {
     $ErrorActionPreference = 'Continue'
@@ -87,8 +95,8 @@ if ($nodeVersionExitCode -ne 0) {
 }
 $nodeVersion = $nodeVersionOutput.TrimStart('v')
 $nodeMajor = [int]($nodeVersion.Split('.')[0])
-if ($nodeMajor -lt 18) {
-    throw "Node.js 18 or newer is required; found $nodeVersion"
+if ($nodeMajor -lt 22 -or $nodeMajor -gt 24) {
+    throw "Node.js 22, 23, or 24 is required; found $nodeVersion"
 }
 
 Write-Step "Using Node.js $nodeVersion from $node"
@@ -97,15 +105,15 @@ Push-Location $installDir
 try {
     if (-not $SkipDependencies) {
         Write-Step 'Installing locked dependencies...'
-        Invoke-Checked -Command $npm -Arguments @('ci')
+        Invoke-Checked -Command $npm -Arguments ($npmPrefixArguments + @('ci'))
     }
 
     Write-Step 'Building the MCP server...'
-    Invoke-Checked -Command $npm -Arguments @('run', 'build')
+    Invoke-Checked -Command $npm -Arguments ($npmPrefixArguments + @('run', 'build'))
 
     if (-not $Dev -and -not $KeepDevDependencies) {
         Write-Step 'Removing development-only and optional protocol packages...'
-        Invoke-Checked -Command $npm -Arguments @('prune', '--omit=dev', '--omit=optional')
+        Invoke-Checked -Command $npm -Arguments ($npmPrefixArguments + @('prune', '--omit=dev', '--omit=optional'))
     }
 }
 finally {
@@ -119,16 +127,16 @@ if (-not (Test-Path -LiteralPath $serverPath -PathType Leaf)) {
 if ($Target -eq 'codex') {
     $codex = Resolve-Application @('codex.exe', 'codex')
 
-    if (Test-NativeSuccess -Command $codex -Arguments @('mcp', 'get', 'console-automation')) {
+    if (Test-NativeSuccess -Command $codex -Arguments @('mcp', 'get', 'remote-job-monitor')) {
         Write-Step 'Replacing the existing Codex MCP registration...'
-        Invoke-Checked -Command $codex -Arguments @('mcp', 'remove', 'console-automation')
+        Invoke-Checked -Command $codex -Arguments @('mcp', 'remove', 'remote-job-monitor')
     }
 
-    Write-Step 'Registering console-automation with Codex...'
+    Write-Step 'Registering RunBeacon with Codex...'
     Invoke-Checked -Command $codex -Arguments @(
-        'mcp', 'add', 'console-automation', '--env', 'LOG_LEVEL=warn', '--', $node, $serverPath
+        'mcp', 'add', 'remote-job-monitor', '--env', 'MCP_SERVER_MODE=true', '--env', 'LOG_LEVEL=warn', '--', $node, $serverPath
     )
-    Invoke-Checked -Command $codex -Arguments @('mcp', 'get', 'console-automation')
+    Invoke-Checked -Command $codex -Arguments @('mcp', 'get', 'remote-job-monitor')
 
     Write-Host ''
     Write-Host 'Installation complete. Restart Codex, then use /mcp to verify the server.' -ForegroundColor Green
@@ -141,10 +149,13 @@ if ([string]::IsNullOrWhiteSpace($CustomPath)) {
 
 $customConfig = @{
     mcpServers = @{
-        'console-automation' = @{
+        'remote-job-monitor' = @{
             command = $node
             args = @($serverPath)
-            env = @{ LOG_LEVEL = 'warn' }
+            env = @{
+                MCP_SERVER_MODE = 'true'
+                LOG_LEVEL = 'warn'
+            }
         }
     }
 }

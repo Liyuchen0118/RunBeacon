@@ -1,0 +1,8 @@
+{
+  "name": "remote-job-monitor",
+  "version": "2.0.0",
+  "private": true,
+  "description": "RunBeacon Codex plugin workspace metadata",
+  "license": "MIT"
+}
+

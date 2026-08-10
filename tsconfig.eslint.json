@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "src/lifecycle/**/*",
+    "src/daemon/lifecycle-daemon.ts",
+    "src/daemon/github-publish-runner.ts",
+    "src/mcp/lifecycle-server.ts",
+    "src/cli/**/*",
+    "src/tests/CredentialProfileStore.test.ts",
+    "src/tests/GitCredentialManager.test.ts",
+    "src/tests/GitHubActionsMonitor.test.ts",
+    "src/tests/GitHubApiClient.test.ts",
+    "src/tests/GitHubPublish.test.ts",
+    "src/tests/GitHubWorkflowEligibility.test.ts",
+    "src/tests/LifecycleManager.test.ts",
+    "src/tests/PluginHooks.test.ts",
+    "src/tests/RunBeaconV3Security.test.ts",
+    "src/tests/SshPasswordProfileManager.test.ts"
+  ]
+}
