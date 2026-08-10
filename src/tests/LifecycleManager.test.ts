@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { Script } from 'node:vm';
 import type { Client, ClientChannel, ConnectConfig } from 'ssh2';
@@ -17,6 +18,7 @@ type FakeSshClient = EventEmitter & {
     callback: (error?: Error, stream?: ClientChannel) => void
   ) => FakeSshClient;
   end: () => FakeSshClient;
+  destroy: () => FakeSshClient;
 };
 
 function createFakeSshClient(
@@ -29,6 +31,10 @@ function createFakeSshClient(
 ): Client {
   const client = new EventEmitter() as FakeSshClient;
   client.end = jest.fn(() => client);
+  client.destroy = jest.fn(() => {
+    setImmediate(() => client.emit('close'));
+    return client;
+  });
   client.connect = jest.fn((config: ConnectConfig) => {
     onConnect(client, config);
     return client;
@@ -38,6 +44,24 @@ function createFakeSshClient(
     return client;
   });
   return client as unknown as Client;
+}
+
+function createRawHostKey(type: string, payload: string): Buffer {
+  const typeBuffer = Buffer.from(type, 'ascii');
+  const payloadBuffer = Buffer.from(payload, 'ascii');
+  const key = Buffer.alloc(8 + typeBuffer.length + payloadBuffer.length);
+  key.writeUInt32BE(typeBuffer.length, 0);
+  typeBuffer.copy(key, 4);
+  key.writeUInt32BE(payloadBuffer.length, 4 + typeBuffer.length);
+  payloadBuffer.copy(key, 8 + typeBuffer.length);
+  return key;
+}
+
+function opensshSha256Fingerprint(key: Buffer): string {
+  return `SHA256:${createHash('sha256')
+    .update(key)
+    .digest('base64')
+    .replace(/=+$/, '')}`;
 }
 
 function createSuccessfulChannel(): ClientChannel {
@@ -509,6 +533,113 @@ describe('LifecycleManager', () => {
     const completed = await manager.waitForTerminal(started.id, 5_000);
     expect(completed.job.state).toBe('failed');
     expect(readFileSync(statePath, 'utf8')).not.toContain(password);
+  });
+
+  test('accepts an unpadded OpenSSH SHA256 host fingerprint', async () => {
+    const hostKey = createRawHostKey('ssh-ed25519', 'test-ed25519-key');
+    const fingerprint = opensshSha256Fingerprint(hostKey);
+    let verifierAccepted = false;
+    const manager = new LifecycleManager({
+      statePath,
+      sshRetryBaseDelayMs: 1,
+      sshClientFactory: () =>
+        createFakeSshClient(
+          (client, config) => {
+            verifierAccepted = Boolean(
+              (config.hostVerifier as (key: Buffer) => boolean)(hostKey)
+            );
+            setImmediate(() => client.emit('ready'));
+          },
+          (_client, _command, callback) => {
+            const channel = createSuccessfulChannel();
+            callback(undefined, channel);
+            setImmediate(() => channel.emit('close', 0));
+          }
+        ),
+    });
+    const started = manager.start({
+      command: 'run-training',
+      target: {
+        kind: 'ssh',
+        host: 'example.test',
+        username: 'runner',
+        hostKeySha256: fingerprint,
+      },
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000);
+
+    expect(fingerprint).not.toMatch(/=$/);
+    expect(verifierAccepted).toBe(true);
+    expect(completed.job.state).toBe('succeeded');
+  });
+
+  test('tries the next host key algorithm after a pinned-key mismatch', async () => {
+    const ed25519Key = createRawHostKey('ssh-ed25519', 'other-host-key');
+    const ecdsaKey = createRawHostKey(
+      'ecdsa-sha2-nistp256',
+      'expected-host-key'
+    );
+    let clientsCreated = 0;
+    let execCalls = 0;
+    let firstClient: FakeSshClient | undefined;
+    let secondStartedAfterDestroy = false;
+    const observedConfigs: ConnectConfig[] = [];
+    const manager = new LifecycleManager({
+      statePath,
+      sshRetryBaseDelayMs: 1,
+      sshClientFactory: () => {
+        clientsCreated += 1;
+        const currentAttempt = clientsCreated;
+        const created = createFakeSshClient(
+          (client, config) => {
+            observedConfigs.push(config);
+            if (currentAttempt === 2) {
+              secondStartedAfterDestroy = Boolean(
+                (firstClient?.destroy as jest.Mock | undefined)?.mock.calls
+                  .length
+              );
+            }
+            const offeredKey = currentAttempt === 1 ? ed25519Key : ecdsaKey;
+            const accepted = Boolean(
+              (config.hostVerifier as (key: Buffer) => boolean)(offeredKey)
+            );
+            setImmediate(() =>
+              accepted
+                ? client.emit('ready')
+                : client.emit('error', new Error('Host denied'))
+            );
+          },
+          (_client, _command, callback) => {
+            execCalls += 1;
+            const channel = createSuccessfulChannel();
+            callback(undefined, channel);
+            setImmediate(() => channel.emit('close', 0));
+          }
+        ) as unknown as FakeSshClient;
+        if (currentAttempt === 1) firstClient = created;
+        return created as unknown as Client;
+      },
+    });
+    const started = manager.start({
+      command: 'run-training',
+      target: {
+        kind: 'ssh',
+        host: 'example.test',
+        username: 'runner',
+        hostKeySha256: opensshSha256Fingerprint(ecdsaKey),
+      },
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000);
+
+    expect(completed.job.state).toBe('succeeded');
+    expect(clientsCreated).toBe(2);
+    expect(execCalls).toBe(1);
+    expect(secondStartedAfterDestroy).toBe(true);
+    expect(observedConfigs[1].algorithms?.serverHostKey).not.toContain(
+      'ssh-ed25519'
+    );
   });
 
   test('retries handshake failures before executing the remote command', async () => {

@@ -3,7 +3,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { spawn, ChildProcess } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
-import { Client, ClientChannel, ConnectConfig } from 'ssh2';
+import {
+  Client,
+  ClientChannel,
+  ConnectConfig,
+  ServerHostKeyAlgorithm,
+} from 'ssh2';
 import { RE2JS } from 're2js';
 import { JobStore } from './JobStore.js';
 import { redactCommand, safeErrorMessage } from './security.js';
@@ -70,6 +75,43 @@ const MAX_WAITERS_GLOBAL = 128;
 const DEFAULT_SSH_HANDSHAKE_ATTEMPTS = 5;
 const DEFAULT_SSH_RETRY_BASE_DELAY_MS = 250;
 const DEFAULT_SSH_READY_TIMEOUT_MS = 12_000;
+const SSH_CLIENT_CLEANUP_TIMEOUT_MS = 250;
+const SSH_SERVER_HOST_KEY_ALGORITHMS: ServerHostKeyAlgorithm[] = [
+  'ssh-ed25519',
+  'ecdsa-sha2-nistp256',
+  'ecdsa-sha2-nistp384',
+  'ecdsa-sha2-nistp521',
+  'rsa-sha2-512',
+  'rsa-sha2-256',
+  'ssh-rsa',
+];
+
+function normalizeSshSha256Fingerprint(value: string): string {
+  return value
+    .trim()
+    .replace(/^SHA256:/i, '')
+    .replace(/=+$/, '');
+}
+
+function hostKeyAlgorithmsForRawKey(key: Buffer): ServerHostKeyAlgorithm[] {
+  if (key.length < 4) return [];
+  const typeLength = key.readUInt32BE(0);
+  if (typeLength < 1 || typeLength > key.length - 4) return [];
+
+  const keyType = key.subarray(4, 4 + typeLength).toString('ascii');
+  if (keyType === 'ssh-rsa') {
+    return ['rsa-sha2-512', 'rsa-sha2-256', 'ssh-rsa'];
+  }
+  if (
+    keyType === 'ssh-ed25519' ||
+    keyType === 'ecdsa-sha2-nistp256' ||
+    keyType === 'ecdsa-sha2-nistp384' ||
+    keyType === 'ecdsa-sha2-nistp521'
+  ) {
+    return [keyType];
+  }
+  return [];
+}
 
 function boundedInteger(
   value: number | undefined,
@@ -552,7 +594,7 @@ export class LifecycleManager extends EventEmitter {
         clearTimeout(timeout);
         if (retryTimer) clearTimeout(retryTimer);
         retryTimer = undefined;
-        client?.end();
+        client?.destroy();
         if (error) reject(error);
         else resolve(result!);
       };
@@ -577,13 +619,10 @@ export class LifecycleManager extends EventEmitter {
       if (target.privateKeyPath) {
         config.privateKey = readFileSync(target.privateKeyPath);
       }
-      if (target.hostKeySha256) {
-        const expected = target.hostKeySha256.replace(/^SHA256:/i, '').trim();
-        config.hostVerifier = (key: Buffer) =>
-          createHash('sha256').update(key).digest('base64') === expected;
-      } else {
-        config.hostVerifier = () => Boolean(target.allowUnverifiedHostKey);
-      }
+      const expectedHostKey = target.hostKeySha256
+        ? normalizeSshSha256Fingerprint(target.hostKeySha256)
+        : undefined;
+      const excludedHostKeyAlgorithms = new Set<ServerHostKeyAlgorithm>();
 
       const connect = () => {
         if (settled) return;
@@ -592,19 +631,11 @@ export class LifecycleManager extends EventEmitter {
         client = currentClient;
         let ready = false;
         let failureHandled = false;
+        let hostKeyRejected = false;
+        let rejectedHostKeyAlgorithms: ServerHostKeyAlgorithm[] = [];
 
-        const failAttempt = (error: Error) => {
-          if (settled || failureHandled || currentClient !== client) return;
-          failureHandled = true;
-          currentClient.end();
-
-          // Once SSH is ready, an exec request may have reached the server. Never
-          // retry at that point because doing so could duplicate training/deploys.
-          if (ready || attempt >= this.sshHandshakeAttempts || timedOut) {
-            settle(undefined, error);
-            return;
-          }
-
+        const scheduleRetry = () => {
+          if (settled) return;
           const delayMs = this.sshRetryBaseDelayMs * 2 ** (attempt - 1);
           this.append(
             job,
@@ -617,6 +648,62 @@ export class LifecycleManager extends EventEmitter {
             connect();
           }, delayMs);
           retryTimer.unref?.();
+        };
+
+        const destroyBeforeRetry = (alreadyClosed: boolean) => {
+          if (alreadyClosed) {
+            currentClient.destroy();
+            scheduleRetry();
+            return;
+          }
+
+          let cleanupFinished = false;
+          let cleanupTimer: NodeJS.Timeout | undefined;
+          const finishCleanup = () => {
+            if (cleanupFinished) return;
+            cleanupFinished = true;
+            if (cleanupTimer) clearTimeout(cleanupTimer);
+            currentClient.removeListener('close', finishCleanup);
+            scheduleRetry();
+          };
+          currentClient.once('close', finishCleanup);
+          currentClient.destroy();
+          if (!cleanupFinished) {
+            cleanupTimer = setTimeout(
+              finishCleanup,
+              SSH_CLIENT_CLEANUP_TIMEOUT_MS
+            );
+            cleanupTimer.unref?.();
+          }
+        };
+
+        const failAttempt = (error: Error, alreadyClosed = false) => {
+          if (settled || failureHandled || currentClient !== client) return;
+          failureHandled = true;
+
+          let addedHostKeyAlgorithm = false;
+          for (const algorithm of rejectedHostKeyAlgorithms) {
+            if (!excludedHostKeyAlgorithms.has(algorithm)) {
+              excludedHostKeyAlgorithms.add(algorithm);
+              addedHostKeyAlgorithm = true;
+            }
+          }
+
+          // Once SSH is ready, an exec request may have reached the server. Never
+          // retry at that point because doing so could duplicate training/deploys.
+          if (
+            ready ||
+            attempt >= this.sshHandshakeAttempts ||
+            timedOut ||
+            (hostKeyRejected &&
+              (rejectedHostKeyAlgorithms.length === 0 ||
+                !addedHostKeyAlgorithm))
+          ) {
+            settle(undefined, error);
+            return;
+          }
+
+          destroyBeforeRetry(alreadyClosed);
         };
 
         currentClient.once('ready', () => {
@@ -662,10 +749,38 @@ export class LifecycleManager extends EventEmitter {
               ready
                 ? 'SSH connection closed before job completion'
                 : 'SSH connection closed before handshake'
-            )
+            ),
+            true
           )
         );
-        currentClient.connect(config);
+        const attemptConfig: ConnectConfig = {
+          ...config,
+          hostVerifier: expectedHostKey
+            ? (key: Buffer) => {
+                const actual = normalizeSshSha256Fingerprint(
+                  createHash('sha256').update(key).digest('base64')
+                );
+                if (actual === expectedHostKey) return true;
+                hostKeyRejected = true;
+                rejectedHostKeyAlgorithms = hostKeyAlgorithmsForRawKey(key);
+                return false;
+              }
+            : () => Boolean(target.allowUnverifiedHostKey),
+        };
+        if (excludedHostKeyAlgorithms.size > 0) {
+          attemptConfig.algorithms = {
+            serverHostKey: SSH_SERVER_HOST_KEY_ALGORITHMS.filter(
+              (algorithm) => !excludedHostKeyAlgorithms.has(algorithm)
+            ),
+          };
+        }
+        try {
+          currentClient.connect(attemptConfig);
+        } catch (error) {
+          failAttempt(
+            error instanceof Error ? error : new Error(safeErrorMessage(error))
+          );
+        }
       };
 
       this.runtimeHandles.set(job.id, {
@@ -674,7 +789,7 @@ export class LifecycleManager extends EventEmitter {
           if (retryTimer) clearTimeout(retryTimer);
           retryTimer = undefined;
           channel?.close();
-          client?.end();
+          client?.destroy();
           settle({ exitCode: null, signal: 'cancelled' });
         },
       });
@@ -682,7 +797,7 @@ export class LifecycleManager extends EventEmitter {
       const timeout = setTimeout(() => {
         timedOut = true;
         channel?.close();
-        client?.end();
+        client?.destroy();
         settle({ exitCode: null, signal: 'timeout', timedOut: true });
       }, input.timeoutMs ?? DEFAULT_TIMEOUT_MS);
       timeout.unref?.();
