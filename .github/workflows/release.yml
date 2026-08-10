@@ -1,0 +1,217 @@
+name: Promote Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Promotion channel
+        required: true
+        type: choice
+        options: [beta, stable]
+      version:
+        description: Core and Runner version
+        required: true
+        default: 3.0.0
+      plugin_version:
+        description: Codex plugin version
+        required: true
+        default: 2.0.0
+      confirm:
+        description: Type promote-beta or promote-stable
+        required: true
+
+concurrency:
+  group: release-promotion
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  security-events: read
+  actions: read
+
+jobs:
+  gate:
+    name: Main release gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    outputs:
+      tag: ${{ steps.values.outputs.tag }}
+    steps:
+      - name: Require main and explicit confirmation
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$CONFIRM" = "promote-$CHANNEL"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify requested versions
+        env:
+          VERSION: ${{ inputs.version }}
+          PLUGIN_VERSION: ${{ inputs.plugin_version }}
+        run: |
+          test "$(node -p "require('./package.json').version")" = "$VERSION"
+          test "$(node -p "require('./packages/runner-installer/package.json').version")" = "$VERSION"
+          test "$(node -p "require('./packages/codex-plugin/package.json').version")" = "$PLUGIN_VERSION"
+      - name: Require zero open High or Critical CodeQL alerts on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh api --paginate "/repos/$GITHUB_REPOSITORY/code-scanning/alerts?state=open&ref=refs/heads/main&per_page=100" --jq '[.[] | select(.rule.security_severity_level == "high" or .rule.security_severity_level == "critical")] | length' | awk '{s+=$1} END {print s+0}')
+          test "$count" = 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm run test:all
+      - run: npm audit --audit-level=high --registry=https://registry.npmjs.org
+      - run: go test -race ./...
+        working-directory: runner
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        working-directory: runner
+      - id: values
+        env:
+          VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          if [ "$CHANNEL" = stable ]; then echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"; else echo "tag=v$VERSION-beta.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"; fi
+
+  build-runner:
+    name: Build Runner assets
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Reproducible cross-build
+        working-directory: runner
+        run: |
+          mkdir -p ../runner-assets
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${{ inputs.version }}" -o ../runner-assets/runbeacon-runner-linux-x64 ./cmd/runbeacon-runner
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${{ inputs.version }}" -o ../runner-assets/runbeacon-runner-linux-arm64 ./cmd/runbeacon-runner
+          GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${{ inputs.version }}" -o ../runner-assets/runbeacon-runner-darwin-x64 ./cmd/runbeacon-runner
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${{ inputs.version }}" -o ../runner-assets/runbeacon-runner-darwin-arm64 ./cmd/runbeacon-runner
+      - uses: anchore/sbom-action@v0
+        with:
+          path: runner-assets
+          output-file: runner-assets/runner.spdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runner-assets
+          path: runner-assets/
+
+  sign-macos:
+    name: Developer ID and Notary
+    needs: [gate, build-runner]
+    runs-on: [self-hosted, macOS, runbeacon-signing]
+    timeout-minutes: 30
+    environment: apple-release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: runner-assets
+          path: runner-assets
+      - name: Sign and verify macOS binaries
+        env:
+          SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          NOTARY_PROFILE: ${{ vars.APPLE_NOTARY_PROFILE }}
+        run: |
+          for file in runner-assets/runbeacon-runner-darwin-*; do
+            chmod 755 "$file"
+            codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$file"
+            codesign --verify --strict --verbose=2 "$file"
+            ditto -c -k --keepParent "$file" "$file.zip"
+            xcrun notarytool submit "$file.zip" --keychain-profile "$NOTARY_PROFILE" --wait
+          done
+          rm runner-assets/*.zip
+          cd runner-assets
+          shasum -a 256 runbeacon-runner-* > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-runner-assets
+          path: runner-assets/
+          overwrite: true
+
+  attest:
+    name: Sign and attest assets
+    needs: [gate, sign-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-runner-assets
+          path: runner-assets
+      - uses: sigstore/cosign-installer@v3
+      - name: Keyless Sigstore signatures
+        run: |
+          for file in runner-assets/runbeacon-runner-*; do cosign sign-blob --yes --bundle "$file.sigstore.json" "$file"; done
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: runner-assets/runbeacon-runner-*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: runner-assets/
+
+  publish:
+    name: Tag, release, and npm publish
+    needs: [gate, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ inputs.channel == 'stable' && 'stable-release' || 'beta-release' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: runner-assets
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Populate Runner installer assets
+        run: |
+          mkdir -p packages/runner-installer/assets
+          cp runner-assets/runbeacon-runner-* runner-assets/SHA256SUMS packages/runner-installer/assets/
+      - name: Create tag only after every gate passed
+        env:
+          TAG: ${{ needs.gate.outputs.tag }}
+        run: |
+          git tag "$TAG" "$GITHUB_SHA"
+          git push origin "$TAG"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.gate.outputs.tag }}
+        run: gh release create "$TAG" runner-assets/* --generate-notes ${{ inputs.channel == 'beta' && '--prerelease' || '' }}
+      - name: Publish core
+        run: npm publish --provenance --access public ${{ inputs.channel == 'beta' && '--tag beta' || '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish Runner installer
+        working-directory: packages/runner-installer
+        run: npm publish --provenance --access public ${{ inputs.channel == 'beta' && '--tag beta' || '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
