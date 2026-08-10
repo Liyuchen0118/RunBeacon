@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { spawn, ChildProcess } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import {
@@ -11,6 +12,18 @@ import {
 } from 'ssh2';
 import { RE2JS } from 're2js';
 import { JobStore } from './JobStore.js';
+import { AuditLog, AuditQuery } from './AuditLog.js';
+import { PolicyConfig, PolicyEngine, PolicyUpdate } from './PolicyEngine.js';
+import { commandForAdapter } from './Adapters.js';
+import {
+  EventSubscriptionStore,
+  SaveEventSubscription,
+} from './EventSubscriptionStore.js';
+import {
+  RunnerRPCClient,
+  RunnerTransportError,
+  SshRunnerTransport,
+} from './RunnerTransport.js';
 import { redactCommand, safeErrorMessage } from './security.js';
 import {
   isTerminalJobState,
@@ -19,8 +32,10 @@ import {
   JobSnapshot,
   JobState,
   PublicJobTarget,
+  SshJobTarget,
   StartJobInput,
   WaitResult,
+  WatchResult,
 } from './types.js';
 
 interface LifecycleManagerOptions {
@@ -37,12 +52,38 @@ interface LifecycleManagerOptions {
   sshHandshakeAttempts?: number;
   sshRetryBaseDelayMs?: number;
   sshReadyTimeoutMs?: number;
+  runnerTransportFactory?: (target: SshJobTarget) => RunnerRPCClient;
+  recoverRunnerTarget?: (profileId: string) => Promise<SshJobTarget>;
+  policyPath?: string;
+  auditPath?: string;
+  eventSubscriptionPath?: string;
 }
 
 interface ExecutionResult {
   exitCode: number | null;
   signal?: string | null;
   timedOut?: boolean;
+  terminalState?: JobState;
+  cancellationVerified?: boolean;
+}
+
+interface RunnerJobPayload {
+  id: string;
+  state: JobState;
+  exitCode?: number | null;
+  signal?: string;
+  error?: string;
+  cancellationVerified?: boolean;
+  lastEventSequence?: number;
+}
+
+interface RunnerEventPayload {
+  sequence: number;
+  timestamp?: string;
+  type: string;
+  state?: JobState;
+  stream?: 'stdout' | 'stderr';
+  data?: string;
 }
 
 interface RuntimeHandle {
@@ -64,6 +105,17 @@ interface WaitCoordinator {
   jobId: string;
   waiters: Map<number, Waiter>;
   timer?: NodeJS.Timeout;
+}
+
+interface ChangeWaiter {
+  id: number;
+  afterVersion: number;
+  tailLines: number;
+  timer: NodeJS.Timeout;
+  signal?: AbortSignal;
+  abortListener?: () => void;
+  resolve: (result: WatchResult) => void;
+  reject: (error: Error) => void;
 }
 
 const DEFAULT_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -130,6 +182,9 @@ export class LifecycleManager extends EventEmitter {
   private readonly activeJobs = new Set<string>();
   private readonly runtimeHandles = new Map<string, RuntimeHandle>();
   private readonly store: JobStore;
+  private readonly policyEngine: PolicyEngine;
+  private readonly auditLog: AuditLog;
+  private readonly eventSubscriptions: EventSubscriptionStore;
   private readonly maxConcurrentJobs: number;
   private readonly maxOutputBytes: number;
   private readonly stalledAfterMs: number;
@@ -140,9 +195,16 @@ export class LifecycleManager extends EventEmitter {
   private readonly sshHandshakeAttempts: number;
   private readonly sshRetryBaseDelayMs: number;
   private readonly sshReadyTimeoutMs: number;
+  private readonly runnerTransportFactory: (
+    target: SshJobTarget
+  ) => RunnerRPCClient;
+  private readonly recoverRunnerTarget?: (
+    profileId: string
+  ) => Promise<SshJobTarget>;
   private readonly progressRemainders = new Map<string, string>();
   private readonly progressPatterns = new Map<string, RE2JS>();
   private readonly waitCoordinators = new Map<string, WaitCoordinator>();
+  private readonly changeWaiters = new Map<string, Map<number, ChangeWaiter>>();
   private persistenceTimer?: NodeJS.Timeout;
   private lastPersistenceError?: string;
   private lastPersistenceSuccessAt?: string;
@@ -188,28 +250,75 @@ export class LifecycleManager extends EventEmitter {
       1_000,
       30_000
     );
+    this.runnerTransportFactory =
+      options.runnerTransportFactory ??
+      ((target) => new SshRunnerTransport(target, this.sshClientFactory));
+    this.recoverRunnerTarget = options.recoverRunnerTarget;
     this.store = new JobStore(
       options.statePath,
       options.persistOutput ?? false,
       options.persistMetadata ?? false
     );
+    this.policyEngine = new PolicyEngine(
+      options.policyPath ?? join(dirname(options.statePath), 'policies.json')
+    );
+    this.auditLog = new AuditLog(
+      options.auditPath ?? join(dirname(options.statePath), 'audit.jsonl')
+    );
+    this.eventSubscriptions = new EventSubscriptionStore(
+      options.eventSubscriptionPath ??
+        join(dirname(options.statePath), 'event-subscriptions.json')
+    );
     this.setMaxListeners(Math.max(20, this.maxConcurrentJobs * 10));
 
+    const recoverableJobs: JobRecord[] = [];
     for (const loaded of this.store.load()) {
       if (loaded.state === 'running' || loaded.state === 'queued') {
-        loaded.state = 'orphaned';
-        loaded.error =
-          'The prior MCP runtime ended before this job reached a terminal state.';
-        loaded.finishedAt = new Date().toISOString();
-        loaded.updatedAt = loaded.finishedAt;
-        loaded.version += 1;
+        if (
+          loaded.execution.backend === 'ssh_runner' &&
+          loaded.execution.durable &&
+          loaded.execution.remoteJobId &&
+          loaded.credentialProfileId &&
+          this.recoverRunnerTarget
+        ) {
+          loaded.state = 'running';
+          loaded.execution.phase = 'reconnecting';
+          loaded.execution.connectionState = 'reconnecting';
+          loaded.execution.resumable = true;
+          loaded.execution.reconnectCount += 1;
+          loaded.version += 1;
+          loaded.updatedAt = new Date().toISOString();
+          recoverableJobs.push(loaded);
+        } else {
+          loaded.state = 'lost';
+          loaded.execution.phase = 'finished';
+          loaded.execution.connectionState = 'disconnected';
+          loaded.error =
+            'The prior coordinator ended and this execution backend cannot be reattached.';
+          loaded.finishedAt = new Date().toISOString();
+          loaded.updatedAt = loaded.finishedAt;
+          loaded.version += 1;
+        }
       }
       this.jobs.set(loaded.id, loaded);
+      if (loaded.progressPattern) {
+        try {
+          this.progressPatterns.set(
+            loaded.id,
+            this.compileProgressPattern(loaded.progressPattern)
+          );
+        } catch {
+          loaded.progressPattern = undefined;
+        }
+      }
       for (const chunk of loaded.output) {
         this.sequence = Math.max(this.sequence, chunk.sequence);
       }
     }
     this.persistNow();
+    for (const job of recoverableJobs) {
+      setImmediate(() => void this.recoverRunnerJob(job));
+    }
   }
 
   start(input: StartJobInput): JobSnapshot {
@@ -217,6 +326,31 @@ export class LifecycleManager extends EventEmitter {
     if (!input.command?.trim()) throw new Error('command is required');
     if (input.timeoutMs !== undefined && input.timeoutMs <= 0) {
       throw new Error('timeoutMs must be greater than zero');
+    }
+    if (
+      input.credentialProfileId !== undefined &&
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(input.credentialProfileId)
+    ) {
+      throw new Error('credentialProfileId is invalid');
+    }
+    if (input.requireDurable && input.executionMode === 'direct') {
+      throw new Error('DURABILITY_REQUIRED: direct execution is not durable');
+    }
+    if (
+      input.adapter === 'apple-signing' &&
+      (input.target?.kind !== 'ssh' || input.executionMode === 'direct')
+    ) {
+      throw new Error(
+        'DURABILITY_REQUIRED: apple-signing requires a macOS LaunchAgent Runner'
+      );
+    }
+    if (
+      input.adapter === 'slurm' &&
+      (input.target?.kind !== 'ssh' || input.executionMode === 'direct')
+    ) {
+      throw new Error(
+        'DURABILITY_REQUIRED: slurm requires the durable Runner for verified scancel handling'
+      );
     }
     if (input.timing?.requestTraceId) {
       const existing = Array.from(this.jobs.values()).find(
@@ -243,6 +377,25 @@ export class LifecycleManager extends EventEmitter {
     const id = randomUUID();
     const now = new Date().toISOString();
     const target = this.publicTarget(input);
+    const policyDecision = this.policyEngine.classify(
+      [input.command, ...(input.args ?? [])].join(' '),
+      input.adapter ?? 'generic'
+    );
+    const commandDigest = `sha256:${createHash('sha256')
+      .update(
+        JSON.stringify({
+          command: input.command,
+          args: input.args ?? [],
+          cwd: input.cwd ?? null,
+          target,
+        })
+      )
+      .digest('hex')}`;
+    const runnerRequested =
+      target.kind === 'ssh' && (input.executionMode ?? 'auto') !== 'direct';
+    const eventSubscriptions = this.eventSubscriptions.validateIds(
+      input.eventSubscriptions
+    );
     const record: JobRecord = {
       id,
       idempotencyKey: input.idempotencyKey,
@@ -261,15 +414,149 @@ export class LifecycleManager extends EventEmitter {
       outputTruncated: false,
       metadata: input.metadata,
       timing: input.timing,
+      execution: {
+        backend: runnerRequested
+          ? 'ssh_runner'
+          : target.kind === 'ssh'
+            ? 'ssh_direct'
+            : 'local',
+        phase: policyDecision.requiresApproval ? 'awaiting_approval' : 'queued',
+        connectionState:
+          target.kind === 'ssh' ? 'disconnected' : 'not_applicable',
+        durable: runnerRequested,
+        resumable: runnerRequested && Boolean(input.credentialProfileId),
+        reconnectCount: 0,
+        lastEventSequence: 0,
+      },
+      policy: {
+        risk: policyDecision.risk,
+        approval: policyDecision.requiresApproval ? 'pending' : 'not_required',
+      },
+      adapter: input.adapter ?? 'generic',
+      outputPolicy: this.normalizeOutputPolicy(input),
+      eventSubscriptions:
+        eventSubscriptions.length > 0 ? eventSubscriptions : undefined,
+      credentialProfileId: input.credentialProfileId,
+      progressPattern: input.progressPattern,
     };
 
     this.jobs.set(id, record);
     if (progressPattern) this.progressPatterns.set(id, progressPattern);
     this.pendingInputs.set(id, input);
-    this.queue.push(id);
-    this.touch(record, 'Job queued.', 'system', 'immediate');
-    this.scheduleDrain();
+    this.auditLog.append({
+      action: 'job_start',
+      outcome: policyDecision.requiresApproval ? 'awaiting_approval' : 'queued',
+      jobId: id,
+      target: this.auditTarget(target),
+      risk: policyDecision.risk,
+      commandDigest,
+    });
+    if (policyDecision.requiresApproval) {
+      this.touch(
+        record,
+        `Approval required: ${policyDecision.reason}.`,
+        'system',
+        'immediate'
+      );
+    } else {
+      this.queue.push(id);
+      this.touch(record, 'Job queued.', 'system', 'immediate');
+      this.scheduleDrain();
+    }
     return this.snapshot(id);
+  }
+
+  approve(jobId: string): JobSnapshot {
+    this.assertNotDisposed();
+    const job = this.requireJob(jobId);
+    if (
+      job.execution.phase !== 'awaiting_approval' ||
+      job.policy.approval !== 'pending'
+    ) {
+      throw new Error('APPROVAL_REQUIRED: job is not awaiting approval');
+    }
+    if (!this.pendingInputs.has(jobId)) {
+      throw new Error('REMOTE_STATE_LOST: pending command is unavailable');
+    }
+    const now = new Date();
+    job.policy.approval = 'approved';
+    job.policy.approvedAt = now.toISOString();
+    job.policy.grantExpiresAt = new Date(
+      now.getTime() + this.policyEngine.get().approvalTtlSeconds * 1_000
+    ).toISOString();
+    job.execution.phase = 'queued';
+    this.queue.push(jobId);
+    this.auditLog.append({
+      action: 'approval',
+      outcome: 'approved',
+      jobId,
+      target: this.auditTarget(job.target),
+      risk: job.policy.risk,
+    });
+    this.touch(job, 'Approval granted.', 'system', 'immediate');
+    this.scheduleDrain();
+    return this.snapshot(jobId);
+  }
+
+  rejectApproval(jobId: string): JobSnapshot {
+    this.assertNotDisposed();
+    const job = this.requireJob(jobId);
+    if (
+      job.execution.phase !== 'awaiting_approval' ||
+      job.policy.approval !== 'pending'
+    ) {
+      throw new Error('APPROVAL_REQUIRED: job is not awaiting approval');
+    }
+    job.policy.approval = 'rejected';
+    this.pendingInputs.delete(jobId);
+    this.auditLog.append({
+      action: 'approval',
+      outcome: 'rejected',
+      jobId,
+      target: this.auditTarget(job.target),
+      risk: job.policy.risk,
+    });
+    this.finish(job, 'cancelled', 'Approval was rejected.');
+    return this.snapshot(jobId);
+  }
+
+  policyConfig(): PolicyConfig {
+    return this.policyEngine.get();
+  }
+
+  updatePolicy(input: PolicyUpdate): PolicyConfig {
+    const config = this.policyEngine.update(input);
+    this.auditLog.append({
+      action: 'policy_update',
+      outcome: 'updated',
+    });
+    return config;
+  }
+
+  queryAudit(query: AuditQuery = {}) {
+    return this.auditLog.query(query);
+  }
+
+  listEventSubscriptions() {
+    return this.eventSubscriptions.list();
+  }
+
+  saveEventSubscription(input: SaveEventSubscription) {
+    const saved = this.eventSubscriptions.save(input);
+    this.auditLog.append({
+      action: 'event_subscription',
+      outcome: 'saved',
+    });
+    return saved;
+  }
+
+  deleteEventSubscription(id: string) {
+    const deleted = this.eventSubscriptions.delete(id);
+    this.auditLog.append({
+      action: 'event_subscription',
+      outcome: 'deleted',
+    });
+    return deleted;
   }
 
   list(tailLines = 8, limit = 100): JobSnapshot[] {
@@ -358,6 +645,76 @@ export class LifecycleManager extends EventEmitter {
     });
   }
 
+  async watchForChange(
+    jobId: string,
+    afterVersion: number,
+    timeoutMs = 25_000,
+    tailLines = 20,
+    signal?: AbortSignal
+  ): Promise<WatchResult> {
+    this.assertNotDisposed();
+    if (signal?.aborted) throw new Error('Job watch was aborted');
+    const current = this.requireJob(jobId);
+    if (current.version > afterVersion || isTerminalJobState(current.state)) {
+      return { changed: true, job: this.snapshot(jobId, tailLines) };
+    }
+
+    const existing = this.changeWaiters.get(jobId);
+    if ((existing?.size ?? 0) >= MAX_WAITERS_PER_JOB) {
+      throw new Error('job_watch limit reached for job');
+    }
+    const total = Array.from(this.changeWaiters.values()).reduce(
+      (sum, waiters) => sum + waiters.size,
+      0
+    );
+    if (total >= MAX_WAITERS_GLOBAL) {
+      throw new Error('global job_watch limit reached');
+    }
+
+    const boundedTimeout = Math.max(1, Math.min(timeoutMs, 30_000));
+    const waiters = existing ?? new Map<number, ChangeWaiter>();
+    if (!existing) this.changeWaiters.set(jobId, waiters);
+
+    return new Promise<WatchResult>((resolve, reject) => {
+      const id = ++this.waiterSequence;
+      const waiter = {} as ChangeWaiter;
+      const cleanup = () => {
+        clearTimeout(waiter.timer);
+        signal?.removeEventListener('abort', waiter.abortListener!);
+        waiters.delete(id);
+        if (waiters.size === 0) this.changeWaiters.delete(jobId);
+      };
+      const finish = (error?: Error, changed = false) => {
+        if (!waiters.has(id)) return;
+        cleanup();
+        if (error) reject(error);
+        else resolve({ changed, job: this.snapshot(jobId, tailLines) });
+      };
+      Object.assign(waiter, {
+        id,
+        afterVersion,
+        tailLines,
+        signal,
+        resolve,
+        reject,
+        timer: setTimeout(() => finish(undefined, false), boundedTimeout),
+        abortListener: () => finish(new Error('Job watch was aborted')),
+      });
+      waiter.timer.unref?.();
+      waiters.set(id, waiter);
+      signal?.addEventListener('abort', waiter.abortListener, { once: true });
+
+      const latest = this.jobs.get(jobId);
+      if (!latest) finish(new Error(`Unknown job: ${jobId}`));
+      else if (
+        latest.version > afterVersion ||
+        isTerminalJobState(latest.state)
+      ) {
+        finish(undefined, true);
+      }
+    });
+  }
+
   waitCoordinatorStatus() {
     let timers = 0;
     for (const coordinator of this.waitCoordinators.values()) {
@@ -379,12 +736,21 @@ export class LifecycleManager extends EventEmitter {
 
   dispose(): void {
     if (this.disposed) return;
+    this.persistNow();
     this.disposed = true;
     for (const coordinator of Array.from(this.waitCoordinators.values())) {
       this.rejectCoordinator(
         coordinator,
         new Error('LifecycleManager was disposed')
       );
+    }
+    for (const [jobId, waiters] of this.changeWaiters) {
+      for (const waiter of waiters.values()) {
+        clearTimeout(waiter.timer);
+        waiter.signal?.removeEventListener('abort', waiter.abortListener!);
+        waiter.reject(new Error('LifecycleManager was disposed'));
+      }
+      this.changeWaiters.delete(jobId);
     }
     if (this.persistenceTimer) clearTimeout(this.persistenceTimer);
     this.persistenceTimer = undefined;
@@ -398,6 +764,7 @@ export class LifecycleManager extends EventEmitter {
     if (isTerminalJobState(job.state)) return this.snapshot(jobId);
 
     job.cancelRequested = true;
+    job.execution.phase = 'cancelling';
     const runtime = this.runtimeHandles.get(jobId);
     job.cancellationVerified = runtime?.cancellationVerified ?? true;
     this.touch(job, 'Cancellation requested.', 'system', 'immediate');
@@ -424,13 +791,33 @@ export class LifecycleManager extends EventEmitter {
         'SSH target requires hostKeySha256, or allowUnverifiedHostKey=true for an explicit insecure override'
       );
     }
+    const normalizedFingerprint = target.hostKeySha256
+      ? normalizeSshSha256Fingerprint(target.hostKeySha256)
+      : undefined;
+    if (
+      normalizedFingerprint &&
+      !/^[A-Za-z0-9+/]{43}$/.test(normalizedFingerprint)
+    ) {
+      throw new Error('SSH hostKeySha256 must be a SHA-256 SSH fingerprint');
+    }
     return {
       kind: 'ssh',
       host: target.host,
       port: target.port ?? 22,
       username: target.username,
       verifiedHostKey: Boolean(target.hostKeySha256),
+      hostKeySha256: normalizedFingerprint
+        ? `SHA256:${normalizedFingerprint}`
+        : undefined,
+      hostKeyAlgorithm: target.hostKeyAlgorithm,
+      runnerPath: target.runnerPath,
     };
+  }
+
+  private auditTarget(target: PublicJobTarget): string {
+    return target.kind === 'ssh'
+      ? `${target.username ?? ''}@${target.host ?? ''}:${target.port ?? 22}`
+      : 'local';
   }
 
   private scheduleDrain(): void {
@@ -451,6 +838,23 @@ export class LifecycleManager extends EventEmitter {
       const job = this.jobs.get(jobId);
       const input = this.pendingInputs.get(jobId);
       if (!job || !input || job.cancelRequested) continue;
+      if (
+        job.policy.approval === 'approved' &&
+        job.policy.grantExpiresAt &&
+        Date.parse(job.policy.grantExpiresAt) <= Date.now()
+      ) {
+        job.policy.approval = 'expired';
+        this.pendingInputs.delete(jobId);
+        this.auditLog.append({
+          action: 'approval',
+          outcome: 'expired',
+          jobId,
+          target: this.auditTarget(job.target),
+          risk: job.policy.risk,
+        });
+        this.finish(job, 'failed', 'APPROVAL_REQUIRED: approval grant expired');
+        continue;
+      }
       this.activeJobs.add(jobId);
       this.pendingInputs.delete(jobId);
       void this.run(job, input).finally(() => {
@@ -463,35 +867,19 @@ export class LifecycleManager extends EventEmitter {
 
   private async run(job: JobRecord, input: StartJobInput): Promise<void> {
     job.state = 'running';
+    job.execution.phase =
+      input.target?.kind === 'ssh' ? 'connecting' : 'executing';
+    job.execution.connectionState =
+      input.target?.kind === 'ssh' ? 'connecting' : 'not_applicable';
     job.startedAt = new Date().toISOString();
     this.touch(job, 'Job started.', 'system', 'immediate');
 
     try {
       const result =
         (input.target?.kind ?? 'local') === 'ssh'
-          ? await this.runSsh(job, input)
+          ? await this.runSshJob(job, input)
           : await this.runLocal(job, input);
-
-      this.flushProgress(job, input);
-      job.exitCode = result.exitCode;
-      job.signal = result.signal;
-      if (job.cancelRequested) {
-        this.finish(
-          job,
-          'cancelled',
-          job.cancellationVerified === false
-            ? 'The SSH channel was closed, but remote process termination could not be verified.'
-            : undefined
-        );
-      } else if (result.timedOut)
-        this.finish(job, 'timed_out', 'Job timed out.');
-      else if (result.exitCode === 0) this.finish(job, 'succeeded');
-      else
-        this.finish(
-          job,
-          'failed',
-          `Process exited with code ${result.exitCode}.`
-        );
+      this.completeExecution(job, input, result);
     } catch (error) {
       this.flushProgress(job, input);
       if (job.cancelRequested) {
@@ -502,8 +890,393 @@ export class LifecycleManager extends EventEmitter {
             ? 'The SSH channel was closed, but remote process termination could not be verified.'
             : undefined
         );
+      } else if (
+        error instanceof RunnerTransportError &&
+        error.code === 'REMOTE_STATE_LOST'
+      ) {
+        this.finish(job, 'lost', error.message);
       } else this.finish(job, 'failed', safeErrorMessage(error));
     }
+  }
+
+  private completeExecution(
+    job: JobRecord,
+    input: StartJobInput,
+    result: ExecutionResult
+  ): void {
+    this.flushProgress(job, input);
+    job.exitCode = result.exitCode;
+    job.signal = result.signal;
+    if (typeof result.cancellationVerified === 'boolean') {
+      job.cancellationVerified = result.cancellationVerified;
+    }
+    if (job.cancelRequested) {
+      this.finish(
+        job,
+        'cancelled',
+        job.cancellationVerified === false
+          ? 'The SSH channel was closed, but remote process termination could not be verified.'
+          : undefined
+      );
+    } else if (result.terminalState === 'lost') {
+      this.finish(job, 'lost', 'REMOTE_STATE_LOST');
+    } else if (result.timedOut || result.terminalState === 'timed_out') {
+      this.finish(job, 'timed_out', 'Job timed out.');
+    } else if (result.terminalState === 'cancelled') {
+      this.finish(job, 'cancelled');
+    } else if (result.exitCode === 0) {
+      this.finish(job, 'succeeded');
+    } else {
+      this.finish(
+        job,
+        'failed',
+        `Process exited with code ${result.exitCode}.`
+      );
+    }
+  }
+
+  private async runSshJob(
+    job: JobRecord,
+    input: StartJobInput
+  ): Promise<ExecutionResult> {
+    const mode = input.executionMode ?? 'auto';
+    if (mode === 'direct') return this.runSsh(job, input);
+    try {
+      return await this.runRunner(job, input);
+    } catch (error) {
+      const runnerUnavailable =
+        error instanceof RunnerTransportError &&
+        (error.code === 'RUNNER_UNAVAILABLE' ||
+          error.code === 'RUNNER_NOT_INSTALLED') &&
+        !error.ambiguous;
+      if (mode !== 'auto' || input.requireDurable || !runnerUnavailable) {
+        throw error;
+      }
+      job.execution = {
+        backend: 'ssh_direct',
+        phase: 'connecting',
+        connectionState: 'connecting',
+        durable: false,
+        resumable: false,
+        reconnectCount: job.execution.reconnectCount,
+        lastEventSequence: 0,
+      };
+      this.append(
+        job,
+        'system',
+        'Runner unavailable before submission; using non-durable direct SSH.\n',
+        input
+      );
+      return this.runSsh(job, input);
+    }
+  }
+
+  private async runRunner(
+    job: JobRecord,
+    input: StartJobInput
+  ): Promise<ExecutionResult> {
+    const target = input.target;
+    if (!target || target.kind !== 'ssh') {
+      throw new RunnerTransportError(
+        'RUNNER_UNAVAILABLE',
+        'Runner execution requires an SSH target'
+      );
+    }
+    const transport = this.runnerTransportFactory(target);
+    let ping: { version?: string };
+    try {
+      ping = await transport.call<{ version?: string }>('ping', {}, 20_000);
+    } catch (error) {
+      if (error instanceof RunnerTransportError) throw error;
+      throw new RunnerTransportError(
+        'RUNNER_UNAVAILABLE',
+        `RUNNER_UNAVAILABLE: ${safeErrorMessage(error)}`
+      );
+    }
+
+    job.execution.phase = 'submitting';
+    job.execution.connectionState = 'connected';
+    job.execution.runnerVersion = ping.version?.slice(0, 64);
+    this.changed(job);
+
+    const runnerCommand = commandForAdapter(input);
+    const commandDigest = `sha256:${createHash('sha256')
+      .update(runnerCommand)
+      .digest('hex')}`;
+    const submitParams = {
+      jobId: job.id,
+      idempotencyKey: input.idempotencyKey ?? job.id,
+      commandDigest,
+      command: runnerCommand,
+      cwd: input.cwd,
+      env: input.env,
+      timeoutMillis: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      outputPolicy: job.outputPolicy,
+    };
+    let submit: { job: RunnerJobPayload; created?: boolean } | undefined;
+    let lastSubmitError: unknown;
+    for (let attempt = 1; attempt <= this.sshHandshakeAttempts; attempt += 1) {
+      try {
+        submit = await transport.call<{
+          job: RunnerJobPayload;
+          created?: boolean;
+        }>('submit', submitParams, 35_000);
+        break;
+      } catch (error) {
+        lastSubmitError = error;
+        if (
+          !(error instanceof RunnerTransportError) ||
+          error.code === 'IDEMPOTENCY_CONFLICT'
+        ) {
+          throw error;
+        }
+        if (attempt < this.sshHandshakeAttempts) {
+          await this.runnerRetryDelay(attempt);
+        }
+      }
+    }
+    if (!submit?.job) {
+      throw new RunnerTransportError(
+        'REMOTE_STATE_LOST',
+        `REMOTE_STATE_LOST: Runner submission acknowledgement was not recovered (${safeErrorMessage(
+          lastSubmitError
+        )})`,
+        true
+      );
+    }
+
+    job.execution.backend = 'ssh_runner';
+    job.execution.durable = true;
+    job.execution.resumable = Boolean(job.credentialProfileId);
+    job.execution.remoteJobId = submit.job.id;
+    job.execution.phase = 'executing';
+    job.execution.connectionState = 'connected';
+    // A retried submit may return a job that already produced output. Always
+    // attach from sequence zero so retained events are not skipped after an
+    // acknowledgement was lost.
+    job.execution.lastEventSequence = 0;
+    job.timing = {
+      ...job.timing,
+      runnerAcceptedAt: new Date().toISOString(),
+      sshReadyAt: job.timing?.sshReadyAt ?? new Date().toISOString(),
+      commandStartedAt:
+        job.timing?.commandStartedAt ?? new Date().toISOString(),
+    };
+    this.changed(job);
+
+    const deadline =
+      Date.now() + (input.timeoutMs ?? DEFAULT_TIMEOUT_MS) + 60_000;
+    return this.watchRunnerJob(job, input, transport, submit.job, deadline);
+  }
+
+  private async watchRunnerJob(
+    job: JobRecord,
+    input: StartJobInput,
+    transport: RunnerRPCClient,
+    initialRemoteJob: RunnerJobPayload,
+    deadline: number
+  ): Promise<ExecutionResult> {
+    const remoteJobId = initialRemoteJob.id;
+    let cancelling = false;
+    const runtimeHandle: RuntimeHandle = {
+      cancellationVerified: false,
+      cancel: () => {
+        if (cancelling) return;
+        cancelling = true;
+        job.execution.phase = 'cancelling';
+        this.changed(job);
+        void transport
+          .call<{ job: RunnerJobPayload }>(
+            'cancel',
+            { jobId: remoteJobId },
+            15_000
+          )
+          .then((result) => {
+            job.cancellationVerified = result.job.cancellationVerified === true;
+            this.changed(job);
+          })
+          .catch((error) => {
+            this.append(
+              job,
+              'system',
+              `Runner cancellation could not be verified: ${safeErrorMessage(
+                error
+              )}\n`,
+              input
+            );
+          });
+      },
+    };
+    this.runtimeHandles.set(job.id, runtimeHandle);
+    if (job.cancelRequested) runtimeHandle.cancel();
+
+    let remoteJob = initialRemoteJob;
+    while (!isTerminalJobState(remoteJob.state)) {
+      try {
+        const watched = await transport.call<{
+          job: RunnerJobPayload;
+          events?: RunnerEventPayload[];
+          truncated?: boolean;
+          timedOut?: boolean;
+        }>(
+          'watch',
+          {
+            jobId: remoteJobId,
+            afterSequence: job.execution.lastEventSequence,
+            timeoutMillis: 25_000,
+          },
+          40_000
+        );
+        job.execution.connectionState = 'connected';
+        job.execution.phase = job.cancelRequested ? 'cancelling' : 'executing';
+        if (watched.truncated) {
+          job.outputTruncated = true;
+          this.append(
+            job,
+            'system',
+            'Runner output retention omitted older events.\n',
+            input
+          );
+        }
+        for (const event of watched.events ?? []) {
+          if (!Number.isFinite(event.sequence)) continue;
+          job.execution.lastEventSequence = Math.max(
+            job.execution.lastEventSequence,
+            Number(event.sequence)
+          );
+          if (
+            event.type === 'output' &&
+            event.data &&
+            (event.stream === 'stdout' || event.stream === 'stderr')
+          ) {
+            this.append(job, event.stream, event.data, input);
+          }
+        }
+        remoteJob = watched.job;
+        job.execution.lastEventSequence = Math.max(
+          job.execution.lastEventSequence,
+          Number(remoteJob.lastEventSequence ?? 0)
+        );
+        if (!watched.timedOut) this.changed(job);
+      } catch (error) {
+        if (
+          error instanceof RunnerTransportError &&
+          error.code === 'IDEMPOTENCY_CONFLICT'
+        ) {
+          throw error;
+        }
+        if (Date.now() >= deadline) {
+          throw new RunnerTransportError(
+            'REMOTE_STATE_LOST',
+            'REMOTE_STATE_LOST: Runner could not be reattached before the recovery deadline',
+            true
+          );
+        }
+        job.execution.phase = 'reconnecting';
+        job.execution.connectionState = 'reconnecting';
+        job.execution.reconnectCount += 1;
+        job.timing = {
+          ...job.timing,
+          disconnectedAt: new Date().toISOString(),
+        };
+        this.changed(job);
+        await this.runnerRetryDelay(job.execution.reconnectCount);
+      }
+    }
+
+    job.execution.phase = 'finalizing';
+    job.execution.connectionState = 'connected';
+    job.timing = {
+      ...job.timing,
+      recoveredAt:
+        job.execution.reconnectCount > 0
+          ? new Date().toISOString()
+          : job.timing?.recoveredAt,
+    };
+    this.changed(job);
+    return {
+      exitCode: remoteJob.exitCode ?? null,
+      signal: remoteJob.signal,
+      timedOut: remoteJob.state === 'timed_out',
+      terminalState: remoteJob.state,
+      cancellationVerified: remoteJob.cancellationVerified,
+    };
+  }
+
+  private async recoverRunnerJob(job: JobRecord): Promise<void> {
+    const profileId = job.credentialProfileId;
+    const remoteJobId = job.execution.remoteJobId;
+    if (!profileId || !remoteJobId || !this.recoverRunnerTarget) return;
+    this.activeJobs.add(job.id);
+    const input: StartJobInput = {
+      command: '[durable runner recovery]',
+      target: { kind: 'local' },
+      adapter: job.adapter,
+      outputPolicy: job.outputPolicy,
+      progressPattern: job.progressPattern,
+      credentialProfileId: profileId,
+    };
+    try {
+      const recoveryDeadline = Date.now() + DEFAULT_TIMEOUT_MS;
+      let transport: RunnerRPCClient | undefined;
+      let remote: { job: RunnerJobPayload } | undefined;
+      let ping: { version?: string } | undefined;
+      while (!transport || !remote || !ping) {
+        try {
+          const target = await this.recoverRunnerTarget(profileId);
+          input.target = target;
+          const candidate = this.runnerTransportFactory(target);
+          ping = await candidate.call<{ version?: string }>('ping', {}, 20_000);
+          remote = await candidate.call<{ job: RunnerJobPayload }>(
+            'get',
+            { jobId: remoteJobId },
+            20_000
+          );
+          transport = candidate;
+        } catch (error) {
+          if (Date.now() >= recoveryDeadline) throw error;
+          job.execution.phase = 'reconnecting';
+          job.execution.connectionState = 'reconnecting';
+          job.execution.reconnectCount += 1;
+          this.changed(job);
+          await this.runnerRetryDelay(job.execution.reconnectCount);
+        }
+      }
+      job.execution.runnerVersion = ping.version?.slice(0, 64);
+      job.execution.connectionState = 'connected';
+      job.execution.phase = 'executing';
+      job.timing = {
+        ...job.timing,
+        recoveredAt: new Date().toISOString(),
+      };
+      this.changed(job);
+      const result = await this.watchRunnerJob(
+        job,
+        input,
+        transport,
+        remote.job,
+        recoveryDeadline
+      );
+      this.completeExecution(job, input, result);
+    } catch (error) {
+      this.flushProgress(job, input);
+      this.finish(job, 'lost', `REMOTE_STATE_LOST: ${safeErrorMessage(error)}`);
+    } finally {
+      this.activeJobs.delete(job.id);
+      this.runtimeHandles.delete(job.id);
+      this.scheduleDrain();
+    }
+  }
+
+  private runnerRetryDelay(attempt: number): Promise<void> {
+    const delayMs = Math.min(
+      5_000,
+      this.sshRetryBaseDelayMs * 2 ** Math.min(5, Math.max(0, attempt - 1))
+    );
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, delayMs);
+      timer.unref?.();
+    });
   }
 
   private runLocal(
@@ -699,7 +1472,14 @@ export class LifecycleManager extends EventEmitter {
               (rejectedHostKeyAlgorithms.length === 0 ||
                 !addedHostKeyAlgorithm))
           ) {
-            settle(undefined, error);
+            settle(
+              undefined,
+              hostKeyRejected
+                ? new Error(
+                    'HOST_KEY_MISMATCH: SSH host key did not match the pinned SHA-256 fingerprint'
+                  )
+                : error
+            );
             return;
           }
 
@@ -710,6 +1490,8 @@ export class LifecycleManager extends EventEmitter {
           if (settled || currentClient !== client) return;
           ready = true;
           const readyAt = new Date().toISOString();
+          job.execution.phase = 'executing';
+          job.execution.connectionState = 'connected';
           job.timing = {
             ...job.timing,
             sshReadyAt: readyAt,
@@ -772,6 +1554,15 @@ export class LifecycleManager extends EventEmitter {
             serverHostKey: SSH_SERVER_HOST_KEY_ALGORITHMS.filter(
               (algorithm) => !excludedHostKeyAlgorithms.has(algorithm)
             ),
+          };
+        } else if (
+          target.hostKeyAlgorithm &&
+          SSH_SERVER_HOST_KEY_ALGORITHMS.includes(
+            target.hostKeyAlgorithm as ServerHostKeyAlgorithm
+          )
+        ) {
+          attemptConfig.algorithms = {
+            serverHostKey: [target.hostKeyAlgorithm as ServerHostKeyAlgorithm],
           };
         }
         try {
@@ -862,8 +1653,42 @@ export class LifecycleManager extends EventEmitter {
     let percentage: number | undefined;
     let phase: string | undefined;
     let message: string | undefined;
+    let structuredEvent = false;
+    let metrics: JobRecord['progress'] extends infer P
+      ? P extends { metrics?: infer M }
+        ? M
+        : never
+      : never;
     try {
       const boundedData = data.slice(-MAX_PROGRESS_LINE_LENGTH);
+      const structuredPrefix = 'RUNBEACON_EVENT ';
+      const structuredIndex = boundedData.indexOf(structuredPrefix);
+      if (structuredIndex >= 0) {
+        structuredEvent = true;
+        const event = JSON.parse(
+          boundedData.slice(structuredIndex + structuredPrefix.length)
+        ) as Record<string, unknown>;
+        const parsed = Number(event.percentage);
+        if (Number.isFinite(parsed)) percentage = parsed;
+        if (typeof event.phase === 'string') phase = event.phase.slice(0, 64);
+        if (typeof event.message === 'string') {
+          message = event.message.slice(0, 240);
+        }
+        if (job.adapter === 'training') {
+          metrics = {};
+          for (const key of ['epoch', 'step', 'loss', 'etaSeconds'] as const) {
+            const value = Number(event[key]);
+            if (Number.isFinite(value)) metrics[key] = value;
+          }
+          if (typeof event.checkpoint === 'string') {
+            metrics.checkpoint = event.checkpoint.slice(0, 240);
+          }
+          if (typeof event.gpu === 'string') {
+            metrics.gpu = event.gpu.slice(0, 240);
+          }
+          if (Object.keys(metrics).length === 0) metrics = undefined;
+        }
+      }
       if (input.progressPattern) {
         const compiled = this.progressPatterns.get(job.id);
         if (!compiled) return;
@@ -879,7 +1704,7 @@ export class LifecycleManager extends EventEmitter {
           if (Number.isFinite(parsed)) percentage = parsed;
           message = matchedText.slice(0, 240);
         }
-      } else {
+      } else if (!structuredEvent) {
         const matches = Array.from(
           boundedData.matchAll(/(?:^|\s)(\d{1,3}(?:\.\d+)?)\s*%/g)
         );
@@ -890,7 +1715,7 @@ export class LifecycleManager extends EventEmitter {
         }
       }
       const phaseMatch = /\[([A-Za-z][A-Za-z0-9_-]{0,63})\]/.exec(boundedData);
-      if (phaseMatch) phase = phaseMatch[1];
+      if (!phase && phaseMatch) phase = phaseMatch[1];
     } catch {
       // A malformed optional progress pattern must not interrupt the job.
     }
@@ -899,6 +1724,7 @@ export class LifecycleManager extends EventEmitter {
       percentage: Math.max(0, Math.min(100, percentage)),
       phase,
       message,
+      metrics,
       updatedAt: new Date().toISOString(),
     };
     job.lastProgressAt = job.progress.updatedAt;
@@ -923,6 +1749,9 @@ export class LifecycleManager extends EventEmitter {
   private finish(job: JobRecord, state: JobState, error?: string): void {
     if (isTerminalJobState(job.state)) return;
     job.state = state;
+    job.execution.phase = 'finished';
+    job.execution.connectionState =
+      job.execution.backend === 'local' ? 'not_applicable' : 'disconnected';
     job.error = error;
     job.finishedAt = new Date().toISOString();
     const terminalMessage =
@@ -932,6 +1761,39 @@ export class LifecycleManager extends EventEmitter {
           ? 'Job cancelled.'
           : error || `Job finished with state ${state}.`;
     this.touch(job, terminalMessage, 'system', 'immediate');
+    try {
+      this.auditLog.append({
+        action: 'job_terminal',
+        outcome: state,
+        jobId: job.id,
+        target: this.auditTarget(job.target),
+        risk: job.policy.risk,
+      });
+    } catch (auditError) {
+      this.emit('auditError', safeErrorMessage(auditError));
+    }
+    if (job.eventSubscriptions?.length) {
+      void this.eventSubscriptions
+        .dispatch(job.eventSubscriptions, {
+          event: 'job_terminal',
+          jobId: job.id,
+          state,
+          finishedAt: job.finishedAt,
+        })
+        .then((results) => {
+          for (const result of results) {
+            this.auditLog.append({
+              action: 'event_delivery',
+              outcome: result.delivered ? 'delivered' : 'failed',
+              jobId: job.id,
+              target: result.id,
+            });
+          }
+        })
+        .catch((deliveryError) => {
+          this.emit('eventDeliveryError', safeErrorMessage(deliveryError));
+        });
+    }
     this.progressPatterns.delete(job.id);
   }
 
@@ -940,6 +1802,20 @@ export class LifecycleManager extends EventEmitter {
     job.updatedAt = new Date().toISOString();
     this.schedulePersist();
     this.emit('jobChanged', job);
+    const changeWaiters = this.changeWaiters.get(job.id);
+    if (changeWaiters) {
+      for (const waiter of Array.from(changeWaiters.values())) {
+        if (job.version <= waiter.afterVersion) continue;
+        clearTimeout(waiter.timer);
+        waiter.signal?.removeEventListener('abort', waiter.abortListener!);
+        changeWaiters.delete(waiter.id);
+        waiter.resolve({
+          changed: true,
+          job: this.snapshot(job.id, waiter.tailLines),
+        });
+      }
+      if (changeWaiters.size === 0) this.changeWaiters.delete(job.id);
+    }
     if (isTerminalJobState(job.state)) {
       const coordinator = this.waitCoordinators.get(job.id);
       if (coordinator) this.resolveCoordinator(coordinator, false);
@@ -1109,6 +1985,25 @@ export class LifecycleManager extends EventEmitter {
 
   private assertNotDisposed(): void {
     if (this.disposed) throw new Error('LifecycleManager was disposed');
+  }
+
+  private normalizeOutputPolicy(
+    input: StartJobInput
+  ): Required<NonNullable<StartJobInput['outputPolicy']>> {
+    const mode = input.outputPolicy?.mode ?? 'tail';
+    const maxBytes = boundedInteger(
+      input.outputPolicy?.maxBytes,
+      64 * 1024 * 1024,
+      64 * 1024,
+      1024 * 1024 * 1024
+    );
+    const retentionHours = boundedInteger(
+      input.outputPolicy?.retentionHours,
+      7 * 24,
+      1,
+      90 * 24
+    );
+    return { mode, maxBytes, retentionHours };
   }
 
   private boundOutputChunk(data: string): {

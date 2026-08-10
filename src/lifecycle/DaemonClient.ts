@@ -13,12 +13,23 @@ import {
   ensureDaemonToken,
   getDaemonPaths,
 } from './DaemonPaths.js';
-import { JobSnapshot, StartJobInput, WaitResult } from './types.js';
+import {
+  JobSnapshot,
+  StartJobInput,
+  WaitResult,
+  WatchResult,
+} from './types.js';
 import {
   DAEMON_PROTOCOL_VERSION,
   DaemonPing,
   RUNBEACON_VERSION,
 } from './protocol.js';
+import { AuditEvent, AuditQuery } from './AuditLog.js';
+import { PolicyConfig, PolicyUpdate } from './PolicyEngine.js';
+import {
+  EventSubscription,
+  SaveEventSubscription,
+} from './EventSubscriptionStore.js';
 
 interface RpcRequest {
   id: string;
@@ -41,6 +52,13 @@ export interface LifecycleService {
     tailLines?: number,
     signal?: AbortSignal
   ): Promise<WaitResult>;
+  watchForChange(
+    jobId: string,
+    afterVersion: number,
+    timeoutMs?: number,
+    tailLines?: number,
+    signal?: AbortSignal
+  ): Promise<WatchResult>;
   snapshot(
     jobId: string,
     tailLines?: number
@@ -50,6 +68,18 @@ export interface LifecycleService {
     limit?: number
   ): Promise<JobSnapshot[]> | JobSnapshot[];
   cancel(jobId: string): Promise<JobSnapshot> | JobSnapshot;
+  approve(jobId: string): Promise<JobSnapshot> | JobSnapshot;
+  rejectApproval(jobId: string): Promise<JobSnapshot> | JobSnapshot;
+  policyConfig(): Promise<PolicyConfig> | PolicyConfig;
+  updatePolicy(input: PolicyUpdate): Promise<PolicyConfig> | PolicyConfig;
+  queryAudit(query?: AuditQuery): Promise<AuditEvent[]> | AuditEvent[];
+  listEventSubscriptions(): Promise<EventSubscription[]> | EventSubscription[];
+  saveEventSubscription(
+    input: SaveEventSubscription
+  ): Promise<EventSubscription> | EventSubscription;
+  deleteEventSubscription(
+    id: string
+  ): Promise<EventSubscription> | EventSubscription;
 }
 
 export interface DaemonClientOptions {
@@ -104,7 +134,7 @@ export class DaemonClient implements LifecycleService {
         env: {
           ...process.env,
           MCP_SERVER_MODE: 'true',
-          RJM_BUILD_VERSION: this.expectedBuildVersion,
+          RUNBEACON_BUILD_VERSION: this.expectedBuildVersion,
         },
       }
     );
@@ -143,6 +173,22 @@ export class DaemonClient implements LifecycleService {
     );
   }
 
+  watchForChange(
+    jobId: string,
+    afterVersion: number,
+    timeoutMs?: number,
+    tailLines?: number,
+    signal?: AbortSignal
+  ): Promise<WatchResult> {
+    const requestTimeout = Math.max(5_000, (timeoutMs ?? 25_000) + 5_000);
+    return this.request(
+      'watch',
+      { jobId, afterVersion, timeoutMs, tailLines },
+      requestTimeout,
+      signal
+    );
+  }
+
   snapshot(jobId: string, tailLines?: number): Promise<JobSnapshot> {
     return this.request('snapshot', { jobId, tailLines });
   }
@@ -153,6 +199,40 @@ export class DaemonClient implements LifecycleService {
 
   cancel(jobId: string): Promise<JobSnapshot> {
     return this.request('cancel', { jobId });
+  }
+
+  approve(jobId: string): Promise<JobSnapshot> {
+    return this.request('approval', { jobId, decision: 'approve' });
+  }
+
+  rejectApproval(jobId: string): Promise<JobSnapshot> {
+    return this.request('approval', { jobId, decision: 'reject' });
+  }
+
+  policyConfig(): Promise<PolicyConfig> {
+    return this.request('policy', { action: 'get' });
+  }
+
+  updatePolicy(input: PolicyUpdate): Promise<PolicyConfig> {
+    return this.request('policy', { action: 'update', input });
+  }
+
+  queryAudit(query: AuditQuery = {}): Promise<AuditEvent[]> {
+    return this.request('audit', { query });
+  }
+
+  listEventSubscriptions(): Promise<EventSubscription[]> {
+    return this.request('event_subscription', { action: 'list' });
+  }
+
+  saveEventSubscription(
+    input: SaveEventSubscription
+  ): Promise<EventSubscription> {
+    return this.request('event_subscription', { action: 'save', input });
+  }
+
+  deleteEventSubscription(id: string): Promise<EventSubscription> {
+    return this.request('event_subscription', { action: 'delete', id });
   }
 
   shutdown(): Promise<{ stopped: boolean }> {

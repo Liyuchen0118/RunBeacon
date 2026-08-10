@@ -1,4 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -7,9 +13,14 @@ import { EventEmitter } from 'node:events';
 import { Script } from 'node:vm';
 import type { Client, ClientChannel, ConnectConfig } from 'ssh2';
 import { LifecycleManager } from '../lifecycle/LifecycleManager.js';
+import {
+  RunnerRPCClient,
+  RunnerTransportError,
+} from '../lifecycle/RunnerTransport.js';
 import { createDashboardHtml } from '../lifecycle/DashboardApp.js';
 import { compareBuildVersions } from '../lifecycle/BuildIdentity.js';
 import { redactCommand } from '../lifecycle/security.js';
+import { commandForAdapter } from '../lifecycle/Adapters.js';
 
 type FakeSshClient = EventEmitter & {
   connect: (config: ConnectConfig) => FakeSshClient;
@@ -493,6 +504,99 @@ describe('LifecycleManager', () => {
     expect(manager.list()).toEqual([]);
   });
 
+  test('backs up a v1 snapshot before migrating it to store v2', () => {
+    const savedAt = new Date().toISOString();
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        savedAt,
+        jobs: [
+          {
+            id: 'legacy-terminal-job',
+            label: 'legacy',
+            displayCommand: 'echo migrated',
+            target: { kind: 'local' },
+            state: 'succeeded',
+            createdAt: savedAt,
+            updatedAt: savedAt,
+            version: 1,
+            output: [],
+            outputBytes: 0,
+            outputLines: 0,
+            outputTruncated: false,
+          },
+        ],
+      })
+    );
+
+    const manager = new LifecycleManager({ statePath });
+
+    const backupPath = `${statePath}.v1.backup.json`;
+    expect(existsSync(backupPath)).toBe(true);
+    expect(JSON.parse(readFileSync(backupPath, 'utf8')).version).toBe(1);
+    expect(JSON.parse(readFileSync(statePath, 'utf8')).version).toBe(2);
+    expect(manager.snapshot('legacy-terminal-job').state).toBe('succeeded');
+  });
+
+  test('recovers a corrupt snapshot from the checked append-only journal', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const started = manager.start({
+      command: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+      shell: false,
+      label: 'journal-recovery',
+    });
+    await manager.waitForTerminal(started.id, 5_000);
+    manager.dispose();
+    writeFileSync(statePath, '{corrupt snapshot');
+
+    const recovered = new LifecycleManager({ statePath });
+
+    expect(recovered.snapshot(started.id).state).toBe('succeeded');
+  });
+
+  test('ignores an incomplete journal tail without losing valid records', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const started = manager.start({
+      command: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+      shell: false,
+      label: 'journal-tail',
+    });
+    await manager.waitForTerminal(started.id, 5_000);
+    manager.dispose();
+    writeFileSync(`${statePath}.events.jsonl`, '{incomplete', { flag: 'a' });
+    writeFileSync(statePath, '{corrupt snapshot');
+
+    const recovered = new LifecycleManager({ statePath });
+
+    expect(recovered.snapshot(started.id).state).toBe('succeeded');
+  });
+
+  test('replays journal deletions when recovering without a snapshot', async () => {
+    const manager = new LifecycleManager({
+      statePath,
+      maxRetainedJobs: 1,
+    });
+    for (const label of ['deleted-history', 'retained-history']) {
+      const started = manager.start({
+        command: process.execPath,
+        args: ['-e', 'process.exit(0)'],
+        shell: false,
+        label,
+      });
+      await manager.waitForTerminal(started.id, 5_000);
+    }
+    manager.dispose();
+    writeFileSync(statePath, '{corrupt snapshot');
+
+    const recovered = new LifecycleManager({ statePath });
+
+    expect(recovered.list(0, 100)).toHaveLength(1);
+    expect(recovered.list(0, 100)[0].label).toBe('retained-history');
+  });
+
   test('requires SSH host verification unless explicitly overridden', () => {
     const manager = new LifecycleManager({ statePath });
     expect(() =>
@@ -517,6 +621,7 @@ describe('LifecycleManager', () => {
     const password = 'RJM_INLINE_PASSWORD_MUST_NOT_PERSIST';
     const started = manager.start({
       command: 'echo hello',
+      executionMode: 'direct',
       timeoutMs: 500,
       target: {
         kind: 'ssh',
@@ -530,9 +635,15 @@ describe('LifecycleManager', () => {
 
     expect(JSON.stringify(started)).not.toContain(password);
     expect(readFileSync(statePath, 'utf8')).not.toContain(password);
+    expect(readFileSync(`${statePath}.events.jsonl`, 'utf8')).not.toContain(
+      password
+    );
     const completed = await manager.waitForTerminal(started.id, 5_000);
     expect(completed.job.state).toBe('failed');
     expect(readFileSync(statePath, 'utf8')).not.toContain(password);
+    expect(readFileSync(`${statePath}.events.jsonl`, 'utf8')).not.toContain(
+      password
+    );
   });
 
   test('accepts an unpadded OpenSSH SHA256 host fingerprint', async () => {
@@ -559,6 +670,7 @@ describe('LifecycleManager', () => {
     });
     const started = manager.start({
       command: 'run-training',
+      executionMode: 'direct',
       target: {
         kind: 'ssh',
         host: 'example.test',
@@ -623,6 +735,7 @@ describe('LifecycleManager', () => {
     });
     const started = manager.start({
       command: 'run-training',
+      executionMode: 'direct',
       target: {
         kind: 'ssh',
         host: 'example.test',
@@ -672,6 +785,7 @@ describe('LifecycleManager', () => {
     });
     const started = manager.start({
       command: 'run-training',
+      executionMode: 'direct',
       target: {
         kind: 'ssh',
         host: 'example.test',
@@ -710,6 +824,7 @@ describe('LifecycleManager', () => {
     });
     const first = manager.start({
       command: 'run-training',
+      executionMode: 'direct',
       target: {
         kind: 'ssh',
         host: 'example.test',
@@ -721,6 +836,7 @@ describe('LifecycleManager', () => {
 
     const second = manager.start({
       command: 'run-training',
+      executionMode: 'direct',
       timeoutMs: 2_000,
       target: {
         kind: 'ssh',
@@ -748,6 +864,7 @@ describe('LifecycleManager', () => {
     });
     const defaultTimeout = defaultManager.start({
       command: 'run-training',
+      executionMode: 'direct',
       target: {
         kind: 'ssh',
         host: 'example.test',
@@ -784,6 +901,7 @@ describe('LifecycleManager', () => {
     });
     const started = manager.start({
       command: 'run-training',
+      executionMode: 'direct',
       target: {
         kind: 'ssh',
         host: 'example.test',
@@ -818,6 +936,7 @@ describe('LifecycleManager', () => {
     });
     const started = manager.start({
       command: 'run-training',
+      executionMode: 'direct',
       target: {
         kind: 'ssh',
         host: 'example.test',
@@ -832,6 +951,521 @@ describe('LifecycleManager', () => {
     expect(completed.job.error).toContain('exec response lost');
     expect(clientsCreated).toBe(1);
     expect(execCalls).toBe(1);
+  });
+
+  test('executes through the durable runner and consumes sequenced output events', async () => {
+    const call = jest.fn(
+      async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'ping') return { version: '3.0.0-alpha.1' };
+        if (method === 'submit') {
+          return {
+            created: true,
+            job: {
+              id: params!.jobId,
+              state: 'running',
+              lastEventSequence: 1,
+            },
+          };
+        }
+        if (method === 'watch') {
+          return {
+            timedOut: false,
+            events: [
+              {
+                sequence: 2,
+                type: 'output',
+                stream: 'stdout',
+                data: 'TRAIN_PROGRESS 100%\n',
+              },
+              { sequence: 3, type: 'state', state: 'succeeded' },
+            ],
+            job: {
+              id: params!.jobId,
+              state: 'succeeded',
+              exitCode: 0,
+              lastEventSequence: 3,
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      }
+    );
+    const manager = new LifecycleManager({
+      statePath,
+      runnerTransportFactory: () => ({ call }) as unknown as RunnerRPCClient,
+    });
+    const started = manager.start({
+      command: 'run-training',
+      credentialProfileId: 'training-host',
+      executionMode: 'runner',
+      requireDurable: true,
+      target: {
+        kind: 'ssh',
+        host: 'runner.example',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000, 50);
+
+    expect(completed.job.state).toBe('succeeded');
+    expect(completed.job.execution).toMatchObject({
+      backend: 'ssh_runner',
+      durable: true,
+      resumable: true,
+      runnerVersion: '3.0.0-alpha.1',
+      lastEventSequence: 3,
+    });
+    expect(completed.job.tail.map((chunk) => chunk.data).join('')).toContain(
+      'TRAIN_PROGRESS 100%'
+    );
+    expect(call.mock.calls.map(([method]) => method)).toEqual([
+      'ping',
+      'submit',
+      'watch',
+    ]);
+  });
+
+  test('reattaches a persisted Runner job after coordinator restart without resubmitting', async () => {
+    const originalWatch = new Promise<Record<string, unknown>>(() => undefined);
+    const firstCall = jest.fn(
+      async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'ping') return { version: '3.0.0' };
+        if (method === 'submit') {
+          return {
+            created: true,
+            job: {
+              id: params!.jobId,
+              state: 'running',
+              lastEventSequence: 1,
+            },
+          };
+        }
+        if (method === 'watch') return originalWatch;
+        throw new Error(`unexpected method ${method}`);
+      }
+    );
+    const first = new LifecycleManager({
+      statePath,
+      persistenceDebounceMs: 25,
+      runnerTransportFactory: () =>
+        ({ call: firstCall }) as unknown as RunnerRPCClient,
+    });
+    const started = first.start({
+      command: 'run-once-remotely',
+      credentialProfileId: 'durable-host',
+      executionMode: 'runner',
+      requireDurable: true,
+      target: {
+        kind: 'ssh',
+        host: 'runner.example',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (first.snapshot(started.id).execution.remoteJobId) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(first.snapshot(started.id).execution.remoteJobId).toBe(started.id);
+    first.dispose();
+
+    const recoveredCalls: string[] = [];
+    const recovered = new LifecycleManager({
+      statePath,
+      recoverRunnerTarget: async (profileId) => {
+        expect(profileId).toBe('durable-host');
+        return {
+          kind: 'ssh',
+          host: 'runner.example',
+          username: 'runner',
+          allowUnverifiedHostKey: true,
+        };
+      },
+      runnerTransportFactory: () =>
+        ({
+          call: async (method: string, params?: Record<string, unknown>) => {
+            recoveredCalls.push(method);
+            if (method === 'ping') return { version: '3.0.0' };
+            if (method === 'get') {
+              return {
+                job: {
+                  id: params!.jobId,
+                  state: 'running',
+                  lastEventSequence: 1,
+                },
+              };
+            }
+            if (method === 'watch') {
+              expect(params!.afterSequence).toBe(0);
+              return {
+                events: [
+                  {
+                    sequence: 2,
+                    type: 'output',
+                    stream: 'stdout',
+                    data: 'recovered output\n',
+                  },
+                  { sequence: 3, type: 'state', state: 'succeeded' },
+                ],
+                job: {
+                  id: params!.jobId,
+                  state: 'succeeded',
+                  exitCode: 0,
+                  lastEventSequence: 3,
+                },
+              };
+            }
+            throw new Error(`unexpected method ${method}`);
+          },
+        }) as RunnerRPCClient,
+    });
+
+    const completed = await recovered.waitForTerminal(started.id, 5_000);
+
+    expect(completed.job.state).toBe('succeeded');
+    expect(completed.job.execution.reconnectCount).toBeGreaterThan(0);
+    expect(completed.job.tail.map((chunk) => chunk.data).join('')).toContain(
+      'recovered output'
+    );
+    expect(recoveredCalls).toEqual(['ping', 'get', 'watch']);
+    expect(recoveredCalls).not.toContain('submit');
+  });
+
+  test('retries an ambiguous submit with the same idempotency key and digest', async () => {
+    const submits: Record<string, unknown>[] = [];
+    let submitAttempts = 0;
+    const call = jest.fn(
+      async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'ping') return { version: '3.0.0-alpha.1' };
+        if (method === 'submit') {
+          submits.push({ ...params });
+          submitAttempts += 1;
+          if (submitAttempts === 1) {
+            throw new RunnerTransportError(
+              'RUNNER_RESPONSE_LOST',
+              'response lost',
+              true
+            );
+          }
+          return {
+            created: false,
+            job: {
+              id: params!.jobId,
+              state: 'running',
+              lastEventSequence: 8,
+            },
+          };
+        }
+        if (method === 'watch') {
+          expect(params!.afterSequence).toBe(0);
+          return {
+            events: [],
+            job: {
+              id: params!.jobId,
+              state: 'succeeded',
+              exitCode: 0,
+              lastEventSequence: 8,
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      }
+    );
+    const manager = new LifecycleManager({
+      statePath,
+      sshRetryBaseDelayMs: 1,
+      runnerTransportFactory: () => ({ call }) as unknown as RunnerRPCClient,
+    });
+    const started = manager.start({
+      command: 'echo exactly-once',
+      idempotencyKey: 'exactly-once-key',
+      executionMode: 'runner',
+      target: {
+        kind: 'ssh',
+        host: 'runner.example',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000);
+
+    expect(completed.job.state).toBe('succeeded');
+    expect(submits).toHaveLength(2);
+    expect(submits[1].idempotencyKey).toBe(submits[0].idempotencyKey);
+    expect(submits[1].commandDigest).toBe(submits[0].commandDigest);
+    expect(submits[1].jobId).toBe(submits[0].jobId);
+  });
+
+  test('never falls back to direct SSH after runner submission becomes ambiguous', async () => {
+    const directExec = jest.fn();
+    const call = jest.fn(async (method: string) => {
+      if (method === 'ping') return { version: '3.0.0-alpha.1' };
+      throw new RunnerTransportError(
+        'RUNNER_RESPONSE_LOST',
+        'submit acknowledgement lost',
+        true
+      );
+    });
+    const manager = new LifecycleManager({
+      statePath,
+      sshRetryBaseDelayMs: 1,
+      runnerTransportFactory: () => ({ call }) as unknown as RunnerRPCClient,
+      sshClientFactory: () =>
+        createFakeSshClient(
+          (client) => setImmediate(() => client.emit('ready')),
+          (_client, _command, callback) => {
+            directExec();
+            const channel = createSuccessfulChannel();
+            callback(undefined, channel);
+            setImmediate(() => channel.emit('close', 0));
+          }
+        ),
+    });
+    const started = manager.start({
+      command: 'must-not-replay',
+      executionMode: 'auto',
+      target: {
+        kind: 'ssh',
+        host: 'runner.example',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000);
+
+    expect(completed.job.state).toBe('lost');
+    expect(completed.job.error).toContain('REMOTE_STATE_LOST');
+    expect(directExec).not.toHaveBeenCalled();
+    expect(
+      call.mock.calls.filter(([method]) => method === 'submit')
+    ).toHaveLength(5);
+  });
+
+  test('auto mode falls back only when the runner probe fails before submission', async () => {
+    let directExecCalls = 0;
+    const manager = new LifecycleManager({
+      statePath,
+      runnerTransportFactory: () =>
+        ({
+          call: jest.fn(async () => {
+            throw new RunnerTransportError(
+              'RUNNER_UNAVAILABLE',
+              'runner not installed'
+            );
+          }),
+        }) as unknown as RunnerRPCClient,
+      sshClientFactory: () =>
+        createFakeSshClient(
+          (client) => setImmediate(() => client.emit('ready')),
+          (_client, _command, callback) => {
+            directExecCalls += 1;
+            const channel = createSuccessfulChannel();
+            callback(undefined, channel);
+            setImmediate(() => channel.emit('close', 0));
+          }
+        ),
+    });
+    const started = manager.start({
+      command: 'safe-direct-fallback',
+      executionMode: 'auto',
+      target: {
+        kind: 'ssh',
+        host: 'runner.example',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000, 50);
+
+    expect(completed.job.state).toBe('succeeded');
+    expect(completed.job.execution.durable).toBe(false);
+    expect(completed.job.execution.backend).toBe('ssh_direct');
+    expect(directExecCalls).toBe(1);
+    expect(completed.job.tail.map((chunk) => chunk.data).join('')).toContain(
+      'using non-durable direct SSH'
+    );
+  });
+
+  test('reconnects runner watches from the last event sequence', async () => {
+    let watchAttempts = 0;
+    const call = jest.fn(
+      async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'ping') return { version: '3.0.0-alpha.1' };
+        if (method === 'submit') {
+          return {
+            job: {
+              id: params!.jobId,
+              state: 'running',
+              lastEventSequence: 1,
+            },
+          };
+        }
+        if (method === 'watch') {
+          watchAttempts += 1;
+          if (watchAttempts === 1) {
+            throw new RunnerTransportError(
+              'RUNNER_RESPONSE_LOST',
+              'temporary disconnect',
+              true
+            );
+          }
+          expect(params!.afterSequence).toBe(0);
+          return {
+            events: [{ sequence: 2, type: 'state', state: 'succeeded' }],
+            job: {
+              id: params!.jobId,
+              state: 'succeeded',
+              exitCode: 0,
+              lastEventSequence: 2,
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      }
+    );
+    const manager = new LifecycleManager({
+      statePath,
+      sshRetryBaseDelayMs: 1,
+      runnerTransportFactory: () => ({ call }) as unknown as RunnerRPCClient,
+    });
+    const started = manager.start({
+      command: 'resume-me',
+      executionMode: 'runner',
+      target: {
+        kind: 'ssh',
+        host: 'runner.example',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000);
+
+    expect(completed.job.state).toBe('succeeded');
+    expect(completed.job.execution.reconnectCount).toBe(1);
+    expect(completed.job.execution.lastEventSequence).toBe(2);
+  });
+
+  test('holds privileged work for a local approval bound to the job', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const started = manager.start({
+      command: process.execPath,
+      args: ['-e', 'process.exit(0)', 'sudo'],
+      shell: false,
+    });
+
+    expect(started.state).toBe('queued');
+    expect(started.execution.phase).toBe('awaiting_approval');
+    expect(started.policy).toMatchObject({
+      risk: 'privileged',
+      approval: 'pending',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(manager.snapshot(started.id).startedAt).toBeUndefined();
+
+    const approved = manager.approve(started.id);
+    expect(approved.policy.approval).toBe('approved');
+    expect(approved.policy.grantExpiresAt).toBeDefined();
+    const completed = await manager.waitForTerminal(started.id, 5_000);
+    expect(completed.job.state).toBe('succeeded');
+
+    const audit = manager.queryAudit({ jobId: started.id, limit: 10 });
+    expect(audit.map((event) => `${event.action}:${event.outcome}`)).toEqual(
+      expect.arrayContaining([
+        'job_start:awaiting_approval',
+        'approval:approved',
+        'job_terminal:succeeded',
+      ])
+    );
+    expect(JSON.stringify(audit)).not.toContain('process.exit');
+    expect(
+      audit.find((event) => event.action === 'job_start')?.commandDigest
+    ).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  test('rejects approval without executing the pending command', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const started = manager.start({
+      command: process.execPath,
+      args: [
+        '-e',
+        "require('node:fs').writeFileSync('must-not-exist','x')",
+        'sudo',
+      ],
+      shell: false,
+    });
+
+    const rejected = manager.rejectApproval(started.id);
+
+    expect(rejected.state).toBe('cancelled');
+    expect(rejected.policy.approval).toBe('rejected');
+    expect(rejected.startedAt).toBeUndefined();
+  });
+
+  test('normalizes structured training metrics without framework log scraping', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const event = JSON.stringify({
+      percentage: 50,
+      phase: 'training',
+      message: 'epoch complete',
+      epoch: 2,
+      step: 120,
+      loss: 0.125,
+      etaSeconds: 30,
+      checkpoint: '/tmp/checkpoint-2',
+      gpu: 'GPU0 71%',
+    });
+    const started = manager.start({
+      command: process.execPath,
+      args: ['-e', `console.log('RUNBEACON_EVENT ${event}')`],
+      shell: false,
+      adapter: 'training',
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000);
+
+    expect(completed.job.progress).toMatchObject({
+      percentage: 50,
+      phase: 'training',
+      metrics: {
+        epoch: 2,
+        step: 120,
+        loss: 0.125,
+        etaSeconds: 30,
+        checkpoint: '/tmp/checkpoint-2',
+        gpu: 'GPU0 71%',
+      },
+    });
+  });
+
+  test('wraps Slurm cancellation and requires durable adapter execution', () => {
+    const wrapped = commandForAdapter({
+      command: 'sbatch --parsable train.slurm',
+      adapter: 'slurm',
+    });
+    expect(wrapped).toContain('scancel');
+    expect(wrapped).toContain('sacct');
+    expect(wrapped).toContain('squeue');
+
+    const manager = new LifecycleManager({ statePath });
+    expect(() =>
+      manager.start({
+        command: 'sbatch --parsable train.slurm',
+        adapter: 'slurm',
+        executionMode: 'direct',
+        target: {
+          kind: 'ssh',
+          host: 'slurm.example',
+          username: 'runner',
+          allowUnverifiedHostKey: true,
+        },
+      })
+    ).toThrow(/DURABILITY_REQUIRED/);
   });
 });
 
@@ -875,22 +1509,24 @@ describe('lifecycle safety and UI helpers', () => {
     expect(() => new Script(script)).not.toThrow();
     expect(html).toContain("request('ui/initialize'");
     expect(html).toContain("request('tools/call'");
-    expect(html).toContain("callTool('job_snapshot'");
-    expect(html).toContain('jobId:requestedJobId, tailLines:6');
+    expect(html).toContain("callTool('job_watch'");
+    expect(html).toContain('afterVersion:current?.version || 0');
+    expect(html).not.toContain("callTool('job_snapshot'");
     expect(html).not.toContain("callTool('job_list'");
     expect(html).toContain('focusedJobId');
     expect(html).toContain('document.hidden');
     expect(html).toContain('renderedSignature');
-    expect(html).toContain('scheduleRefresh(0)');
+    expect(html).toContain('timeoutMs:25000');
     expect(html).not.toContain('setInterval(refresh');
-    expect(html).toContain('no model polling');
+    expect(html).not.toContain('1500');
     expect(html).toContain('data?.job');
     expect(html).toContain('job.progress.phase');
     expect(html).toContain("job.metadata?.kind === 'github_publish'");
     expect(html).toContain("callTool('job_start'");
     expect(html).toContain('useDefaultCredential:true');
     expect(html).toContain('requestTraceId:launcherAttempt.requestTraceId');
-    expect(html).toContain('Direct default SSH start');
+    expect(html).toContain('Default SSH task');
+    expect(html).toContain("executionMode:'auto'");
     expect(html).toContain("['prompt→tool'");
   });
 

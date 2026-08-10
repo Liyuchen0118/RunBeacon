@@ -16,6 +16,8 @@ export interface SaveSshPasswordProfileInput {
   username: string;
   password: string;
   hostKeySha256?: string;
+  hostKeyAlgorithm?: string;
+  runnerPath?: string;
   allowUnverifiedHostKey?: boolean;
   makeDefault?: boolean;
 }
@@ -49,6 +51,8 @@ export class SshPasswordProfileManager {
       username: input.username,
       credentialKind: 'password',
       hostKeySha256: input.hostKeySha256,
+      hostKeyAlgorithm: input.hostKeyAlgorithm,
+      runnerPath: input.runnerPath,
       allowUnverifiedHostKey:
         input.allowUnverifiedHostKey === true ? true : undefined,
     });

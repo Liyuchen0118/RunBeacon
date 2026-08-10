@@ -24,6 +24,8 @@ export interface SshCredentialProfile extends CredentialProfileBase {
   privateKeyPath?: string;
   agent?: string;
   hostKeySha256?: string;
+  hostKeyAlgorithm?: string;
+  runnerPath?: string;
   allowUnverifiedHostKey?: boolean;
 }
 
@@ -277,6 +279,22 @@ function normalizeProfile(
     );
   }
   const hostKeySha256 = normalizeOptional(input.hostKeySha256, 200);
+  const hostKeyAlgorithm = normalizeOptional(input.hostKeyAlgorithm, 64);
+  if (
+    hostKeyAlgorithm &&
+    ![
+      'ssh-ed25519',
+      'ecdsa-sha2-nistp256',
+      'ecdsa-sha2-nistp384',
+      'ecdsa-sha2-nistp521',
+      'rsa-sha2-512',
+      'rsa-sha2-256',
+      'ssh-rsa',
+    ].includes(hostKeyAlgorithm)
+  ) {
+    throw new Error('Unsupported SSH host-key algorithm');
+  }
+  const runnerPath = normalizeOptional(input.runnerPath, 4_000);
   if (!hostKeySha256 && input.allowUnverifiedHostKey !== true) {
     throw new Error(
       'SSH profile requires hostKeySha256 unless allowUnverifiedHostKey=true is explicitly accepted'
@@ -292,6 +310,8 @@ function normalizeProfile(
     privateKeyPath,
     agent,
     hostKeySha256,
+    hostKeyAlgorithm,
+    runnerPath,
     allowUnverifiedHostKey:
       input.allowUnverifiedHostKey === true ? true : undefined,
   };
