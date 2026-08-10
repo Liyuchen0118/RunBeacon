@@ -47,8 +47,8 @@ try {
   assert.equal(result.job.execution.backend, 'ssh_direct');
   assert.equal(result.job.execution.durable, false);
   assert.equal(result.job.target.verifiedHostKey, false);
-  assert.match(output, new RegExp(marker));
-  assert.doesNotMatch(JSON.stringify(result.job), new RegExp(password));
+  assert.equal(output.includes(marker), true);
+  assert.equal(JSON.stringify(result.job).includes(password), false);
 
   process.stdout.write(
     `${JSON.stringify({ passwordAuthentication: 'passed', lifecycle: 'start-wait' })}\n`

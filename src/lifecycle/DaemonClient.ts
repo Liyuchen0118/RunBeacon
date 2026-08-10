@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { fileURLToPath } from 'node:url';
@@ -316,7 +316,7 @@ export class DaemonClient implements LifecycleService {
       return Promise.reject(new Error(`Daemon request ${method} was aborted`));
     }
     return new Promise<T>((resolve, reject) => {
-      const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const id = randomUUID();
       const socket = createConnection(this.paths.socketPath);
       let buffer = '';
       let settled = false;
