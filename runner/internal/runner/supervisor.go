@@ -139,8 +139,8 @@ func Supervise(jobDir string, spec SupervisorSpec) error {
 		defer timer.Stop()
 	}
 
-	waitErr := command.Wait()
 	outputWG.Wait()
+	waitErr := command.Wait()
 	exitCode := command.ProcessState.ExitCode()
 	state := StateFailed
 	verified := false
