@@ -44,4 +44,3 @@ if (installed.status !== 0) {
   throw new Error(`Runner service installation exited with code ${installed.status}`);
 }
 process.stdout.write(`${target}\n`);
-

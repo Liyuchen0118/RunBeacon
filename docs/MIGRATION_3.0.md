@@ -60,4 +60,3 @@ Commands classified as privileged, credential/private-key, release, or destructi
 Stable promotion is manual and stops before tagging if main has any open High/Critical CodeQL alert or a Node, Go, signing, Notary, asset, audit, package, or plugin gate fails.
 
 To roll back, pin npm major 2 and plugin 1.x. Runner uninstall refuses active tasks and preserves state by default.
-
