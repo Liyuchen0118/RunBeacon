@@ -1,5 +1,28 @@
 # Changelog
 
+## 3.0.0 (2026-08-11)
+
+### Breaking changes
+
+- narrow the npm package to lifecycle, CLI, MCP, credentials, GitHub publishing, policy, audit, and subscriptions
+- move the old `mcp-console` entry point and 40-tool protocol surface to the 2.0.x legacy line
+- require Node.js 22 or 24 and rename `RJM_*` configuration to `RUNBEACON_*` with 3.x aliases
+
+### Features
+
+- add protocol-v1 Go Runner supervisors with Unix socket RPC, idempotent stdin submission, sequenced recovery, bounded output, timeout, and verified process-group cancellation
+- add daemon protocol v5, event store v2, `lost` recovery state, execution phases, durability metadata, and `job_watch`
+- add interactive approval, hash-chain audit, event subscriptions, and loopback single-task dashboard fallback
+- add generic, training, Slurm, and macOS Apple-signing adapters
+- add Linux user systemd and macOS Aqua LaunchAgent installers
+
+### Security and release
+
+- prevent direct SSH fallback after possible Runner acceptance
+- keep commands, credentials, approval metadata, and signing secrets out of Runner argv, snapshots, service files, and audit records
+- add independent JavaScript/TypeScript and Go CodeQL, Go race/vulnerability gates, four-platform assets, SHA256, Sigstore, provenance, SBOM, Developer ID signing, and Notary checks
+- replace automatic releases with a manual promotion gate that refuses tags while main has open CodeQL High/Critical alerts
+
 ## 2.0.0 (2026-08-03)
 
 ### Breaking security changes

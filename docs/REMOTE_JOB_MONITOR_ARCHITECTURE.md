@@ -1,143 +1,82 @@
-# RunBeacon architecture
+# RunBeacon 3 Architecture
 
-## Goals
+RunBeacon is a single-job lifecycle layer for AI agents. It is not a terminal multiplexer, a general SSH administration service, or a DAG scheduler.
 
-RunBeacon removes model-driven polling from long-running command workflows. It owns the process or SSH channel, records lifecycle events, exposes bounded state through MCP, and lets Codex block on one long-running `job_wait` call.
+## Process model
 
-## Components
-
-```mermaid
-flowchart LR
-  Codex["Codex task"] -->|"MCP stdio"| Shim["lifecycle-server"]
-  Shim -->|"authenticated local RPC"| Daemon["resident lifecycle daemon"]
-  Daemon --> Local["local child process"]
-  Daemon --> SSH["SSH channel via ssh2"]
-  Local --> GitRunner["GitHub publish runner"]
-  GitRunner --> GitHub["Git push / Actions REST API"]
-  Dashboard["MCP Apps dashboard"] -->|"direct tools/call"| Shim
-  PromptHook["UserPromptSubmit Hook"] -->|"prefer tracked SSH"| Codex
-  Hook["PreToolUse Hook"] -->|"deny raw SSH"| Codex
-  Daemon --> Store["redacted jobs.json"]
+```text
+Codex / CLI
+    | MCP or daemon protocol v5
+    v
+Local coordinator
+    | fixed-host-key SSH, command on stdin
+    v
+runbeacon-runner rpc
+    | 0600 Unix socket, Runner protocol v1
+    v
+user service -> independent supervisor -> process group
 ```
 
-- `src/mcp/lifecycle-server.ts`: MCP tools and dashboard resource.
-- `src/daemon/lifecycle-daemon.ts`: resident job owner.
-- `src/lifecycle/DaemonClient.ts`: authenticated local RPC and daemon startup.
-- `src/lifecycle/LifecycleManager.ts`: queue, execution, events, output ring, progress, cancellation, and assessment.
-- `src/lifecycle/JobStore.ts`: atomic redacted metadata persistence.
-- `src/lifecycle/DashboardApp.ts`: portable MCP Apps HTML resource.
-- `src/daemon/github-publish-runner.ts`: staged-commit, non-force push, and background GitHub Actions monitoring.
-- `src/lifecycle/GitHubPublish.ts`: GitHub remote parsing and failure classification.
-- `src/lifecycle/GitCredentialManager.ts`: PAT save, verification, and deletion through the configured Git credential helper.
-- `src/lifecycle/CredentialProfileStore.ts`: owner-only, secret-free SSH/GitHub connection references.
-- `hooks/route-ssh.cjs`: prevents Codex Bash from bypassing tracking.
-- `hooks/route-remote-prompt.cjs`: detects operational remote prompts and injects RunBeacon as the default execution route.
+The coordinator runs on Node.js 22 or 24 on Windows, Linux, and macOS. The single-file Go Runner is delivered for Linux and macOS x64/arm64 and opens no network port.
 
-## Lifecycle
+Linux installs the Runner as a user systemd service. macOS installs it locally, from an active Aqua session, as a LaunchAgent. SSH can submit work to that service but cannot install it remotely or unlock the login Keychain.
 
-```mermaid
-stateDiagram-v2
-  [*] --> queued
-  queued --> running
-  queued --> cancelled
-  running --> succeeded
-  running --> failed
-  running --> cancelled
-  running --> timed_out
-  running --> orphaned: daemon crash and metadata recovery
-  queued --> orphaned: daemon crash and metadata recovery
+## Submission boundary
+
+The coordinator creates the global job ID, idempotency key, and SHA-256 command digest. The command and environment are sent in an SSH stdin request; they never appear in an argv, service definition, coordinator snapshot, credential profile, or audit record.
+
+The Runner persists the idempotency key and digest before launching an independent supervisor. Concurrent supervisors contend for an exclusive claim file, so a response-loss retry can start the command at most once. The same idempotency key plus another digest returns `IDEMPOTENCY_CONFLICT`.
+
+`executionMode=auto` may use direct SSH only when the Runner probe fails before submission and durability is not required. Any ambiguous submit is retried with the same identifiers and never falls back to direct SSH.
+
+## Recovery
+
+Runner jobs persist a safe credential-profile reference, fixed host fingerprint and algorithm, remote job ID, and last consumed event sequence. After daemon restart, the coordinator resolves the OS-backed profile, calls Runner `get`, then resumes `watch(afterSequence)`. It never calls `submit` during recovery.
+
+One-time inline passwords and direct SSH commands are intentionally not resumable. If their coordinator disappears, they become `lost`. A Runner supervisor that disappears before a terminal record also becomes `lost`; commands are never replayed automatically.
+
+Runner state transitions are:
+
+```text
+queued | running | succeeded | failed | cancelled | timed_out | lost
 ```
 
-`job_wait` registers an in-process listener for a terminal transition. It does not call `job_snapshot` on an interval. Codex's bundled MCP configuration sets `tool_timeout_sec` to 86,400 seconds so the pending tool call can remain idle for a long job.
+Coordinator phases add `awaiting_approval`, credential resolution, connection, submission, execution, reconnection, cancellation, and finalization detail.
 
-## Dashboard behavior
+## Storage
 
-`job_dashboard`, `job_start`, and `github_publish_start` attach the same `_meta.ui.resourceUri` and return a `dashboardJobId`. The returned HTML binds its instance to that one job and calls `job_snapshot(jobId)` directly every 1.5 seconds; it never requests job history. A bare `job_dashboard` selects only the newest non-terminal job, while an explicit `jobId` reopens that task. Its default-SSH launcher calls `job_start` directly with the user's exact textarea value and switches the same dashboard to the newly created job, so a latency-sensitive command can bypass model scheduling. GitHub publish cards display remote, branch, Actions-monitoring mode, percentage, phase, full progress message, and bounded output. The focused job can display prompt-to-tool, credential lookup, queue, SSH, command, and total timing. This is deliberate: the UI gets bounded task state while the model remains asleep and unrelated history stays out of the view. Clients without MCP Apps support can still use every data tool.
+Coordinator store v2 combines:
 
-## GitHub publish lifecycle
+- owner-only atomic snapshots;
+- a checked, sequence-contiguous append journal;
+- a one-time owner-only v1 backup;
+- redacted output and metadata only when explicitly enabled.
 
-`github_publish_start` starts a normal tracked local job whose executable is the bundled publish runner. The runner validates the Git repository and branch, optionally commits the existing index, runs `git push --progress` without force, and then parses local workflow YAML plus open pull requests before querying the GitHub Actions REST API by pushed commit SHA.
+The Runner stores each job in a `0700` directory with `0600` records. Commands and environments are passed to supervisors over an inherited pipe and are not persisted. Output modes are `tail`, `full`, and `none`; the default cap is 64 MiB per job with seven-day retention and a 10 GiB global retention ceiling. Automatic pruning removes terminal jobs only.
 
-```mermaid
-stateDiagram-v2
-  [*] --> preflight
-  preflight --> commit: commitMessage and staged changes
-  preflight --> push: no commit requested
-  commit --> push
-  push --> pushed
-  pushed --> complete: Actions disabled
-  pushed --> no-workflows: no eligible branch or PR trigger
-  pushed --> actions-discovery: eligible or uncertain trigger
-  actions-discovery --> monitoring-degraded: API unavailable or no run discovered
-  actions-discovery --> actions: run discovered
-  actions --> complete: all accepted conclusions
-  actions --> actions-failed: failed conclusion
-  actions --> actions-timeout: deadline reached
-```
+## Waiting and dashboard
 
-Each runner phase emits one structured progress line such as `70% [actions] build: in_progress`. `LifecycleManager` parses this into percentage, phase, and a bounded message. Git's own transfer percentages are excluded by the runner-specific progress pattern, preventing object-upload progress from being mistaken for end-to-end completion.
+The model starts a job and calls `job_wait` once. The daemon owns wait timers, SSH reconnection, Runner event continuation, GitHub Actions discovery, and terminal notification.
 
-The model may call `job_wait` once to continue after the terminal event. All repeated Actions API checks happen inside the runner. Anonymous access is limited to one request per 60 seconds; authenticated access uses the configured interval with a 10-second floor. Each API call is bounded to five attempts and a 15-second per-attempt timeout, with retry only for transport failures, HTTP 408/429/5xx, jittered exponential backoff, and `Retry-After` support.
+The MCP App is bound to one job. It calls `job_watch(jobId, afterVersion)`, a bounded long poll, and stops while the page is hidden. It does not poll `job_snapshot` or load job history. Clients without MCP Apps can start an on-demand loopback dashboard with the interactive CLI; RunBeacon never opens an external browser automatically.
 
-The API transport resolves proxies in this order: `RUNBEACON_GITHUB_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, Git URL-specific proxy, `git http.proxy`, direct. `NO_PROXY` overrides the selected proxy. Diagnostics expose only stable failure codes, never Authorization data or proxy userinfo.
+## Policy and audit
 
-The push outcome and observation outcome are independent. Confirmed push plus unavailable monitoring is a successful `monitoring-degraded` job by default; a confidently ineligible workflow is a successful `no-workflows` job. `requireActions: true` turns either condition into a gate failure. An observed failing or timed-out workflow always fails regardless of that option.
+The default policy requires a five-minute approval grant for privileged, private-key/signing, release, and destructive commands. The approval is bound to the job, command digest, target, and risk class. Approval RPC is private to the dashboard and CLI and is absent from the MCP tool catalog.
 
-## SSH and credentials
+The audit JSONL is owner-only and hash chained. It records decisions, approvals, Runner management, cancellation, event delivery, and publication outcomes without command bodies or credentials. A broken hash or sequence fails closed.
 
-The daemon owns the `ssh2` connection and command channel. The public job record contains only host, port, username, and whether the host key was verified. It never contains password, passphrase, private-key contents, or environment values.
+Persistent terminal subscriptions support Codex waiters, desktop integration, and HTTPS webhooks signed with an HMAC secret obtained from an environment-variable reference. Secret values are never saved in subscription configuration.
 
-Authentication order is supplied per job:
+## Adapters
 
-1. SSH agent path
-2. Private key path with optional memory-only passphrase
-3. Password read into memory from an OS-managed RunBeacon credential reference
-4. Memory-only password explicitly supplied by the user
+- `generic` accepts bounded RE2 progress and `RUNBEACON_EVENT <JSON>`.
+- `training` accepts explicit epoch, step, loss, ETA, checkpoint, GPU, and percentage fields. GPU percentages cannot overwrite overall progress.
+- `slurm` requires the Runner, captures `sbatch --parsable`, resumes via the Runner, and verifies `scancel` through process-group termination.
+- `apple-signing` requires the Aqua LaunchAgent Runner and checks the Developer ID identity, untimestamped and timestamped signatures, and a Keychain Notary profile without reading a Keychain password.
 
-Require `hostKeySha256` by default. `allowUnverifiedHostKey` is an explicit insecure override and should only be used with user awareness.
+## Configuration migration
 
-The local daemon RPC uses a random token stored with owner-only permissions under `PLUGIN_DATA`. On Windows it uses a named pipe; on macOS/Linux it uses an owner-only Unix socket.
+Use `RUNBEACON_*` environment variables. The 3.x coordinator accepts matching `RJM_*` aliases with a variable-name-only warning; 4.0 removes them. The default data directory atomically migrates from `~/.remote-job-monitor` to `~/.runbeacon` when possible.
 
-Safe profiles are stored separately as `credential-profiles.json` with owner-only permissions. SSH profiles contain only host, port, username, an agent socket/pipe or private-key path, host-key verification policy, and optionally `credentialKind: "password"`. A profile never contains passwords, passphrases, tokens, authorization headers, or private-key contents. `ssh_password_save` sends a password over stdin to an OS-backed Git credential helper under a profile-specific synthetic host, verifies the saved value, and rolls back on profile persistence failure. `job_start` can select a profile explicitly, use the SSH default, or uniquely match one by host and username; password profiles are resolved into the transient SSH target and excluded from daemon persistence and public snapshots.
-
-The same document stores only the default profile ids for SSH and GitHub. Defaults are independent and are cleared when their profile is deleted. GitHub publishing automatically chooses its default when no explicit profile or memory-only token is supplied. SSH default routing requires `useDefaultCredential: true`, preventing ordinary local jobs from silently becoming remote jobs.
-
-GitHub profiles point to the standard Git credential helper rather than duplicating its secret store. `github_token_save` accepts an environment-variable import or an explicitly supplied PAT, sends it to `git credential approve` over stdin, verifies it with `git credential fill`, and persists only the profile id, host, username, and credential kind. `github_token_delete` is limited to PAT profiles created through this path. Pushes use Git normally. The Actions runner invokes `git credential fill` with terminal interaction disabled, keeps the returned password/token only in memory, suppresses both helper output streams, and falls back to anonymous API access when no credential is available.
-
-Both PAT and SSH-password persistence reject Git's plaintext `credential-store` helper. `ssh_password_delete` removes the profile-specific OS credential and its RunBeacon reference; generic `credential_profile_delete` intentionally deletes only the reference.
-
-An optional `githubToken` is sent through daemon RPC and the child environment only. It is not placed in runner arguments, labels, metadata, output, or `jobs.json`. Public repositories do not require a token. Git credential discovery for the push is delegated to Git with terminal prompting disabled, so a missing credential fails visibly instead of hanging an unattended job.
-
-## Persistence boundary
-
-The resident daemon lets jobs survive MCP shim and Codex task restarts. State transitions are persisted immediately while high-frequency output updates are coalesced. Arbitrary metadata and output-derived progress messages are excluded by default; metadata requires `RJM_PERSIST_METADATA=true` and is sanitized before persistence. Output persistence is disabled unless `RJM_PERSIST_OUTPUT=true`, because logs commonly contain secrets. Terminal history is bounded by `RJM_MAX_RETAINED_JOBS` (default 1000).
-
-The MCP shim and daemon perform a protocol v4 handshake with a build ID and comparable plugin cachebuster version. A newer client can replace an idle older daemon, but an older client refuses a newer protocol/build and cannot downgrade it. Active or queued jobs block every automatic upgrade. Same-version/different-build mismatches fail closed and require a new cachebuster.
-
-The prompt Hook generates `requestTraceId` and `requestReceivedAt` for operational remote requests and stores them in bounded, owner-only, turn-scoped plugin state. A `PreToolUse` Hook injects that trace into `job_start` for the same session and turn, eliminating model-dependent field copying. State keys are hashes and the state never contains the prompt, command, or credentials. The MCP shim records its own arrival and credential-resolution timestamps; the daemon adds command-start, SSH-ready, and first-output timestamps. Lifecycle startup deduplicates by request trace before command execution, independently of the caller's cross-request `idempotencyKey`. Timing contains no credential or output data and is safe to persist.
-
-If the daemon process itself crashes or the machine reboots, local child processes and SSH channels cannot be reattached generically. Previously active records are marked `orphaned` on recovery instead of falsely reported as running.
-
-## Production hardening roadmap
-
-1. Add a platform service installer (Windows service/task, systemd user service, launchd agent).
-2. Add remote durable execution adapters (systemd-run, tmux, Slurm, Kubernetes Job) that return a stable remote job identifier.
-3. Add callback/webhook completion for remote schedulers; use adaptive daemon-side polling only when the remote system exposes no event channel.
-4. Add SSH known_hosts parsing so pinned fingerprints are not the only strict-verification option.
-5. Add GitHub Enterprise and non-Git credential-helper keychain backends; never add plaintext secret profiles.
-6. Add audit log retention, output redaction policies, and per-host command policy.
-7. Add job dependencies and completion actions so multi-step workflows can run entirely inside the daemon when no model reasoning is needed between steps.
-
-## Validation
-
-- `npm run build`: TypeScript build.
-- `npx jest src/tests/LifecycleManager.test.ts --runInBand --coverage=false`: lifecycle, timeout, SSH safety, Hook, and UI tests.
-- `npm run test:lifecycle:mcp`: real MCP client/server and UI-resource smoke test.
-- `src/tests/GitHubPublish.test.ts`: GitHub remote parsing, push failure classification, and accepted Actions conclusions.
-- `src/tests/GitHubApiClient.test.ts`, `GitHubActionsMonitor.test.ts`, and `GitHubWorkflowEligibility.test.ts`: retry, proxy, redaction, monitoring outcome, workflow trigger, and draft-PR coverage.
-- `npm run test:github-publish`: offline real-runner verification of fast `no-workflows`, `requireActions`, secret-free output, and a single remote commit.
-- The lifecycle MCP smoke test creates a temporary worktree and local bare remote, then exercises staged commit and push through `github_publish_start` without external credentials.
-- `npm run test:lifecycle:daemon`: second-client reattachment to a resident daemon.
-- The lifecycle MCP and daemon smoke tests run on Windows, Linux, and macOS in CI.
-- `validate_plugin.py`: Codex plugin manifest validation.
-- `quick_validate.py`: bundled skill validation.
+See [MIGRATION_3.0.md](MIGRATION_3.0.md) for package, state, host-key algorithm, Runner, and rollback details.
