@@ -13,6 +13,14 @@ import { SshJobTarget } from './types.js';
 const MAX_RUNNER_RESPONSE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_RPC_TIMEOUT_MS = 35_000;
 const RUNNER_PATH_PATTERN = /^\/[A-Za-z0-9._/+@-]{1,1023}$/;
+const SSH_SERVER_HOST_KEY_ALGORITHMS: ServerHostKeyAlgorithm[] = [
+  'ssh-ed25519',
+  'ecdsa-sha2-nistp256',
+  'ecdsa-sha2-nistp384',
+  'ecdsa-sha2-nistp521',
+  'rsa-sha2-512',
+  'rsa-sha2-256',
+];
 
 export interface RunnerRequest {
   protocolVersion: number;
@@ -44,6 +52,123 @@ export class RunnerTransportError extends Error {
     super(message);
     this.name = 'RunnerTransportError';
   }
+}
+
+export async function probeSshHostKeyAlgorithm(
+  target: SshJobTarget,
+  clientFactory: () => Client = () => new Client(),
+  timeoutMs = 8_000
+): Promise<ServerHostKeyAlgorithm> {
+  const expected = target.hostKeySha256
+    ?.trim()
+    .replace(/^SHA256:/i, '')
+    .replace(/=+$/, '');
+  if (!expected) {
+    throw new RunnerTransportError(
+      'HOST_KEY_MISMATCH',
+      'A pinned SHA-256 host fingerprint is required before probing its algorithm'
+    );
+  }
+  for (const algorithm of SSH_SERVER_HOST_KEY_ALGORITHMS) {
+    const matched = await probeHostKeyAttempt(
+      target,
+      expected,
+      algorithm,
+      clientFactory,
+      timeoutMs
+    );
+    if (matched) return algorithm;
+  }
+  throw new RunnerTransportError(
+    'HOST_KEY_MISMATCH',
+    'No supported SSH host-key algorithm matched the pinned SHA-256 fingerprint'
+  );
+}
+
+function probeHostKeyAttempt(
+  target: SshJobTarget,
+  expected: string,
+  algorithm: ServerHostKeyAlgorithm,
+  clientFactory: () => Client,
+  timeoutMs: number
+): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const client = clientFactory();
+    let settled = false;
+    let fingerprintMatched = false;
+    const finish = (matched: boolean, error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      client.removeAllListeners();
+      client.destroy();
+      if (error) reject(error);
+      else resolve(matched);
+    };
+    const timer = setTimeout(
+      () =>
+        finish(
+          false,
+          fingerprintMatched
+            ? new RunnerTransportError(
+                'RUNNER_UNAVAILABLE',
+                'SSH authentication did not complete after the pinned host key matched'
+              )
+            : undefined
+        ),
+      Math.max(1_000, Math.min(30_000, timeoutMs))
+    );
+    timer.unref?.();
+    client.once('ready', () => finish(fingerprintMatched));
+    client.once('error', (error) => {
+      if (fingerprintMatched) {
+        finish(
+          false,
+          new RunnerTransportError(
+            'RUNNER_UNAVAILABLE',
+            `SSH authentication failed after the pinned host key matched: ${safeErrorMessage(error)}`
+          )
+        );
+      } else {
+        finish(false);
+      }
+    });
+    client.once('close', () => finish(false));
+    try {
+      const config: ConnectConfig = {
+        host: target.host,
+        port: target.port ?? 22,
+        username: target.username,
+        password: target.password,
+        passphrase: target.passphrase,
+        agent: target.agent,
+        readyTimeout: Math.max(1_000, Math.min(30_000, timeoutMs)),
+        algorithms: { serverHostKey: [algorithm] },
+        hostVerifier: (key: Buffer) => {
+          fingerprintMatched =
+            createHash('sha256')
+              .update(key)
+              .digest('base64')
+              .replace(/=+$/, '') === expected;
+          return fingerprintMatched;
+        },
+      };
+      if (target.privateKeyPath) {
+        config.privateKey = readFileSync(target.privateKeyPath);
+      }
+      client.connect(config);
+    } catch (error) {
+      finish(
+        false,
+        fingerprintMatched
+          ? new RunnerTransportError(
+              'RUNNER_UNAVAILABLE',
+              safeErrorMessage(error)
+            )
+          : undefined
+      );
+    }
+  });
 }
 
 export class SshRunnerTransport implements RunnerRPCClient {

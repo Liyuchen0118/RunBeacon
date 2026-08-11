@@ -10,7 +10,10 @@ import { safeErrorMessage } from '../lifecycle/security.js';
 import { resolveRunBeaconDataDir } from '../lifecycle/Environment.js';
 import { CredentialProfileStore } from '../lifecycle/CredentialProfileStore.js';
 import { createSshProfileResolver } from '../lifecycle/CredentialResolver.js';
-import { SshRunnerTransport } from '../lifecycle/RunnerTransport.js';
+import {
+  probeSshHostKeyAlgorithm,
+  SshRunnerTransport,
+} from '../lifecycle/RunnerTransport.js';
 
 const dataDir = resolveRunBeaconDataDir();
 const daemonEntry = fileURLToPath(
@@ -94,7 +97,7 @@ async function main(): Promise<void> {
 
 async function runner(args: string[]): Promise<void> {
   const action = args[0] ?? 'probe';
-  if (action === 'probe') {
+  if (action === 'probe' || action === 'migrate-host-key') {
     const profiles = new CredentialProfileStore(
       join(dataDir, 'credential-profiles.json')
     );
@@ -108,6 +111,17 @@ async function runner(args: string[]): Promise<void> {
       );
     }
     const target = await createSshProfileResolver(dataDir)(profile.id);
+    if (action === 'migrate-host-key') {
+      const algorithm = await probeSshHostKeyAlgorithm(target);
+      const { createdAt, updatedAt, ...safe } = profile;
+      void createdAt;
+      void updatedAt;
+      print({
+        profile: profiles.save({ ...safe, hostKeyAlgorithm: algorithm }),
+        hostKeyAlgorithm: algorithm,
+      });
+      return;
+    }
     print({
       profile: profile.id,
       ...(await new SshRunnerTransport(target).call('ping', {}, 20_000)),
@@ -134,7 +148,7 @@ async function runner(args: string[]): Promise<void> {
     return;
   }
   throw new Error(
-    'runner action must be probe, install, upgrade, or uninstall'
+    'runner action must be probe, migrate-host-key, install, upgrade, or uninstall'
   );
 }
 
@@ -321,4 +335,4 @@ function numberOption(args: string[], name: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback;
 }
 
-const helpText = `RunBeacon 3 CLI\n\nrunbeacon jobs [--limit N]\nrunbeacon show <jobId>\nrunbeacon wait <jobId> [--timeout-ms N]\nrunbeacon events <jobId>\nrunbeacon cancel <jobId>\nrunbeacon approve <jobId>\nrunbeacon reject <jobId>\nrunbeacon dashboard [jobId] [--port N]\nrunbeacon runner probe [--profile ID]\nrunbeacon runner install|upgrade|uninstall\nrunbeacon policy\nrunbeacon policy set <risk> <on|off>\nrunbeacon subscriptions list\nrunbeacon subscriptions save <id> <codex|desktop|webhook> [--url-env NAME] [--hmac-secret-env NAME]\nrunbeacon subscriptions delete <id>\nrunbeacon audit [--job ID] [--action ACTION] [--since ISO]\nrunbeacon doctor\n`;
+const helpText = `RunBeacon 3 CLI\n\nrunbeacon jobs [--limit N]\nrunbeacon show <jobId>\nrunbeacon wait <jobId> [--timeout-ms N]\nrunbeacon events <jobId>\nrunbeacon cancel <jobId>\nrunbeacon approve <jobId>\nrunbeacon reject <jobId>\nrunbeacon dashboard [jobId] [--port N]\nrunbeacon runner probe [--profile ID]\nrunbeacon runner migrate-host-key [--profile ID]\nrunbeacon runner install|upgrade|uninstall\nrunbeacon policy\nrunbeacon policy set <risk> <on|off>\nrunbeacon subscriptions list\nrunbeacon subscriptions save <id> <codex|desktop|webhook> [--url-env NAME] [--hmac-secret-env NAME]\nrunbeacon subscriptions delete <id>\nrunbeacon audit [--job ID] [--action ACTION] [--since ISO]\nrunbeacon doctor\n`;

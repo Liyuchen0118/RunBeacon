@@ -2,6 +2,7 @@ package runner
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -27,6 +29,11 @@ func Supervise(jobDir string, spec SupervisorSpec) error {
 	if !claimed {
 		return nil
 	}
+	// A cancellation can arrive after submission but before the supervisor has
+	// started a process group. In that case there is nothing remote to kill.
+	if cancellationRequested(jobDir) {
+		return finishSupervisor(jobDir, &job, StateCancelled, nil, "", true)
+	}
 	job.SupervisorPID = os.Getpid()
 	if err := writeJob(jobDir, job); err != nil {
 		return err
@@ -43,7 +50,14 @@ func Supervise(jobDir string, spec SupervisorSpec) error {
 	command.Dir = spec.CWD
 	command.Env = os.Environ()
 	for key, value := range spec.Env {
+		if key == "RUNBEACON_CANCELLATION_ACK_FILE" || key == "RUNBEACON_TERMINAL_STATE_FILE" {
+			continue
+		}
 		command.Env = append(command.Env, key+"="+value)
+	}
+	if normalizeCancellationMode(spec.CancellationMode) == "external" {
+		command.Env = append(command.Env, "RUNBEACON_CANCELLATION_ACK_FILE="+jobDir+string(os.PathSeparator)+cancellationAckName)
+		command.Env = append(command.Env, "RUNBEACON_TERMINAL_STATE_FILE="+jobDir+string(os.PathSeparator)+externalStateName)
 	}
 	stdin, err := command.StdinPipe()
 	if err != nil {
@@ -128,12 +142,19 @@ func Supervise(jobDir string, spec SupervisorSpec) error {
 	go copyOutput("stdout", bufio.NewReader(stdout))
 	go copyOutput("stderr", bufio.NewReader(stderr))
 
-	timedOut := make(chan struct{}, 1)
+	processExited := make(chan struct{})
 	if spec.TimeoutMillis > 0 {
 		timer := time.AfterFunc(time.Duration(spec.TimeoutMillis)*time.Millisecond, func() {
 			if setTimeoutRequested(jobDir) == nil {
-				_ = killProcessGroup(command.Process.Pid)
-				timedOut <- struct{}{}
+				_ = signalProcessGroup(command.Process.Pid, syscall.SIGTERM)
+				select {
+				case <-processExited:
+					return
+				case <-time.After(5 * time.Second):
+					if processGroupExists(command.Process.Pid) {
+						_ = killProcessGroup(command.Process.Pid)
+					}
+				}
 			}
 		})
 		defer timer.Stop()
@@ -141,6 +162,7 @@ func Supervise(jobDir string, spec SupervisorSpec) error {
 
 	outputWG.Wait()
 	waitErr := command.Wait()
+	close(processExited)
 	exitCode := command.ProcessState.ExitCode()
 	state := StateFailed
 	verified := false
@@ -148,9 +170,28 @@ func Supervise(jobDir string, spec SupervisorSpec) error {
 	if timeoutRequested(jobDir) {
 		state = StateTimedOut
 		verified = processGroupTerminationVerified(command.Process.Pid, 2*time.Second)
+		if job.CancellationMode == "external" {
+			verified = verified && cancellationAcknowledged(jobDir)
+		}
 	} else if cancellationRequested(jobDir) {
-		state = StateCancelled
 		verified = processGroupTerminationVerified(command.Process.Pid, 2*time.Second)
+		if job.CancellationMode == "external" {
+			verified = verified && cancellationAcknowledged(jobDir)
+		}
+		if verified {
+			state = StateCancelled
+		} else {
+			state = StateFailed
+			message = "cancellation could not be verified"
+		}
+	} else if externalState, declared := externalTerminalState(jobDir); declared {
+		verified = processGroupTerminationVerified(command.Process.Pid, 2*time.Second)
+		if verified {
+			state = externalState
+		} else {
+			state = StateFailed
+			message = "external terminal state could not be verified"
+		}
 	} else if waitErr == nil && exitCode == 0 {
 		state = StateSucceeded
 	} else if waitErr != nil {
@@ -160,6 +201,26 @@ func Supervise(jobDir string, spec SupervisorSpec) error {
 		message = fmt.Sprintf("capture output: %v", outputErr)
 	}
 	return finishSupervisor(jobDir, &job, state, &exitCode, message, verified)
+}
+
+func externalTerminalState(jobDir string) (JobState, bool) {
+	path := jobDir + string(os.PathSeparator) + externalStateName
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 32 {
+		return "", false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	switch string(bytes.TrimSpace(data)) {
+	case string(StateCancelled):
+		return StateCancelled, true
+	case string(StateTimedOut):
+		return StateTimedOut, true
+	default:
+		return "", false
+	}
 }
 
 func finishSupervisor(jobDir string, job *Job, state JobState, exitCode *int, message string, cancellationVerified bool) error {

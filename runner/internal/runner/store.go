@@ -2,7 +2,6 @@ package runner
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -23,6 +22,8 @@ const (
 	outputFileName      = "output.jsonl"
 	cancelFileName      = "cancel.requested"
 	timeoutFileName     = "timeout.requested"
+	cancellationAckName = "cancellation.verified"
+	externalStateName   = "external.state"
 	supervisorClaimName = "supervisor.claim"
 	defaultMaxOutput    = int64(64 * 1024 * 1024)
 	defaultRetention    = 7 * 24
@@ -33,12 +34,20 @@ const (
 )
 
 type Store struct {
-	paths Paths
-	mu    sync.Mutex
+	paths        Paths
+	mu           sync.Mutex
+	eventMu      sync.Mutex
+	eventCursors map[string]eventReadCursor
 }
 
 func NewStore(paths Paths) *Store {
-	return &Store{paths: paths}
+	return &Store{paths: paths, eventCursors: make(map[string]eventReadCursor)}
+}
+
+type eventReadCursor struct {
+	info         os.FileInfo
+	offset       int64
+	lastSequence uint64
 }
 
 func (store *Store) Prepare() error {
@@ -109,6 +118,7 @@ func (store *Store) Prune(maxBytes int64) error {
 			if err := os.RemoveAll(jobDir); err != nil {
 				return err
 			}
+			store.forgetEventCursors(jobDir)
 			total -= size
 			continue
 		}
@@ -124,6 +134,7 @@ func (store *Store) Prune(maxBytes int64) error {
 		if err := os.RemoveAll(filepath.Join(store.paths.JobsDir, candidate.id)); err != nil {
 			return err
 		}
+		store.forgetEventCursors(filepath.Join(store.paths.JobsDir, candidate.id))
 		total -= candidate.size
 	}
 	if total > maxBytes {
@@ -241,6 +252,13 @@ func normalizeOutputPolicy(policy OutputPolicy) OutputPolicy {
 	return policy
 }
 
+func normalizeCancellationMode(value string) string {
+	if value == "external" {
+		return value
+	}
+	return "process_group"
+}
+
 func (store *Store) JobDir(jobID string) (string, error) {
 	if !validJobID(jobID) {
 		return "", errors.New("invalid jobId")
@@ -339,6 +357,7 @@ func (store *Store) Create(params SubmitParams) (Job, bool, error) {
 		CreatedAt:         now,
 		UpdatedAt:         now,
 		OutputPolicy:      normalizeOutputPolicy(params.OutputPolicy),
+		CancellationMode:  normalizeCancellationMode(params.CancellationMode),
 		LastEventSequence: 1,
 	}
 	if err := writeJob(jobDir, job); err != nil {
@@ -460,25 +479,73 @@ func appendOutput(jobDir string, job *Job, event Event) error {
 	}
 	job.OutputBytes += int64(len(encoded))
 	if job.OutputPolicy.Mode == "tail" && job.OutputBytes > job.OutputPolicy.MaxBytes {
-		data, err := os.ReadFile(path)
+		retained, err := compactTailFile(path, job.OutputPolicy.MaxBytes)
 		if err != nil {
 			return err
 		}
-		start := len(data) - int(job.OutputPolicy.MaxBytes)
-		if start < 0 {
-			start = 0
-		}
-		if newline := bytes.IndexByte(data[start:], '\n'); newline >= 0 {
-			start += newline + 1
-		}
-		data = data[start:]
-		if err := atomicWrite(path, data); err != nil {
-			return err
-		}
-		job.OutputBytes = int64(len(data))
+		job.OutputBytes = retained
 		job.OutputTruncated = true
 	}
 	return nil
+}
+
+func compactTailFile(path string, maxBytes int64) (int64, error) {
+	// Retaining 75% creates slack, so a busy task does not rewrite its full
+	// output file after every subsequent chunk.
+	targetBytes := maxBytes - maxBytes/4
+	if targetBytes < 48*1024 {
+		targetBytes = 48 * 1024
+	}
+	source, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	info, err := source.Stat()
+	if err != nil {
+		source.Close()
+		return 0, err
+	}
+	start := info.Size() - targetBytes
+	if start < 0 {
+		start = 0
+	}
+	if _, err := source.Seek(start, io.SeekStart); err != nil {
+		source.Close()
+		return 0, err
+	}
+	reader := bufio.NewReaderSize(source, 64*1024)
+	if start > 0 {
+		if _, err := reader.ReadBytes('\n'); err != nil && !errors.Is(err, io.EOF) {
+			source.Close()
+			return 0, err
+		}
+	}
+	temporary := path + ".tmp"
+	defer os.Remove(temporary)
+	target, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		source.Close()
+		return 0, err
+	}
+	written, copyErr := io.CopyBuffer(target, reader, make([]byte, 64*1024))
+	if copyErr == nil {
+		copyErr = target.Sync()
+	}
+	closeErr := target.Close()
+	sourceCloseErr := source.Close()
+	if copyErr != nil {
+		return 0, copyErr
+	}
+	if closeErr != nil {
+		return 0, closeErr
+	}
+	if sourceCloseErr != nil {
+		return 0, sourceCloseErr
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		return 0, err
+	}
+	return written, nil
 }
 
 func atomicWrite(path string, data []byte) error {
@@ -489,37 +556,86 @@ func atomicWrite(path string, data []byte) error {
 	return os.Rename(temporary, path)
 }
 
-func readEvents(path string, after uint64) ([]Event, error) {
+func (store *Store) readEvents(path string, after uint64) ([]Event, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
+		delete(store.eventCursors, path)
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	start := int64(0)
+	lastSequence := uint64(0)
+	if cursor, ok := store.eventCursors[path]; ok &&
+		os.SameFile(cursor.info, info) &&
+		after >= cursor.lastSequence &&
+		cursor.offset <= info.Size() {
+		start = cursor.offset
+		lastSequence = cursor.lastSequence
+	}
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return nil, err
+	}
+	reader := bufio.NewReaderSize(io.LimitReader(file, info.Size()-start), 2*1024*1024)
 	var events []Event
-	for scanner.Scan() {
+	completeOffset := start
+	for {
+		line, readErr := reader.ReadSlice('\n')
+		if errors.Is(readErr, io.EOF) {
+			// Writers append a complete newline-terminated record before updating
+			// the job sequence. Keep a partial final record for the next read.
+			break
+		}
+		if errors.Is(readErr, bufio.ErrBufferFull) {
+			return nil, errors.New("event record exceeds 2 MiB")
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+		completeOffset += int64(len(line))
 		var event Event
-		if json.Unmarshal(scanner.Bytes(), &event) == nil && event.Sequence > after {
-			events = append(events, event)
+		if json.Unmarshal(line[:len(line)-1], &event) == nil {
+			if event.Sequence > lastSequence {
+				lastSequence = event.Sequence
+			}
+			if event.Sequence > after {
+				events = append(events, event)
+			}
 		}
 	}
-	return events, scanner.Err()
+	store.eventCursors[path] = eventReadCursor{
+		info:         info,
+		offset:       completeOffset,
+		lastSequence: lastSequence,
+	}
+	return events, nil
+}
+
+func (store *Store) forgetEventCursors(jobDir string) {
+	store.eventMu.Lock()
+	defer store.eventMu.Unlock()
+	delete(store.eventCursors, filepath.Join(jobDir, eventFileName))
+	delete(store.eventCursors, filepath.Join(jobDir, outputFileName))
 }
 
 func (store *Store) EventsAfter(jobID string, after uint64) ([]Event, bool, error) {
+	store.eventMu.Lock()
+	defer store.eventMu.Unlock()
 	jobDir, err := store.JobDir(jobID)
 	if err != nil {
 		return nil, false, err
 	}
-	stateEvents, err := readEvents(filepath.Join(jobDir, eventFileName), after)
+	stateEvents, err := store.readEvents(filepath.Join(jobDir, eventFileName), after)
 	if err != nil {
 		return nil, false, err
 	}
-	outputEvents, err := readEvents(filepath.Join(jobDir, outputFileName), after)
+	outputEvents, err := store.readEvents(filepath.Join(jobDir, outputFileName), after)
 	if err != nil {
 		return nil, false, err
 	}
@@ -542,7 +658,20 @@ func (store *Store) MarkCancellationRequested(jobID string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(jobDir, cancelFileName), []byte(time.Now().UTC().Format(time.RFC3339Nano)), 0o600)
+	path := filepath.Join(jobDir, cancelFileName)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.WriteString(time.Now().UTC().Format(time.RFC3339Nano))
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
 }
 
 func cancellationRequested(jobDir string) bool {
@@ -557,6 +686,18 @@ func timeoutRequested(jobDir string) bool {
 
 func setTimeoutRequested(jobDir string) error {
 	return os.WriteFile(filepath.Join(jobDir, timeoutFileName), []byte(time.Now().UTC().Format(time.RFC3339Nano)), 0o600)
+}
+
+func cancellationAcknowledged(jobDir string) bool {
+	info, err := os.Stat(filepath.Join(jobDir, cancellationAckName))
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 128 {
+		return false
+	}
+	trigger, triggerErr := os.Stat(filepath.Join(jobDir, cancelFileName))
+	if triggerErr != nil {
+		trigger, triggerErr = os.Stat(filepath.Join(jobDir, timeoutFileName))
+	}
+	return triggerErr == nil && !info.ModTime().Before(trigger.ModTime())
 }
 
 func decodeParams(params map[string]any, target any) error {

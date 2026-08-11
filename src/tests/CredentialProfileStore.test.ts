@@ -78,6 +78,22 @@ describe('CredentialProfileStore', () => {
     expect(store.list()).toEqual([]);
   });
 
+  test('rejects deprecated SSH RSA/SHA-1 host-key algorithms', () => {
+    const store = new CredentialProfileStore(profilePath);
+    expect(() =>
+      store.save({
+        id: 'legacy-rsa',
+        kind: 'ssh',
+        host: 'server.example.com',
+        port: 22,
+        username: 'deploy',
+        agent: 'auto',
+        hostKeySha256: 'SHA256:test',
+        hostKeyAlgorithm: 'ssh-rsa',
+      })
+    ).toThrow(/Unsupported SSH host-key algorithm/);
+  });
+
   test('persists only a safe reference for SSH password profiles', () => {
     const store = new CredentialProfileStore(profilePath);
     const marker = 'SSH_PASSWORD_CANARY_MUST_NOT_PERSIST_4928';

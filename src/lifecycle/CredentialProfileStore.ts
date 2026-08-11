@@ -289,7 +289,6 @@ function normalizeProfile(
       'ecdsa-sha2-nistp521',
       'rsa-sha2-512',
       'rsa-sha2-256',
-      'ssh-rsa',
     ].includes(hostKeyAlgorithm)
   ) {
     throw new Error('Unsupported SSH host-key algorithm');

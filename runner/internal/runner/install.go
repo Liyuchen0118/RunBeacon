@@ -125,8 +125,13 @@ WantedBy=default.target
 	if output, err := exec.Command("systemctl", "--user", "daemon-reload").CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %s", strings.TrimSpace(string(output)))
 	}
-	if output, err := exec.Command("systemctl", "--user", "enable", "--now", "runbeacon-runner.service").CombinedOutput(); err != nil {
+	if output, err := exec.Command("systemctl", "--user", "enable", "runbeacon-runner.service").CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl enable: %s", strings.TrimSpace(string(output)))
+	}
+	// Restart is intentional on upgrade. Supervisors run in independent
+	// sessions and KillMode=process leaves them alive for reconciliation.
+	if output, err := exec.Command("systemctl", "--user", "restart", "runbeacon-runner.service").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl restart: %s", strings.TrimSpace(string(output)))
 	}
 	return nil
 }
@@ -157,18 +162,7 @@ func installLaunchAgent(current, home string) error {
 		return err
 	}
 	plistPath := filepath.Join(plistDir, "io.runbeacon.runner.plist")
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>io.runbeacon.runner</string>
-<key>ProgramArguments</key><array><string>%s</string><string>serve</string></array>
-<key>LimitLoadToSessionType</key><string>Aqua</string>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-<key>ProcessType</key><string>Interactive</string><key>Umask</key><integer>63</integer>
-<key>StandardOutPath</key><string>%s</string>
-<key>StandardErrorPath</key><string>%s</string>
-</dict></plist>
-`, xmlEscape(target), xmlEscape(filepath.Join(logDir, "runner.stdout.log")), xmlEscape(filepath.Join(logDir, "runner.stderr.log")))
+	plist := launchAgentPlist(target, logDir)
 	if err := os.WriteFile(plistPath, []byte(plist), 0o600); err != nil {
 		return err
 	}
@@ -177,6 +171,22 @@ func installLaunchAgent(current, home string) error {
 		return fmt.Errorf("launchctl bootstrap: %s", strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func launchAgentPlist(target, logDir string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>io.runbeacon.runner</string>
+<key>ProgramArguments</key><array><string>%s</string><string>serve</string></array>
+<key>LimitLoadToSessionType</key><string>Aqua</string>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>AbandonProcessGroup</key><true/>
+<key>ProcessType</key><string>Interactive</string><key>Umask</key><integer>63</integer>
+<key>StandardOutPath</key><string>%s</string>
+<key>StandardErrorPath</key><string>%s</string>
+</dict></plist>
+`, xmlEscape(target), xmlEscape(filepath.Join(logDir, "runner.stdout.log")), xmlEscape(filepath.Join(logDir, "runner.stderr.log")))
 }
 
 func copyExecutable(source, target string) error {

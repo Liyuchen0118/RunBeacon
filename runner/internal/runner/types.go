@@ -50,6 +50,7 @@ type Job struct {
 	Signal               string       `json:"signal,omitempty"`
 	Error                string       `json:"error,omitempty"`
 	CancellationVerified bool         `json:"cancellationVerified"`
+	CancellationMode     string       `json:"cancellationMode"`
 	OutputPolicy         OutputPolicy `json:"outputPolicy"`
 	OutputBytes          int64        `json:"outputBytes"`
 	OutputTruncated      bool         `json:"outputTruncated"`
@@ -85,14 +86,15 @@ type Response struct {
 }
 
 type SubmitParams struct {
-	JobID          string            `json:"jobId"`
-	IdempotencyKey string            `json:"idempotencyKey"`
-	CommandDigest  string            `json:"commandDigest"`
-	Command        string            `json:"command"`
-	CWD            string            `json:"cwd,omitempty"`
-	Env            map[string]string `json:"env,omitempty"`
-	TimeoutMillis  int64             `json:"timeoutMillis,omitempty"`
-	OutputPolicy   OutputPolicy      `json:"outputPolicy"`
+	JobID            string            `json:"jobId"`
+	IdempotencyKey   string            `json:"idempotencyKey"`
+	CommandDigest    string            `json:"commandDigest"`
+	Command          string            `json:"command"`
+	CWD              string            `json:"cwd,omitempty"`
+	Env              map[string]string `json:"env,omitempty"`
+	TimeoutMillis    int64             `json:"timeoutMillis,omitempty"`
+	CancellationMode string            `json:"cancellationMode,omitempty"`
+	OutputPolicy     OutputPolicy      `json:"outputPolicy"`
 }
 
 type WatchParams struct {
@@ -102,8 +104,9 @@ type WatchParams struct {
 }
 
 type SupervisorSpec struct {
-	Command       string            `json:"command"`
-	CWD           string            `json:"cwd,omitempty"`
-	Env           map[string]string `json:"env,omitempty"`
-	TimeoutMillis int64             `json:"timeoutMillis,omitempty"`
+	Command          string            `json:"command"`
+	CWD              string            `json:"cwd,omitempty"`
+	Env              map[string]string `json:"env,omitempty"`
+	TimeoutMillis    int64             `json:"timeoutMillis,omitempty"`
+	CancellationMode string            `json:"cancellationMode,omitempty"`
 }

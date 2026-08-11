@@ -150,10 +150,11 @@ func (server *Server) dispatch(request Request) Response {
 		jobDir, _ := server.store.JobDir(job.ID)
 		if job.State == StateQueued && !supervisorClaimed(jobDir) {
 			spec := SupervisorSpec{
-				Command:       params.Command,
-				CWD:           params.CWD,
-				Env:           params.Env,
-				TimeoutMillis: params.TimeoutMillis,
+				Command:          params.Command,
+				CWD:              params.CWD,
+				Env:              params.Env,
+				TimeoutMillis:    params.TimeoutMillis,
+				CancellationMode: job.CancellationMode,
 			}
 			_, startErr := startSupervisor(server.executable, jobDir, spec)
 			if startErr != nil {
@@ -193,16 +194,37 @@ func (server *Server) watch(params WatchParams) Response {
 		if err != nil {
 			return failure("JOB_NOT_FOUND", "runner job was not found")
 		}
-		events, truncated, err := server.store.EventsAfter(params.JobID, params.AfterSequence)
-		if err != nil {
-			return failure("REMOTE_STATE_LOST", err.Error())
-		}
-		if len(events) > 0 || job.State.Terminal() || time.Now().After(deadline) {
+		if job.LastEventSequence > params.AfterSequence || job.State.Terminal() {
+			events, truncated, err := server.store.EventsAfter(params.JobID, params.AfterSequence)
+			if err != nil {
+				return failure("REMOTE_STATE_LOST", err.Error())
+			}
+			truncated = truncated ||
+				(len(events) == 0 && job.OutputTruncated && job.LastEventSequence > params.AfterSequence)
+			nextSequence := params.AfterSequence
+			for _, event := range events {
+				if event.Sequence > nextSequence {
+					nextSequence = event.Sequence
+				}
+			}
+			if len(events) == 0 && truncated {
+				nextSequence = job.LastEventSequence
+			}
 			return success(map[string]any{
-				"job":       job,
-				"events":    events,
-				"truncated": truncated,
-				"timedOut":  len(events) == 0 && !job.State.Terminal(),
+				"job":          job,
+				"events":       events,
+				"truncated":    truncated,
+				"nextSequence": nextSequence,
+				"timedOut":     false,
+			})
+		}
+		if time.Now().After(deadline) {
+			return success(map[string]any{
+				"job":          job,
+				"events":       []Event{},
+				"truncated":    false,
+				"nextSequence": params.AfterSequence,
+				"timedOut":     true,
 			})
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -215,13 +237,32 @@ func (server *Server) cancel(jobID string) Response {
 		return failure("JOB_NOT_FOUND", "runner job was not found")
 	}
 	if job.State.Terminal() {
+		if job.State == StateCancelled && !job.CancellationVerified {
+			return failure("CANCEL_UNVERIFIED", "process-group cancellation was not verified")
+		}
 		return success(map[string]any{"job": job})
 	}
 	if err := server.store.MarkCancellationRequested(jobID); err != nil {
 		return failure("CANCEL_FAILED", err.Error())
 	}
+	// Submission and cancellation can race before the supervisor records its
+	// process group. Wait for either a verified terminal state or the group ID.
+	startDeadline := time.Now().Add(3 * time.Second)
+	for job.ProcessGroupID <= 0 && !job.State.Terminal() && time.Now().Before(startDeadline) {
+		time.Sleep(25 * time.Millisecond)
+		job, err = server.store.Get(jobID)
+		if err != nil {
+			return failure("CANCEL_FAILED", err.Error())
+		}
+	}
+	if job.State.Terminal() {
+		if job.State != StateCancelled || !job.CancellationVerified {
+			return failure("CANCEL_UNVERIFIED", "cancellation before process start was not verified")
+		}
+		return success(map[string]any{"job": job})
+	}
 	if job.ProcessGroupID <= 0 {
-		return failure("CANCEL_UNVERIFIED", "runner has not recorded the remote process group")
+		return failure("CANCEL_UNVERIFIED", "runner did not record a process group before the cancellation deadline")
 	}
 	if err := signalProcessGroup(job.ProcessGroupID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return failure("CANCEL_FAILED", err.Error())
@@ -230,6 +271,9 @@ func (server *Server) cancel(jobID string) Response {
 	for time.Now().Before(deadline) {
 		current, readErr := server.store.Get(jobID)
 		if readErr == nil && current.State.Terminal() {
+			if current.State != StateCancelled || !current.CancellationVerified {
+				return failure("CANCEL_UNVERIFIED", "process-group or adapter cancellation was not verified")
+			}
 			return success(map[string]any{"job": current})
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -239,6 +283,9 @@ func (server *Server) cancel(jobID string) Response {
 	for time.Now().Before(deadline) {
 		current, readErr := server.store.Get(jobID)
 		if readErr == nil && current.State.Terminal() {
+			if current.State != StateCancelled || !current.CancellationVerified {
+				return failure("CANCEL_UNVERIFIED", "process-group or adapter cancellation was not verified")
+			}
 			return success(map[string]any{"job": current})
 		}
 		time.Sleep(100 * time.Millisecond)
