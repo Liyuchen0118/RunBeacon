@@ -93,6 +93,9 @@ describe('RunBeacon 3 security services', () => {
       jobId: 'job-12345678',
       state: 'succeeded',
       finishedAt: '2026-08-11T00:00:00.000Z',
+      command: 'canary-command-secret',
+      output: 'canary-output-secret',
+      credential: 'canary-credential-secret',
     };
     const fetchMock = jest
       .spyOn(globalThis, 'fetch')
@@ -102,15 +105,20 @@ describe('RunBeacon 3 security services', () => {
       { id: 'build-finished', delivered: true },
     ]);
 
-    const body = JSON.stringify(event);
+    const safeBody = JSON.stringify({
+      event: event.event,
+      jobId: event.jobId,
+      state: event.state,
+      finishedAt: event.finishedAt,
+    });
     const expected = createHmac('sha256', 'canary-webhook-secret')
-      .update(body)
+      .update(safeBody)
       .digest('hex');
     expect(fetchMock).toHaveBeenCalledWith(
       'https://events.example.test/runbeacon',
       expect.objectContaining({
         method: 'POST',
-        body,
+        body: safeBody,
         headers: expect.objectContaining({
           'x-runbeacon-signature': `sha256=${expected}`,
         }),
@@ -121,6 +129,15 @@ describe('RunBeacon 3 security services', () => {
     expect(persisted).not.toContain('https://events.example.test/runbeacon');
     expect(persisted).toContain('RUNBEACON_TEST_WEBHOOK_SECRET');
     expect(persisted).not.toContain('canary-webhook-secret');
+    expect(safeBody).not.toContain('canary-command-secret');
+    expect(safeBody).not.toContain('canary-output-secret');
+    expect(safeBody).not.toContain('canary-credential-secret');
+    await expect(
+      store.dispatch(['build-finished'], {
+        ...event,
+        jobId: '../persisted-secret',
+      })
+    ).rejects.toThrow('invalid terminal event');
   });
 
   test('rejects unsafe webhook endpoints and limits subscription fan-out', () => {

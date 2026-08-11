@@ -42,6 +42,14 @@ interface SubscriptionDocument {
 }
 
 const ENVIRONMENT_REFERENCE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const TERMINAL_JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const TERMINAL_STATES = new Set([
+  'succeeded',
+  'failed',
+  'cancelled',
+  'timed_out',
+  'lost',
+]);
 
 export type DesktopNotifier = (title: string, body: string) => Promise<void>;
 
@@ -124,7 +132,7 @@ export class EventSubscriptionStore {
     ids: string[],
     event: TerminalEvent
   ): Promise<Array<{ id: string; delivered: boolean; error?: string }>> {
-    const body = JSON.stringify(event);
+    const body = serializeTerminalEvent(event);
     return Promise.all(
       ids.map(async (id) => {
         const subscription = this.get(id);
@@ -185,6 +193,9 @@ export class EventSubscriptionStore {
               'content-type': 'application/json',
               'x-runbeacon-signature': `sha256=${signature}`,
             },
+            // This opt-in webhook receives only the bounded TerminalEvent allow-list
+            // produced above, never persisted command, output, or credential data.
+            // lgtm[js/file-access-to-http]
             body,
             signal: controller.signal,
           });
@@ -397,4 +408,29 @@ function validateWebhookUrl(value: string): string {
     );
   }
   return url.toString();
+}
+
+function serializeTerminalEvent(event: TerminalEvent): string {
+  if (
+    event.event !== 'job_terminal' ||
+    !TERMINAL_JOB_ID.test(event.jobId) ||
+    !TERMINAL_STATES.has(event.state) ||
+    !isCanonicalTimestamp(event.finishedAt)
+  ) {
+    throw new Error('invalid terminal event');
+  }
+  return JSON.stringify({
+    event: 'job_terminal',
+    jobId: event.jobId,
+    state: event.state,
+    finishedAt: event.finishedAt,
+  });
+}
+
+function isCanonicalTimestamp(value: string): boolean {
+  if (value.length !== 24) return false;
+  const timestamp = new Date(value);
+  return (
+    Number.isFinite(timestamp.getTime()) && timestamp.toISOString() === value
+  );
 }
