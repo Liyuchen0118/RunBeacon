@@ -671,7 +671,7 @@ export class LifecycleManager extends EventEmitter {
       throw new Error('global job_watch limit reached');
     }
 
-    const boundedTimeout = Math.max(1, Math.min(timeoutMs, 30_000));
+    const boundedTimeout = normalizeWatchTimeout(timeoutMs);
     const waiters = existing ?? new Map<number, ChangeWaiter>();
     if (!existing) this.changeWaiters.set(jobId, waiters);
 
@@ -2137,4 +2137,14 @@ export class LifecycleManager extends EventEmitter {
     if (!job) throw new Error(`Unknown job: ${jobId}`);
     return job;
   }
+}
+
+export function normalizeWatchTimeout(timeoutMs: number): number {
+  if (!Number.isFinite(timeoutMs)) return 25_000;
+  if (timeoutMs <= 100) return 100;
+  if (timeoutMs <= 1_000) return 1_000;
+  if (timeoutMs <= 5_000) return 5_000;
+  if (timeoutMs <= 15_000) return 15_000;
+  if (timeoutMs <= 25_000) return 25_000;
+  return 30_000;
 }

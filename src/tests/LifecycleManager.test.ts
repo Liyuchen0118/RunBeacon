@@ -12,7 +12,10 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { Script } from 'node:vm';
 import type { Client, ClientChannel, ConnectConfig } from 'ssh2';
-import { LifecycleManager } from '../lifecycle/LifecycleManager.js';
+import {
+  LifecycleManager,
+  normalizeWatchTimeout,
+} from '../lifecycle/LifecycleManager.js';
 import {
   RunnerRPCClient,
   RunnerTransportError,
@@ -1470,6 +1473,15 @@ describe('LifecycleManager', () => {
 });
 
 describe('lifecycle safety and UI helpers', () => {
+  test('maps job watch timeouts to bounded constant durations', () => {
+    expect(normalizeWatchTimeout(-1)).toBe(100);
+    expect(normalizeWatchTimeout(100)).toBe(100);
+    expect(normalizeWatchTimeout(101)).toBe(1_000);
+    expect(normalizeWatchTimeout(25_000)).toBe(25_000);
+    expect(normalizeWatchTimeout(Number.MAX_SAFE_INTEGER)).toBe(30_000);
+    expect(normalizeWatchTimeout(Number.POSITIVE_INFINITY)).toBe(25_000);
+  });
+
   test('orders cachebuster builds monotonically for daemon upgrades', () => {
     expect(
       compareBuildVersions(

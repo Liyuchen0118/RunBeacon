@@ -14,7 +14,7 @@ export interface EventSubscription {
   id: string;
   kind: EventSubscriptionKind;
   enabled: boolean;
-  url?: string;
+  urlEnvVar?: string;
   hmacSecretEnvVar?: string;
   createdAt: string;
   updatedAt: string;
@@ -24,7 +24,7 @@ export interface SaveEventSubscription {
   id: string;
   kind: EventSubscriptionKind;
   enabled?: boolean;
-  url?: string;
+  urlEnvVar?: string;
   hmacSecretEnvVar?: string;
 }
 
@@ -36,9 +36,11 @@ export interface TerminalEvent {
 }
 
 interface SubscriptionDocument {
-  version: 1;
+  version: 2;
   subscriptions: EventSubscription[];
 }
+
+const ENVIRONMENT_REFERENCE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 
 export class EventSubscriptionStore {
   private readonly subscriptions = new Map<string, EventSubscription>();
@@ -67,20 +69,14 @@ export class EventSubscriptionStore {
       throw new Error('unsupported event subscription kind');
     }
     if (input.kind === 'webhook') {
-      let url: URL;
-      try {
-        url = new URL(input.url ?? '');
-      } catch {
-        throw new Error('webhook subscription requires a valid HTTPS URL');
-      }
-      if (url.protocol !== 'https:' || url.username || url.password) {
+      if (!ENVIRONMENT_REFERENCE.test(input.urlEnvVar ?? '')) {
         throw new Error(
-          'webhook subscription requires an HTTPS URL without userinfo'
+          'webhook subscription requires a valid URL environment variable reference'
         );
       }
-      if (
-        !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(input.hmacSecretEnvVar ?? '')
-      ) {
+      const configuredUrl = process.env[input.urlEnvVar!];
+      if (configuredUrl) validateWebhookUrl(configuredUrl);
+      if (!ENVIRONMENT_REFERENCE.test(input.hmacSecretEnvVar ?? '')) {
         throw new Error(
           'webhook subscription requires a valid HMAC secret environment variable reference'
         );
@@ -92,7 +88,7 @@ export class EventSubscriptionStore {
       id: input.id,
       kind: input.kind,
       enabled: input.enabled !== false,
-      url: input.kind === 'webhook' ? input.url : undefined,
+      urlEnvVar: input.kind === 'webhook' ? input.urlEnvVar : undefined,
       hmacSecretEnvVar:
         input.kind === 'webhook' ? input.hmacSecretEnvVar : undefined,
       createdAt: existing?.createdAt ?? now,
@@ -134,6 +130,24 @@ export class EventSubscriptionStore {
           // daemon records the durable event even when no host is attached.
           return { id, delivered: true };
         }
+        const configuredUrl = process.env[subscription.urlEnvVar!];
+        if (!configuredUrl) {
+          return {
+            id,
+            delivered: false,
+            error: 'Webhook URL reference is unavailable',
+          };
+        }
+        let webhookUrl: string;
+        try {
+          webhookUrl = validateWebhookUrl(configuredUrl);
+        } catch {
+          return {
+            id,
+            delivered: false,
+            error: 'Webhook URL reference is invalid',
+          };
+        }
         const secret = process.env[subscription.hmacSecretEnvVar!];
         if (!secret) {
           return {
@@ -149,7 +163,7 @@ export class EventSubscriptionStore {
         const timer = setTimeout(() => controller.abort(), 10_000);
         timer.unref?.();
         try {
-          const response = await fetch(subscription.url!, {
+          const response = await fetch(webhookUrl, {
             method: 'POST',
             headers: {
               'content-type': 'application/json',
@@ -182,7 +196,7 @@ export class EventSubscriptionStore {
       const document = JSON.parse(
         readFileSync(this.path, 'utf8')
       ) as SubscriptionDocument;
-      if (document.version !== 1 || !Array.isArray(document.subscriptions))
+      if (document.version !== 2 || !Array.isArray(document.subscriptions))
         return;
       for (const item of document.subscriptions) {
         if (!isStoredSubscription(item)) continue;
@@ -197,7 +211,7 @@ export class EventSubscriptionStore {
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     const temporary = `${this.path}.tmp`;
     const document: SubscriptionDocument = {
-      version: 1,
+      version: 2,
       subscriptions: this.list(),
     };
     writeFileSync(temporary, JSON.stringify(document, null, 2), {
@@ -224,15 +238,23 @@ function isStoredSubscription(value: unknown): value is EventSubscription {
     return false;
   }
   if (item.kind !== 'webhook') return true;
+  return (
+    ENVIRONMENT_REFERENCE.test(item.urlEnvVar ?? '') &&
+    ENVIRONMENT_REFERENCE.test(item.hmacSecretEnvVar ?? '')
+  );
+}
+
+function validateWebhookUrl(value: string): string {
+  let url: URL;
   try {
-    const url = new URL(item.url ?? '');
-    return (
-      url.protocol === 'https:' &&
-      !url.username &&
-      !url.password &&
-      /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(item.hmacSecretEnvVar ?? '')
-    );
+    url = new URL(value);
   } catch {
-    return false;
+    throw new Error('webhook subscription requires a valid HTTPS URL');
   }
+  if (url.protocol !== 'https:' || url.username || url.password) {
+    throw new Error(
+      'webhook subscription requires an HTTPS URL without userinfo'
+    );
+  }
+  return url.toString();
 }

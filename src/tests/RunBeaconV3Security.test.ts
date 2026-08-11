@@ -15,6 +15,7 @@ describe('RunBeacon 3 security services', () => {
   });
 
   afterEach(() => {
+    delete process.env.RUNBEACON_TEST_WEBHOOK_URL;
     delete process.env.RUNBEACON_TEST_WEBHOOK_SECRET;
     jest.restoreAllMocks();
     rmSync(root, { recursive: true, force: true });
@@ -72,10 +73,12 @@ describe('RunBeacon 3 security services', () => {
   test('signs webhook delivery without persisting the HMAC secret', async () => {
     const path = join(root, 'subscriptions.json');
     const store = new EventSubscriptionStore(path);
+    process.env.RUNBEACON_TEST_WEBHOOK_URL =
+      'https://events.example.test/runbeacon';
     store.save({
       id: 'build-finished',
       kind: 'webhook',
-      url: 'https://events.example.test/runbeacon',
+      urlEnvVar: 'RUNBEACON_TEST_WEBHOOK_URL',
       hmacSecretEnvVar: 'RUNBEACON_TEST_WEBHOOK_SECRET',
     });
     process.env.RUNBEACON_TEST_WEBHOOK_SECRET = 'canary-webhook-secret';
@@ -108,17 +111,21 @@ describe('RunBeacon 3 security services', () => {
       })
     );
     const persisted = readFileSync(path, 'utf8');
+    expect(persisted).toContain('RUNBEACON_TEST_WEBHOOK_URL');
+    expect(persisted).not.toContain('https://events.example.test/runbeacon');
     expect(persisted).toContain('RUNBEACON_TEST_WEBHOOK_SECRET');
     expect(persisted).not.toContain('canary-webhook-secret');
   });
 
   test('rejects unsafe webhook endpoints and limits subscription fan-out', () => {
     const store = new EventSubscriptionStore(join(root, 'subscriptions.json'));
+    process.env.RUNBEACON_TEST_WEBHOOK_URL =
+      'http://user:password@example.test/hook';
     expect(() =>
       store.save({
         id: 'unsafe',
         kind: 'webhook',
-        url: 'http://user:password@example.test/hook',
+        urlEnvVar: 'RUNBEACON_TEST_WEBHOOK_URL',
         hmacSecretEnvVar: 'RUNBEACON_TEST_WEBHOOK_SECRET',
       })
     ).toThrow(/HTTPS URL without userinfo/);

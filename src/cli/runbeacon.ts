@@ -158,7 +158,7 @@ async function subscriptions(args: string[]): Promise<void> {
       await client.saveEventSubscription({
         id,
         kind,
-        url: stringOption(args, '--url'),
+        urlEnvVar: stringOption(args, '--url-env'),
         hmacSecretEnvVar: stringOption(args, '--hmac-secret-env'),
       })
     );
@@ -286,9 +286,9 @@ async function handleDashboardRequest(
     }
     response.statusCode = 404;
     response.end('Not found');
-  } catch (error) {
+  } catch {
     response.statusCode = 500;
-    json(response, { error: safeErrorMessage(error) });
+    json(response, { error: 'RunBeacon request failed' });
   }
 }
 
@@ -321,4 +321,4 @@ function numberOption(args: string[], name: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback;
 }
 
-const helpText = `RunBeacon 3 CLI\n\nrunbeacon jobs [--limit N]\nrunbeacon show <jobId>\nrunbeacon wait <jobId> [--timeout-ms N]\nrunbeacon events <jobId>\nrunbeacon cancel <jobId>\nrunbeacon approve <jobId>\nrunbeacon reject <jobId>\nrunbeacon dashboard [jobId] [--port N]\nrunbeacon runner probe [--profile ID]\nrunbeacon runner install|upgrade|uninstall\nrunbeacon policy\nrunbeacon policy set <risk> <on|off>\nrunbeacon subscriptions list\nrunbeacon subscriptions save <id> <codex|desktop|webhook> [--url URL] [--hmac-secret-env NAME]\nrunbeacon subscriptions delete <id>\nrunbeacon audit [--job ID] [--action ACTION] [--since ISO]\nrunbeacon doctor\n`;
+const helpText = `RunBeacon 3 CLI\n\nrunbeacon jobs [--limit N]\nrunbeacon show <jobId>\nrunbeacon wait <jobId> [--timeout-ms N]\nrunbeacon events <jobId>\nrunbeacon cancel <jobId>\nrunbeacon approve <jobId>\nrunbeacon reject <jobId>\nrunbeacon dashboard [jobId] [--port N]\nrunbeacon runner probe [--profile ID]\nrunbeacon runner install|upgrade|uninstall\nrunbeacon policy\nrunbeacon policy set <risk> <on|off>\nrunbeacon subscriptions list\nrunbeacon subscriptions save <id> <codex|desktop|webhook> [--url-env NAME] [--hmac-secret-env NAME]\nrunbeacon subscriptions delete <id>\nrunbeacon audit [--job ID] [--action ACTION] [--since ISO]\nrunbeacon doctor\n`;

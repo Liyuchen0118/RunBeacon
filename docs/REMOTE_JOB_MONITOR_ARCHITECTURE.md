@@ -66,7 +66,7 @@ The default policy requires a five-minute approval grant for privileged, private
 
 The audit JSONL is owner-only and hash chained. It records decisions, approvals, Runner management, cancellation, event delivery, and publication outcomes without command bodies or credentials. A broken hash or sequence fails closed.
 
-Persistent terminal subscriptions support Codex waiters, desktop integration, and HTTPS webhooks signed with an HMAC secret obtained from an environment-variable reference. Secret values are never saved in subscription configuration.
+Persistent terminal subscriptions support Codex waiters, desktop integration, and HTTPS webhooks. Webhook URLs and HMAC secrets are both obtained from environment-variable references, so neither value is saved in subscription configuration. Version 1 webhook records that persisted a URL are ignored and must be saved again with `urlEnvVar`.
 
 ## Adapters
 

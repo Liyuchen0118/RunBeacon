@@ -82,7 +82,7 @@ RunBeacon retains credential, GitHub publishing, and lifecycle tools and adds:
 - `job_watch`: dashboard long poll by local snapshot version
 - `runner_manage`: Runner probe; signed installation is interactive CLI-only
 - `policy_manage`: inspect/update risk defaults, never approve jobs
-- `event_subscription_manage`: Codex, desktop, or HMAC HTTPS webhook subscriptions
+- `event_subscription_manage`: Codex, desktop, or HMAC HTTPS webhook subscriptions using environment references for URLs and secrets
 - `audit_query`: verified hash-chain audit events
 
 The model-facing completion path remains `job_start -> job_wait`. The MCP App watches only the current job and pauses while hidden.

@@ -926,7 +926,7 @@ const tools: Tool[] = [
   {
     name: 'event_subscription_manage',
     description:
-      'List, save, or delete persistent Codex, desktop, and HMAC HTTPS webhook event subscriptions.',
+      'List, save, or delete persistent Codex, desktop, and HMAC HTTPS webhook subscriptions. Webhook URLs and secrets use environment-variable references.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -934,7 +934,7 @@ const tools: Tool[] = [
         id: { type: 'string', minLength: 1, maxLength: 64 },
         kind: { type: 'string', enum: ['codex', 'desktop', 'webhook'] },
         enabled: { type: 'boolean' },
-        url: { type: 'string', maxLength: 2048 },
+        urlEnvVar: { type: 'string', maxLength: 128 },
         hmacSecretEnvVar: { type: 'string', maxLength: 128 },
       },
       required: ['action'],
@@ -1296,7 +1296,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             kind: eventSubscriptionKind(args.kind),
             enabled:
               typeof args.enabled === 'boolean' ? args.enabled : undefined,
-            url: optionalString(args.url),
+            urlEnvVar: optionalString(args.urlEnvVar),
             hmacSecretEnvVar: optionalString(args.hmacSecretEnvVar),
           });
           return reply(
