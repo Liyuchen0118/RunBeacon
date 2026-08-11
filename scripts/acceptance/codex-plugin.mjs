@@ -7,6 +7,10 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { writeAcceptanceReport } from './report.mjs';
 import { assertRunBeaconCodexAcceptance } from './codex-exec-json.mjs';
+import {
+  isCodexPluginInstalled,
+  prepareCodexCommand,
+} from './codex-command.mjs';
 
 const startedAt = new Date().toISOString();
 const root = path.resolve(
@@ -38,14 +42,18 @@ const skillCreator = path.join(
 const python =
   process.env.RUNBEACON_PYTHON ||
   (process.platform === 'win32' ? 'python.exe' : 'python3');
-const codex =
-  process.env.RUNBEACON_CODEX_BIN ||
-  (process.platform === 'win32' ? 'codex.cmd' : 'codex');
 const output =
   process.env.RUNBEACON_ACCEPTANCE_OUTPUT ||
   path.join(root, 'acceptance-results', 'codex-plugin.json');
 const backup = `${pluginTarget}.acceptance-backup-${process.pid}`;
+const pluginSourceExisted = fs.existsSync(pluginTarget);
 let staged = false;
+let codexInvocation;
+let marketplaceName;
+let pluginSelector;
+let installationChanged = false;
+let pluginWasInstalled = false;
+let acceptanceData;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -59,9 +67,35 @@ function run(command, args, options = {}) {
   assert.equal(
     result.status,
     0,
-    `${command} failed:\n${result.stdout}\n${result.stderr}`
+    `${command} failed${result.error ? `: ${result.error.message}` : ''}:\n${result.stdout ?? ''}\n${result.stderr ?? ''}`
   );
   return result;
+}
+
+function runNpm(args, options = {}) {
+  const npmCliCandidates = [
+    process.env.npm_execpath,
+    path.join(
+      path.dirname(process.execPath),
+      'node_modules',
+      'npm',
+      'bin',
+      'npm-cli.js'
+    ),
+    path.resolve(
+      path.dirname(process.execPath),
+      '..',
+      'lib',
+      'node_modules',
+      'npm',
+      'bin',
+      'npm-cli.js'
+    ),
+  ].find((candidate) => candidate && fs.existsSync(candidate));
+  if (npmCliCandidates) {
+    return run(process.execPath, [npmCliCandidates, ...args], options);
+  }
+  return run(process.platform === 'win32' ? 'npm.cmd' : 'npm', args, options);
 }
 
 function stagePlugin() {
@@ -104,11 +138,26 @@ function stagePlugin() {
 }
 
 try {
+  codexInvocation = prepareCodexCommand();
+  marketplaceName = run(python, [
+    path.join(pluginCreator, 'scripts', 'read_marketplace_name.py'),
+    '--marketplace-path',
+    marketplacePath,
+  ]).stdout.trim();
+  assert.match(marketplaceName, /^[A-Za-z0-9._-]+$/);
+  pluginSelector = `remote-job-monitor@${marketplaceName}`;
+  pluginWasInstalled = isCodexPluginInstalled(
+    run(codexInvocation.command, ['plugin', 'list']).stdout,
+    pluginSelector
+  );
   stagePlugin();
   run(python, [
     path.join(pluginCreator, 'scripts', 'update_plugin_cachebuster.py'),
     pluginTarget,
   ]);
+  runNpm(['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'], {
+    cwd: pluginTarget,
+  });
   run(python, [
     path.join(pluginCreator, 'scripts', 'validate_plugin.py'),
     pluginTarget,
@@ -117,30 +166,36 @@ try {
     path.join(skillCreator, 'scripts', 'quick_validate.py'),
     path.join(pluginTarget, 'skills', 'monitor-remote-jobs'),
   ]);
-  const marketplaceName = run(python, [
-    path.join(pluginCreator, 'scripts', 'read_marketplace_name.py'),
-    '--marketplace-path',
-    marketplacePath,
-  ]).stdout.trim();
-  assert.match(marketplaceName, /^[A-Za-z0-9._-]+$/);
-  run(codex, ['plugin', 'add', `remote-job-monitor@${marketplaceName}`]);
+  installationChanged = true;
+  run(codexInvocation.command, ['plugin', 'add', pluginSelector]);
   const prompt = [
     'Use RunBeacon job_start to run this as a local tracked command:',
     'node -e "console.log(\'RUNBEACON_CODEX_ACCEPTANCE\')"',
     'Immediately call job_wait exactly once. Do not call job_snapshot or job_list.',
     'Return the final job state.',
   ].join('\n');
+  acceptanceData = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'runbeacon-codex-acceptance-')
+  );
   const task = run(
-    codex,
+    codexInvocation.command,
     [
       'exec',
       '--json',
+      '--approve-for-me',
       '--skip-git-repo-check',
       '--sandbox',
       'workspace-write',
       prompt,
     ],
-    { cwd: pluginTarget }
+    {
+      cwd: pluginTarget,
+      env: {
+        ...process.env,
+        PLUGIN_DATA: acceptanceData,
+        RUNBEACON_INLINE_MANAGER: 'true',
+      },
+    }
   );
   assertRunBeaconCodexAcceptance(task.stdout);
   const report = writeAcceptanceReport({
@@ -159,9 +214,39 @@ try {
   if (staged) fs.rmSync(backup, { recursive: true, force: true });
   process.stdout.write(`${JSON.stringify(report)}\n`);
 } catch (error) {
-  if (staged && fs.existsSync(backup)) {
+  let rollbackError;
+  if (staged) {
     fs.rmSync(pluginTarget, { recursive: true, force: true });
-    fs.renameSync(backup, pluginTarget);
+    if (pluginSourceExisted && fs.existsSync(backup)) {
+      fs.renameSync(backup, pluginTarget);
+    }
+  }
+  if (installationChanged && codexInvocation && pluginSelector) {
+    try {
+      const currentlyInstalled = isCodexPluginInstalled(
+        run(codexInvocation.command, ['plugin', 'list']).stdout,
+        pluginSelector
+      );
+      if (currentlyInstalled) {
+        run(codexInvocation.command, ['plugin', 'remove', pluginSelector]);
+      }
+      if (pluginWasInstalled) {
+        run(codexInvocation.command, ['plugin', 'add', pluginSelector]);
+      }
+    } catch (cause) {
+      rollbackError = cause;
+    }
+  }
+  if (rollbackError) {
+    throw new AggregateError(
+      [error, rollbackError],
+      'Codex plugin acceptance failed and the installed plugin rollback also failed'
+    );
   }
   throw error;
+} finally {
+  if (acceptanceData) {
+    fs.rmSync(acceptanceData, { recursive: true, force: true });
+  }
+  codexInvocation?.cleanup();
 }

@@ -38,7 +38,7 @@
     "typecheck": "tsc --noEmit",
     "prepare": "npm run build",
     "test:runner": "cd runner && go test -race ./...",
-    "test:release-evidence": "node scripts/release-evidence-test.mjs && node scripts/codex-exec-json-test.mjs"
+    "test:release-evidence": "node scripts/release-evidence-test.mjs && node scripts/codex-exec-json-test.mjs && node scripts/codex-command-test.mjs"
   },
   "keywords": [
     "mcp",
