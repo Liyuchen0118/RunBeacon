@@ -464,16 +464,17 @@ describe('LifecycleManager', () => {
     });
     const script = [
       "const value = Buffer.from('中文进度 100% 完成\\n')",
-      "process.stdout.write('x'.repeat(128 * 1024))",
+      "process.stdout.write('x'.repeat(128 * 1024), () => {",
       'setTimeout(() => process.stdout.write(value.subarray(0, 1)), 20)',
       'setTimeout(() => process.stdout.write(value.subarray(1)), 40)',
-      'setTimeout(() => process.exit(0), 70)',
+      '})',
     ].join(';');
     const started = manager.start({
       command: process.execPath,
       args: ['-e', script],
       shell: false,
     });
+    expect(started.adapter).toBe('generic');
     const completed = await manager.waitForTerminal(started.id, 5_000, 500);
 
     expect(completed.job.state).toBe('succeeded');
