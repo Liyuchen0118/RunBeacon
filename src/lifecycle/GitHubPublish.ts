@@ -10,6 +10,20 @@ export type GitPushFailureKind =
   | 'network'
   | 'unknown';
 
+export interface GitPushAttemptResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+export interface GitPushRetryNotice {
+  attempt: number;
+  maxAttempts: number;
+  delayMs: number;
+}
+
+const MAX_GIT_PUSH_ATTEMPTS = 5;
+
 export function parseGitHubRepository(
   remoteUrl: string
 ): GitHubRepository | undefined {
@@ -43,13 +57,36 @@ export function classifyGitPushFailure(output: string): GitPushFailureKind {
     return 'permission';
   }
   if (
-    /could not resolve host|failed to connect|connection timed out|network is unreachable/i.test(
+    /could not resolve host|failed to connect|connection timed out|network is unreachable|connection (?:was )?reset|recv failure|send failure|unexpected disconnect|remote end hung up|early eof/i.test(
       output
     )
   ) {
     return 'network';
   }
   return 'unknown';
+}
+
+export async function retryGitPush(
+  runAttempt: () => Promise<GitPushAttemptResult>,
+  onRetry: (notice: GitPushRetryNotice) => void = () => undefined,
+  sleep: (delayMs: number) => Promise<void> = (delayMs) =>
+    new Promise((resolvePromise) => setTimeout(resolvePromise, delayMs))
+): Promise<GitPushAttemptResult> {
+  let lastResult: GitPushAttemptResult | undefined;
+  for (let attempt = 1; attempt <= MAX_GIT_PUSH_ATTEMPTS; attempt += 1) {
+    lastResult = await runAttempt();
+    if (lastResult.code === 0) return lastResult;
+    const failure = classifyGitPushFailure(
+      `${lastResult.stderr}\n${lastResult.stdout}`
+    );
+    if (failure !== 'network' || attempt === MAX_GIT_PUSH_ATTEMPTS) {
+      return lastResult;
+    }
+    const delayMs = Math.min(8_000, 500 * 2 ** (attempt - 1));
+    onRetry({ attempt, maxAttempts: MAX_GIT_PUSH_ATTEMPTS, delayMs });
+    await sleep(delayMs);
+  }
+  return lastResult as GitPushAttemptResult;
 }
 
 export function isSuccessfulActionsConclusion(

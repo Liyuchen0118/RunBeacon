@@ -5,6 +5,7 @@ import {
   classifyGitPushFailure,
   parseGitCredentialOutput,
   parseGitHubRepository,
+  retryGitPush,
 } from '../lifecycle/GitHubPublish.js';
 import {
   createGitHubDispatcher,
@@ -79,14 +80,30 @@ async function publish(input: RunnerOptions): Promise<void> {
 
   const sha = (await requireGit(cwd, ['rev-parse', 'HEAD'])).stdout.trim();
   phase(30, 'push', `Pushing ${sha.slice(0, 12)} to ${input.remote}/${branch}`);
-  const push = await runGit(
-    cwd,
-    ['push', '--progress', input.remote, `HEAD:${branch}`],
-    true,
-    {
-      GIT_TERMINAL_PROMPT: '0',
-      GCM_INTERACTIVE: 'never',
-    }
+  const push = await retryGitPush(
+    () =>
+      runGit(
+        cwd,
+        [
+          '-c',
+          'http.version=HTTP/1.1',
+          'push',
+          '--progress',
+          input.remote,
+          `HEAD:${branch}`,
+        ],
+        true,
+        {
+          GIT_TERMINAL_PROMPT: '0',
+          GCM_INTERACTIVE: 'never',
+        }
+      ),
+    ({ attempt, maxAttempts, delayMs }) =>
+      phase(
+        30 + attempt,
+        'network-retry',
+        `Git push network attempt ${attempt}/${maxAttempts} failed; retrying in ${delayMs} ms`
+      )
   );
   if (push.code !== 0) {
     const output = `${push.stderr}\n${push.stdout}`;
