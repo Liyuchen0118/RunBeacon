@@ -1,0 +1,128 @@
+name: RunBeacon Stable Acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      beta_tag:
+        description: Public beta tag under acceptance
+        required: true
+        type: string
+
+concurrency:
+  group: stable-acceptance-${{ inputs.beta_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  require-main:
+    name: Bind acceptance to main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require main and an existing prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BETA_TAG: ${{ inputs.beta_tag }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$BETA_TAG" --jq 'select(.prerelease == true) | .tag_name' | grep -Fx "$BETA_TAG"
+          test "$(git rev-list -n 1 "$BETA_TAG")" = "$GITHUB_SHA"
+
+  linux-training:
+    name: Linux durable training machine
+    needs: require-main
+    runs-on: [self-hosted, Linux, runbeacon-training]
+    timeout-minutes: 35
+    environment: linux-training-acceptance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:lifecycle:daemon
+        env:
+          RUNBEACON_DAEMON_EVIDENCE: acceptance-results/daemon-recovery.json
+      - name: Disconnect for ten minutes and recover the same Runner job
+        run: node scripts/acceptance/linux-training.mjs
+        env:
+          RUNBEACON_ACCEPTANCE_DISCONNECT_MS: 600000
+          RUNBEACON_DAEMON_EVIDENCE: acceptance-results/daemon-recovery.json
+          RUNBEACON_ACCEPTANCE_OUTPUT: acceptance-results/linux-training.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-training-evidence
+          path: acceptance-results/linux-training.json
+          retention-days: 30
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: acceptance-results/linux-training.json
+
+  mac-signing:
+    name: macOS LaunchAgent signing and Notary
+    needs: require-main
+    runs-on: [self-hosted, macOS, runbeacon-signing]
+    timeout-minutes: 20
+    environment: apple-release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Verify Developer ID and Notary through the Aqua LaunchAgent Runner
+        run: node scripts/acceptance/mac-signing.mjs
+        env:
+          RUNBEACON_APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          RUNBEACON_NOTARY_PROFILE: ${{ vars.APPLE_NOTARY_PROFILE }}
+          RUNBEACON_ACCEPTANCE_OUTPUT: acceptance-results/mac-signing.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-signing-evidence
+          path: acceptance-results/mac-signing.json
+          retention-days: 30
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: acceptance-results/mac-signing.json
+
+  codex-plugin:
+    name: Fresh Codex task plugin acceptance
+    needs: require-main
+    runs-on: [self-hosted, Windows, runbeacon-codex]
+    timeout-minutes: 25
+    environment: codex-plugin-acceptance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Reinstall marketplace plugin and execute a fresh Codex task
+        run: node scripts/acceptance/codex-plugin.mjs
+        env:
+          RUNBEACON_ACCEPTANCE_OUTPUT: acceptance-results/codex-plugin.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-plugin-evidence
+          path: acceptance-results/codex-plugin.json
+          retention-days: 30
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: acceptance-results/codex-plugin.json

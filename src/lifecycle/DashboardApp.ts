@@ -16,22 +16,22 @@ export function createDashboardHtml(): string {
     header { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; }
     h1 { font-size:18px; margin:0; }
     #connection { font-size:12px; opacity:.7; }
-    .launcher { border:1px solid color-mix(in srgb, #2563eb 28%, transparent); border-radius:12px; padding:12px; margin-bottom:14px; background:color-mix(in srgb, #2563eb 6%, Canvas); }
+    .launcher { border:1px solid color-mix(in srgb, #2563eb 28%, transparent); border-radius:8px; padding:12px; margin-bottom:14px; background:color-mix(in srgb, #2563eb 6%, Canvas); }
     .launcher-title { font-size:13px; font-weight:700; margin-bottom:7px; }
     .launcher textarea { box-sizing:border-box; width:100%; min-height:84px; resize:vertical; border:1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius:8px; padding:8px; background:Canvas; color:CanvasText; font:12px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
     .launcher-row { display:flex; align-items:center; gap:8px; margin-top:8px; }
     .launcher-row input { flex:1; min-width:0; border:1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius:7px; padding:6px 8px; background:Canvas; color:CanvasText; }
     #launch-status { font-size:12px; opacity:.75; margin-top:7px; min-height:1.2em; }
     #jobs { display:grid; gap:10px; }
-    .empty { opacity:.7; border:1px dashed color-mix(in srgb, CanvasText 25%, transparent); border-radius:10px; padding:22px; text-align:center; }
-    .job { border:1px solid color-mix(in srgb, CanvasText 18%, transparent); border-radius:12px; padding:12px; background:color-mix(in srgb, Canvas 96%, CanvasText 4%); }
+    .empty { opacity:.7; border:1px dashed color-mix(in srgb, CanvasText 25%, transparent); border-radius:8px; padding:22px; text-align:center; }
+    .job { border:1px solid color-mix(in srgb, CanvasText 18%, transparent); border-radius:8px; padding:12px; background:color-mix(in srgb, Canvas 96%, CanvasText 4%); }
     .top { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
     .label { font-weight:650; overflow-wrap:anywhere; }
     .meta { margin-top:3px; font-size:12px; opacity:.7; }
     .state { border-radius:999px; padding:3px 8px; font-size:11px; font-weight:700; text-transform:uppercase; white-space:nowrap; }
     .running,.queued { background:#2563eb22; color:#2563eb; }
     .succeeded { background:#16a34a22; color:#16a34a; }
-    .failed,.timed_out,.orphaned { background:#dc262622; color:#dc2626; }
+    .failed,.timed_out,.lost { background:#dc262622; color:#dc2626; }
     .cancelled { background:#64748b22; color:#64748b; }
     .bar { margin-top:10px; height:7px; background:color-mix(in srgb, CanvasText 12%, transparent); border-radius:999px; overflow:hidden; }
     .fill { height:100%; background:#2563eb; transition:width .2s ease; }
@@ -48,13 +48,13 @@ export function createDashboardHtml(): string {
 <body>
   <header><h1>RunBeacon</h1><span id="connection">Connecting...</span></header>
   <section class="launcher">
-    <div class="launcher-title">Direct default SSH start | bypasses model scheduling</div>
+    <div class="launcher-title">Default SSH task</div>
     <textarea id="launch-command" spellcheck="false" placeholder="Paste the remote shell command exactly as it should run"></textarea>
     <div class="launcher-row">
       <input id="launch-progress" aria-label="Progress pattern" placeholder="Optional progress regex, e.g. (\\d+)%" />
       <button id="launch-button" type="button">Run on default SSH</button>
     </div>
-    <div id="launch-status">The command stays in this app and is sent directly to RunBeacon.</div>
+    <div id="launch-status"></div>
   </section>
   <main id="jobs"><div class="empty">Waiting for the current task...</div></main>
   <script>
@@ -67,11 +67,12 @@ export function createDashboardHtml(): string {
       const launchStatusEl = document.getElementById('launch-status');
       let rpcId = 0;
       let ready;
-      let refreshing = false;
-      let refreshTimer;
+      let watchGeneration = 0;
+      let watching = false;
       let renderedSignature = null;
       let latestJobs = [];
       let focusedJobId;
+      let approvalCapability;
       let launcherAttempt;
       const pending = new Map();
 
@@ -83,6 +84,15 @@ export function createDashboardHtml(): string {
       });
       const structured = (value) =>
         value?.structuredContent ?? value?.result?.structuredContent ?? value?.params?.structuredContent;
+      const privateMetadata = (value) => value?._meta ?? value?.result?._meta ?? value?.params?._meta;
+      const captureApproval = (value, jobId) => {
+        const candidate = privateMetadata(value)?.['runbeacon/approval'];
+        if (candidate?.jobId === jobId && typeof candidate.capability === 'string') {
+          approvalCapability = candidate;
+        }
+      };
+      const hasApproval = (jobId) => approvalCapability?.jobId === jobId &&
+        Date.parse(approvalCapability.expiresAt || '') > Date.now();
 
       window.addEventListener('message', (event) => {
         if (event.source !== window.parent) return;
@@ -98,12 +108,17 @@ export function createDashboardHtml(): string {
         if (message.method === 'ui/notifications/tool-result') {
           const data = structured(message.params);
           if (data?.dashboardJobId && data?.job?.id === data.dashboardJobId) {
+            if (focusedJobId !== data.dashboardJobId) {
+              watchGeneration += 1;
+              approvalCapability = undefined;
+            }
             focusedJobId = data.dashboardJobId;
+            captureApproval(message.params, focusedJobId);
             render([data.job]);
-            scheduleRefresh(isTerminal(data.job.state) ? 5000 : 0);
+            beginWatch();
           } else if (focusedJobId && data?.job?.id === focusedJobId) {
             render([data.job]);
-            scheduleRefresh(isTerminal(data.job.state) ? 5000 : 0);
+            beginWatch();
           } else if (data?.dashboardJobId === null) {
             focusedJobId = undefined;
             render([]);
@@ -114,7 +129,7 @@ export function createDashboardHtml(): string {
       const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({
         '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
       })[char]);
-      const isTerminal = (state) => ['succeeded','failed','cancelled','timed_out','orphaned'].includes(state);
+      const isTerminal = (state) => ['succeeded','failed','cancelled','timed_out','lost'].includes(state);
       const targetLabel = (target) => target?.kind === 'ssh'
         ? (target.username || '') + '@' + (target.host || '') + ':' + (target.port || 22)
         : 'local';
@@ -187,18 +202,33 @@ export function createDashboardHtml(): string {
             ? '<div class="github">Credential profile | ' + escapeHtml(job.metadata.credentialProfile) + '</div>'
             : '';
           const timing = timingHtml(job);
+          const execution = job.execution || {};
+          const runner = '<div class="github">' +
+            escapeHtml(execution.durable ? 'Durable' : 'Direct') +
+            ' | ' + escapeHtml(execution.phase || 'queued') +
+            ' | ' + escapeHtml(execution.connectionState || 'not_applicable') +
+            (execution.reconnectCount ? ' | reconnects ' + escapeHtml(execution.reconnectCount) : '') +
+            (execution.runnerVersion ? ' | Runner ' + escapeHtml(execution.runnerVersion) : '') +
+            '</div>';
           const output = tail ? '<pre>' + escapeHtml(tail) + '</pre>' : '';
           const cancel = isTerminal(job.state) ? ''
             : '<div style="margin-top:9px"><button data-cancel="' + escapeHtml(job.id) + '">Cancel</button></div>';
+          const approval = execution.phase !== 'awaiting_approval' ? ''
+            : hasApproval(job.id)
+              ? '<div style="margin-top:9px;display:flex;gap:7px">' +
+                  '<button data-approval="approve" data-job="' + escapeHtml(job.id) + '">Approve</button>' +
+                  '<button data-approval="reject" data-job="' + escapeHtml(job.id) + '">Reject</button>' +
+                '</div>'
+              : '<div class="meta">Approval required</div>';
           return '<section class="job">' +
             '<div class="top">' +
               '<div><div class="label">' + escapeHtml(job.label) + '</div>' +
               '<div class="meta">' + escapeHtml(targetLabel(job.target)) + ' | ' + escapeHtml(job.id.slice(0,8)) + ' | elapsed ' + duration(job.assessment?.elapsedMs) + ' | ' + escapeHtml(job.assessment?.health || '') + '</div>' +
               '<div class="meta">' + escapeHtml(job.assessment?.summary || '') + '</div></div>' +
               '<span class="state ' + escapeHtml(job.state) + '">' + escapeHtml(job.state) + '</span>' +
-            '</div>' + github + credential + timing + progressBar + progressInfo +
+            '</div>' + runner + github + credential + timing + progressBar + progressInfo +
             (job.error ? '<div class="meta">' + escapeHtml(job.error) + '</div>' : '') +
-            output + cancel + '</section>';
+            output + approval + cancel + '</section>';
         }).join('');
       }
 
@@ -207,47 +237,76 @@ export function createDashboardHtml(): string {
         return request('tools/call', { name, arguments:args });
       }
 
-      async function refresh() {
-        if (refreshing) return;
-        if (!focusedJobId) {
-          connectionEl.textContent = 'Waiting for current task';
-          return;
-        }
-        refreshing = true;
-        const requestedJobId = focusedJobId;
+      const backoff = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      async function beginWatch() {
+        if (watching || !focusedJobId || document.hidden) return;
+        const generation = ++watchGeneration;
+        watching = true;
+        let errorDelay = 250;
         try {
-          const response = await callTool('job_snapshot', { jobId:requestedJobId, tailLines:6 });
-          const data = structured(response);
-          if (focusedJobId === requestedJobId && data?.job?.id === requestedJobId) {
-            render([data.job]);
+          while (generation === watchGeneration && focusedJobId && !document.hidden) {
+            const current = latestJobs.find((job) => job.id === focusedJobId);
+            if (current && isTerminal(current.state)) {
+              approvalCapability = undefined;
+              connectionEl.textContent = 'Complete';
+              return;
+            }
+            try {
+              const requestedJobId = focusedJobId;
+              if (current?.execution?.phase === 'awaiting_approval' && !hasApproval(requestedJobId)) {
+                const dashboardResponse = await callTool('job_dashboard', { jobId:requestedJobId });
+                captureApproval(dashboardResponse, requestedJobId);
+                const dashboardData = structured(dashboardResponse);
+                if (dashboardData?.job?.id === requestedJobId) render([dashboardData.job]);
+              }
+              const response = await callTool('job_watch', {
+                jobId:requestedJobId,
+                afterVersion:current?.version || 0,
+                timeoutMs:25000,
+                tailLines:6
+              });
+              const data = structured(response);
+              if (generation !== watchGeneration || focusedJobId !== requestedJobId) return;
+              if (data?.job?.id === requestedJobId) render([data.job]);
+              connectionEl.textContent = 'Live';
+              errorDelay = 250;
+            } catch (error) {
+              connectionEl.textContent = 'Reconnecting';
+              await backoff(errorDelay);
+              errorDelay = Math.min(5000, errorDelay * 2);
+            }
           }
-          connectionEl.textContent = 'Live | no model polling';
-        } catch (error) {
-          connectionEl.textContent = 'Waiting for MCP connection';
         } finally {
-          refreshing = false;
+          watching = false;
+          if (generation !== watchGeneration && focusedJobId && !document.hidden) {
+            void beginWatch();
+          }
         }
-      }
-
-      function refreshDelay() {
-        if (document.hidden) return 15000;
-        return latestJobs.some((job) => !isTerminal(job.state)) ? 1500 : 5000;
-      }
-
-      function scheduleRefresh(delay = refreshDelay()) {
-        if (refreshTimer) clearTimeout(refreshTimer);
-        refreshTimer = setTimeout(async () => {
-          await refresh();
-          scheduleRefresh();
-        }, delay);
       }
 
       jobsEl.addEventListener('click', async (event) => {
+        const approvalButton = event.target.closest('button[data-approval]');
+        if (approvalButton) {
+          approvalButton.disabled = true;
+          try {
+            if (!hasApproval(approvalButton.dataset.job)) throw new Error('approval capability expired');
+            const response = await callTool('job_approval', {
+              jobId:approvalButton.dataset.job,
+              decision:approvalButton.dataset.approval,
+              capability:approvalCapability.capability,
+            });
+            approvalCapability = undefined;
+            const data = structured(response);
+            if (data?.job?.id === focusedJobId) render([data.job]);
+          } finally { void beginWatch(); }
+          return;
+        }
         const button = event.target.closest('button[data-cancel]');
         if (!button) return;
         button.disabled = true;
         try { await callTool('job_cancel', { jobId:button.dataset.cancel }); }
-        finally { await refresh(); scheduleRefresh(); }
+        finally { void beginWatch(); }
       });
 
       launchButtonEl.addEventListener('click', async () => {
@@ -272,15 +331,19 @@ export function createDashboardHtml(): string {
             useDefaultCredential:true,
             requestTraceId:launcherAttempt.requestTraceId,
             requestReceivedAt:launcherAttempt.requestReceivedAt,
+            executionMode:'auto',
             ...(progressPattern ? { progressPattern } : {}),
           });
           const data = structured(response);
           if (!data?.job) throw new Error('RunBeacon returned no job');
           launcherAttempt = undefined;
+          watchGeneration += 1;
+          approvalCapability = undefined;
           focusedJobId = data.job.id;
+          captureApproval(response, focusedJobId);
           launchStatusEl.textContent = 'Started job ' + data.job.id.slice(0,8) + '. Live updates use no model polling.';
           render([data.job]);
-          scheduleRefresh(0);
+          void beginWatch();
         } catch (error) {
           launchStatusEl.textContent = 'Start failed. Retry keeps the same request trace and cannot duplicate the job.';
         } finally {
@@ -293,9 +356,10 @@ export function createDashboardHtml(): string {
         appCapabilities:{},
         protocolVersion:'2026-01-26'
       }).then(() => notify('ui/notifications/initialized', {}));
-      ready.then(() => scheduleRefresh(0)).catch(() => { connectionEl.textContent = 'MCP Apps bridge unavailable'; });
+      ready.then(() => beginWatch()).catch(() => { connectionEl.textContent = 'MCP Apps bridge unavailable'; });
       document.addEventListener('visibilitychange', () => {
-        scheduleRefresh(document.hidden ? 15000 : 0);
+        watchGeneration += 1;
+        if (!document.hidden) void beginWatch();
       }, { passive:true });
     })();
   </script>

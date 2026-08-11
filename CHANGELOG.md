@@ -1,5 +1,38 @@
 # Changelog
 
+## 3.0.0 (2026-08-11)
+
+### Breaking changes
+
+- narrow the npm package to lifecycle, CLI, MCP, credentials, GitHub publishing, policy, audit, and subscriptions
+- move the old `mcp-console` entry point and 40-tool protocol surface to the 2.0.x legacy line
+- require Node.js 22 or 24 and rename `RJM_*` configuration to `RUNBEACON_*` with 3.x aliases
+
+### Features
+
+- add protocol-v1 Go Runner supervisors with Unix socket RPC, idempotent stdin submission, sequenced recovery, bounded output, timeout, and verified process-group cancellation
+- add daemon protocol v5, event store v2, `lost` recovery state, execution phases, durability metadata, and `job_watch`
+- add interactive approval, hash-chain audit, event subscriptions, and loopback single-task dashboard fallback
+- add generic, training, Slurm, and macOS Apple-signing adapters
+- add Linux user systemd and macOS Aqua LaunchAgent installers
+- map lifecycle jobs to optional experimental MCP Tasks without changing the `job_start -> job_wait` fallback
+- add explicit pinned-fingerprint SSH host-key algorithm migration and native desktop notifications
+- map verified Slurm scheduler cancellation and timeout outcomes to native lifecycle states
+
+### Security and release
+
+- prevent direct SSH fallback after possible Runner acceptance
+- keep commands, credentials, approval metadata, and signing secrets out of Runner argv, snapshots, service files, and audit records
+- add independent JavaScript/TypeScript and Go CodeQL, Go race/vulnerability gates, four-platform assets, SHA256, Sigstore, provenance, SBOM, Developer ID signing, and Notary checks
+- replace automatic releases with a manual promotion gate that refuses tags while main has open CodeQL High/Critical alerts
+- require exact GitHub Actions Sigstore identity verification, signed-byte SBOM generation, a seven-day public Beta, and attested Linux/Mac/Codex acceptance before Stable
+- require Slurm scheduler acknowledgement in addition to process-group exit before reporting cancellation
+- reject deprecated SSH RSA/SHA-1 negotiation while retaining RSA SHA-2 host keys
+- reject coordinator idempotency-key reuse with a different execution digest, including after restart
+- preserve partially written Runner events for continuation and release pruned event cursors
+- isolate desktop notifier processes from credential and task environment variables
+- promote the exact signed Beta Runner assets to Stable instead of rebuilding them
+
 ## 2.0.0 (2026-08-03)
 
 ### Breaking security changes
@@ -28,49 +61,3 @@
 - separate confirmed Git pushes from best-effort Actions monitoring so transient API failures no longer misreport the push as failed
 - add workflow and open-PR eligibility detection with a fast `no-workflows` terminal phase
 - add bounded GitHub API retries, proxy reuse, `NO_PROXY`, safe diagnostics, and optional `requireActions` gating
-
-## [1.1.3](https://github.com/ooples/mcp-console-automation/compare/v1.1.2...v1.1.3) (2026-07-15)
-
-### Bug Fixes
-
-- **ssh:** stop acknowledging commands on their own output, which wedged long sessions ([#95](https://github.com/ooples/mcp-console-automation/issues/95)) ([ffb7a45](https://github.com/ooples/mcp-console-automation/commit/ffb7a456634569df080a528af91b2e66dc818a7b))
-
-## [1.1.2](https://github.com/ooples/mcp-console-automation/compare/v1.1.1...v1.1.2) (2026-07-15)
-
-### Bug Fixes
-
-- harden console automation mcp ([#92](https://github.com/ooples/mcp-console-automation/issues/92)) ([3e7d369](https://github.com/ooples/mcp-console-automation/commit/3e7d3696f40c0b2e0e705630eb78b7d4ab88747e))
-
-## [1.1.1](https://github.com/ooples/mcp-console-automation/compare/v1.1.0...v1.1.1) (2026-07-09)
-
-### Bug Fixes
-
-- **remote:** honor private-key path, find git bash, run shell builtins via shell ([#80](https://github.com/ooples/mcp-console-automation/issues/80)) ([e6615b2](https://github.com/ooples/mcp-console-automation/commit/e6615b23937df85417791df0843d87de8143d4a1))
-
-## [1.1.0](https://github.com/ooples/mcp-console-automation/compare/v1.0.2...v1.1.0) (2026-07-08)
-
-### Features
-
-- add support for interactive .NET console applications ([#14](https://github.com/ooples/mcp-console-automation/issues/14)) ([fc14566](https://github.com/ooples/mcp-console-automation/commit/fc1456603c1ea57b7f7329aae435f1db2c50ec1e))
-- **release:** migrate from semantic-release to release-please ([#85](https://github.com/ooples/mcp-console-automation/issues/85)) ([21dacad](https://github.com/ooples/mcp-console-automation/commit/21dacadbea169bd3949e01de012260de1dce3d66))
-
-### Bug Fixes
-
-- add explicit GitHub OIDC login before publishing ([941be1e](https://github.com/ooples/mcp-console-automation/commit/941be1ed9c676910e6ca52f58ea65f6488f2e10b))
-- add timeout cleanup and increase test timeout values ([eef0a6e](https://github.com/ooples/mcp-console-automation/commit/eef0a6e3ce3bc9fba390408046d9e0d07345d04c))
-- add timer cleanup for docker protocol connection monitoring and reconnection ([5d4ece7](https://github.com/ooples/mcp-console-automation/commit/5d4ece747c2c14dcc5d44a072593f3684317a071))
-- add workerpool timeout cleanup to prevent memory leaks ([2e304eb](https://github.com/ooples/mcp-console-automation/commit/2e304eb619c4fe4919a3096a9721a049cd0e18e9))
-- build MCP Publisher from source instead of npm ([19d5e24](https://github.com/ooples/mcp-console-automation/commit/19d5e245388a366375ca2df3c3dd8c56a87ce9c7))
-- **ci:** repair the test suite and formatting (53 failures -&gt; 0) ([#81](https://github.com/ooples/mcp-console-automation/issues/81)) ([fb1e6ea](https://github.com/ooples/mcp-console-automation/commit/fb1e6ea2c1be0de52490f76beba03eb9de1fc4d5))
-- convert ES module mocks to CommonJS format for Jest compatibility ([c6be03b](https://github.com/ooples/mcp-console-automation/commit/c6be03bb103ec1c657c4a0aa6225ded10fb2574a))
-- convert jest mocks to mjs format for es module compatibility ([811f5f2](https://github.com/ooples/mcp-console-automation/commit/811f5f237909a3113857c7565e9ef0ff8b201fe5))
-- enable unit tests with ESM package mocks ([70dbff4](https://github.com/ooples/mcp-console-automation/commit/70dbff4c89ac04620246f34d4478ff1fa3448106))
-- handle protected branch push gracefully in MCP registry workflow ([fd4dcb9](https://github.com/ooples/mcp-console-automation/commit/fd4dcb90e9a941c1304261d2d77f5a6965f3395a))
-- make Docker publishing optional to prevent release failures ([f689f66](https://github.com/ooples/mcp-console-automation/commit/f689f6691e767057deb927022b43911e0dd7e9ba))
-- make server.json commit step optional ([8d649b9](https://github.com/ooples/mcp-console-automation/commit/8d649b9245c72453b8309b4d0dabb92ff83418d0))
-- **release:** add the conventionalcommits changelog preset dependency ([#84](https://github.com/ooples/mcp-console-automation/issues/84)) ([a7400ac](https://github.com/ooples/mcp-console-automation/commit/a7400acfaca62a8d79f77606ffe3df2ee245bd5d))
-- **release:** point semantic-release at the real github repository ([#83](https://github.com/ooples/mcp-console-automation/issues/83)) ([1375c5d](https://github.com/ooples/mcp-console-automation/commit/1375c5dec96e6db3d87d9fdfd2c061552e075d54))
-- remove redundant command option from localprotocol platform tests and fix timer leak ([8dba508](https://github.com/ooples/mcp-console-automation/commit/8dba5083500bc5f2ff51ce8f22f3809e62e690e5))
-- resolve jest es module import errors and wsl protocol compatibility ([09f7ffe](https://github.com/ooples/mcp-console-automation/commit/09f7ffeacdfb5b8634f7bc24f1efd83795a08027))
-- skip hardware-intensive integration and stress tests in ci ([4b4b444](https://github.com/ooples/mcp-console-automation/commit/4b4b4441c61d7e00ab85a00c05c094594e7538e3))
-- use GitHub OIDC authentication for MCP registry ([392b021](https://github.com/ooples/mcp-console-automation/commit/392b021bf50bbcd8568ec5d82eee9521e17cd787))

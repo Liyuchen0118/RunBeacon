@@ -1,0 +1,145 @@
+#!/usr/bin/env node
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { writeAcceptanceReport, requiredEnvironment } from './report.mjs';
+
+assert.equal(
+  process.platform,
+  'darwin',
+  'Mac signing acceptance requires macOS'
+);
+const startedAt = new Date().toISOString();
+const root = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '../..'
+);
+const temporary = fs.mkdtempSync(
+  path.join(os.tmpdir(), 'runbeacon-mac-acceptance-')
+);
+const build = path.join(temporary, 'runbeacon-runner');
+const installed = path.join(
+  os.homedir(),
+  'Library',
+  'Application Support',
+  'RunBeacon',
+  'bin',
+  'runbeacon-runner'
+);
+const identity = requiredEnvironment('RUNBEACON_APPLE_SIGNING_IDENTITY');
+const notaryProfile = requiredEnvironment('RUNBEACON_NOTARY_PROFILE');
+const output =
+  process.env.RUNBEACON_ACCEPTANCE_OUTPUT ||
+  path.join(root, 'acceptance-results', 'mac-signing.json');
+
+function run(command, args, options = {}) {
+  const result = spawnSync(command, args, {
+    cwd: root,
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+    ...options,
+  });
+  assert.equal(
+    result.status,
+    0,
+    `${command} failed:\n${result.stdout}\n${result.stderr}`
+  );
+  return result;
+}
+
+function rpc(method, params = {}) {
+  const result = run(installed, ['rpc'], {
+    input: `${JSON.stringify({ protocolVersion: 1, method, params })}\n`,
+  });
+  const response = JSON.parse(result.stdout);
+  assert.equal(response.ok, true, JSON.stringify(response.error));
+  return response.result;
+}
+
+try {
+  run('go', ['build', '-trimpath', '-o', build, './cmd/runbeacon-runner'], {
+    cwd: path.join(root, 'runner'),
+  });
+  run(build, ['install']);
+  run('launchctl', ['print', `gui/${process.getuid()}`]);
+  const command = [
+    'set -eu',
+    'rb_tmp=$(mktemp -d "${TMPDIR:-/tmp}/runbeacon-signing-acceptance.XXXXXX")',
+    'trap \'rm -rf "$rb_tmp"\' EXIT HUP INT TERM',
+    'printf \'int main(void) { return 0; }\\n\' >"$rb_tmp/probe.c"',
+    'xcrun clang -Os -o "$rb_tmp/probe" "$rb_tmp/probe.c"',
+    'security find-identity -v -p codesigning | grep -F -- "$RUNBEACON_APPLE_SIGNING_IDENTITY" >/dev/null',
+    'codesign --force --options runtime --timestamp=none --sign "$RUNBEACON_APPLE_SIGNING_IDENTITY" "$rb_tmp/probe"',
+    'codesign --verify --strict --verbose=2 "$rb_tmp/probe"',
+    'if codesign -d --verbose=4 "$rb_tmp/probe" 2>&1 | grep -q \'^Timestamp=\'; then exit 65; fi',
+    'echo RUNBEACON_UNTIMESTAMPED_OK',
+    'codesign --force --options runtime --timestamp --sign "$RUNBEACON_APPLE_SIGNING_IDENTITY" "$rb_tmp/probe"',
+    'codesign --verify --strict --verbose=2 "$rb_tmp/probe"',
+    'codesign -d --verbose=4 "$rb_tmp/probe" 2>&1 | grep -q \'^Timestamp=\'',
+    'echo RUNBEACON_TIMESTAMPED_OK',
+    'xcrun notarytool history --keychain-profile "$RUNBEACON_NOTARY_PROFILE" >/dev/null',
+    'echo RUNBEACON_NOTARY_OK',
+  ].join('\n');
+  const jobId = randomUUID();
+  const submitted = rpc('submit', {
+    jobId,
+    idempotencyKey: `mac-signing-${jobId}`,
+    commandDigest: `sha256:${createHash('sha256').update(command).digest('hex')}`,
+    command,
+    env: {
+      RUNBEACON_APPLE_SIGNING_IDENTITY: identity,
+      RUNBEACON_NOTARY_PROFILE: notaryProfile,
+    },
+    timeoutMillis: 10 * 60 * 1_000,
+    cancellationMode: 'process_group',
+    outputPolicy: {
+      mode: 'full',
+      maxBytes: 4 * 1024 * 1024,
+      retentionHours: 168,
+    },
+  });
+  assert.equal(submitted.created, true);
+  let sequence = 0;
+  let finalJob = submitted.job;
+  const events = [];
+  while (
+    !['succeeded', 'failed', 'cancelled', 'timed_out', 'lost'].includes(
+      finalJob.state
+    ) ||
+    sequence < Number(finalJob.lastEventSequence || 0)
+  ) {
+    const watched = rpc('watch', {
+      jobId,
+      afterSequence: sequence,
+      timeoutMillis: 25_000,
+    });
+    for (const event of watched.events || []) {
+      events.push(event);
+      sequence = Math.max(sequence, event.sequence);
+    }
+    finalJob = watched.job;
+  }
+  assert.equal(finalJob.state, 'succeeded');
+  const text = events.map((event) => event.data || '').join('');
+  const report = writeAcceptanceReport({
+    kind: 'mac-signing',
+    output,
+    startedAt,
+    checks: {
+      launchAgentAqua: true,
+      developerIdUntimestamped: text.includes('RUNBEACON_UNTIMESTAMPED_OK'),
+      developerIdTimestamped: text.includes('RUNBEACON_TIMESTAMPED_OK'),
+      notaryProfile: text.includes('RUNBEACON_NOTARY_OK'),
+      keychainSecretStayedLocal:
+        !/unlock-keychain|keychain-password|\.p8/i.test(command),
+    },
+    details: { identity, notaryProfile, runnerJobId: jobId },
+  });
+  process.stdout.write(`${JSON.stringify(report)}\n`);
+} finally {
+  fs.rmSync(temporary, { recursive: true, force: true });
+}

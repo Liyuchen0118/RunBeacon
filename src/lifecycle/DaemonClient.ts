@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { fileURLToPath } from 'node:url';
@@ -13,12 +13,24 @@ import {
   ensureDaemonToken,
   getDaemonPaths,
 } from './DaemonPaths.js';
-import { JobSnapshot, StartJobInput, WaitResult } from './types.js';
+import {
+  ApprovalContext,
+  JobSnapshot,
+  StartJobInput,
+  WaitResult,
+  WatchResult,
+} from './types.js';
 import {
   DAEMON_PROTOCOL_VERSION,
   DaemonPing,
   RUNBEACON_VERSION,
 } from './protocol.js';
+import { AuditEvent, AuditQuery } from './AuditLog.js';
+import { PolicyConfig, PolicyUpdate } from './PolicyEngine.js';
+import {
+  EventSubscription,
+  SaveEventSubscription,
+} from './EventSubscriptionStore.js';
 
 interface RpcRequest {
   id: string;
@@ -41,6 +53,13 @@ export interface LifecycleService {
     tailLines?: number,
     signal?: AbortSignal
   ): Promise<WaitResult>;
+  watchForChange(
+    jobId: string,
+    afterVersion: number,
+    timeoutMs?: number,
+    tailLines?: number,
+    signal?: AbortSignal
+  ): Promise<WatchResult>;
   snapshot(
     jobId: string,
     tailLines?: number
@@ -50,6 +69,19 @@ export interface LifecycleService {
     limit?: number
   ): Promise<JobSnapshot[]> | JobSnapshot[];
   cancel(jobId: string): Promise<JobSnapshot> | JobSnapshot;
+  approve(jobId: string): Promise<JobSnapshot> | JobSnapshot;
+  rejectApproval(jobId: string): Promise<JobSnapshot> | JobSnapshot;
+  approvalContext(jobId: string): Promise<ApprovalContext> | ApprovalContext;
+  policyConfig(): Promise<PolicyConfig> | PolicyConfig;
+  updatePolicy(input: PolicyUpdate): Promise<PolicyConfig> | PolicyConfig;
+  queryAudit(query?: AuditQuery): Promise<AuditEvent[]> | AuditEvent[];
+  listEventSubscriptions(): Promise<EventSubscription[]> | EventSubscription[];
+  saveEventSubscription(
+    input: SaveEventSubscription
+  ): Promise<EventSubscription> | EventSubscription;
+  deleteEventSubscription(
+    id: string
+  ): Promise<EventSubscription> | EventSubscription;
 }
 
 export interface DaemonClientOptions {
@@ -104,7 +136,7 @@ export class DaemonClient implements LifecycleService {
         env: {
           ...process.env,
           MCP_SERVER_MODE: 'true',
-          RJM_BUILD_VERSION: this.expectedBuildVersion,
+          RUNBEACON_BUILD_VERSION: this.expectedBuildVersion,
         },
       }
     );
@@ -128,16 +160,47 @@ export class DaemonClient implements LifecycleService {
     return this.request('start', { input });
   }
 
-  waitForTerminal(
+  async waitForTerminal(
     jobId: string,
     timeoutMs?: number,
     tailLines?: number,
     signal?: AbortSignal
   ): Promise<WaitResult> {
-    const requestTimeout = Math.max(5_000, (timeoutMs ?? 86_400_000) + 5_000);
+    const waitBudget = timeoutMs ?? 86_400_000;
+    const deadline = Date.now() + waitBudget;
+    for (;;) {
+      const remaining = Math.max(0, deadline - Date.now());
+      try {
+        return await this.request(
+          'wait',
+          { jobId, timeoutMs: remaining, tailLines },
+          Math.max(5_000, remaining + 5_000),
+          signal
+        );
+      } catch (error) {
+        if (
+          signal?.aborted ||
+          error instanceof DaemonRpcError ||
+          Date.now() >= deadline
+        ) {
+          throw error;
+        }
+        await this.ensureReady();
+      }
+    }
+  }
+
+  watchForChange(
+    jobId: string,
+    afterVersion: number,
+    timeoutMs?: number,
+    tailLines?: number,
+    signal?: AbortSignal
+  ): Promise<WatchResult> {
+    const requestTimeout = Math.max(5_000, (timeoutMs ?? 25_000) + 5_000);
     return this.request(
-      'wait',
-      { jobId, timeoutMs, tailLines },
+      'watch',
+      { jobId, afterVersion, timeoutMs, tailLines },
       requestTimeout,
       signal
     );
@@ -153,6 +216,44 @@ export class DaemonClient implements LifecycleService {
 
   cancel(jobId: string): Promise<JobSnapshot> {
     return this.request('cancel', { jobId });
+  }
+
+  approve(jobId: string): Promise<JobSnapshot> {
+    return this.request('approval', { jobId, decision: 'approve' });
+  }
+
+  rejectApproval(jobId: string): Promise<JobSnapshot> {
+    return this.request('approval', { jobId, decision: 'reject' });
+  }
+
+  approvalContext(jobId: string): Promise<ApprovalContext> {
+    return this.request('approval_context', { jobId });
+  }
+
+  policyConfig(): Promise<PolicyConfig> {
+    return this.request('policy', { action: 'get' });
+  }
+
+  updatePolicy(input: PolicyUpdate): Promise<PolicyConfig> {
+    return this.request('policy', { action: 'update', input });
+  }
+
+  queryAudit(query: AuditQuery = {}): Promise<AuditEvent[]> {
+    return this.request('audit', { query });
+  }
+
+  listEventSubscriptions(): Promise<EventSubscription[]> {
+    return this.request('event_subscription', { action: 'list' });
+  }
+
+  saveEventSubscription(
+    input: SaveEventSubscription
+  ): Promise<EventSubscription> {
+    return this.request('event_subscription', { action: 'save', input });
+  }
+
+  deleteEventSubscription(id: string): Promise<EventSubscription> {
+    return this.request('event_subscription', { action: 'delete', id });
   }
 
   shutdown(): Promise<{ stopped: boolean }> {
@@ -233,10 +334,12 @@ export class DaemonClient implements LifecycleService {
     signal?: AbortSignal
   ): Promise<T> {
     if (signal?.aborted) {
-      return Promise.reject(new Error(`Daemon request ${method} was aborted`));
+      return Promise.reject(
+        new DaemonTransportError(`Daemon request ${method} was aborted`)
+      );
     }
     return new Promise<T>((resolve, reject) => {
-      const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const id = randomUUID();
       const socket = createConnection(this.paths.socketPath);
       let buffer = '';
       let settled = false;
@@ -250,12 +353,17 @@ export class DaemonClient implements LifecycleService {
         else resolve(result as T);
       };
       const timer = setTimeout(
-        () => finish(new Error(`Daemon request ${method} timed out`)),
+        () =>
+          finish(
+            new DaemonTransportError(`Daemon request ${method} timed out`)
+          ),
         timeoutMs
       );
       timer.unref?.();
       const abortListener = () =>
-        finish(new Error(`Daemon request ${method} was aborted`));
+        finish(
+          new DaemonTransportError(`Daemon request ${method} was aborted`)
+        );
       signal?.addEventListener('abort', abortListener, { once: true });
 
       socket.setEncoding('utf8');
@@ -271,18 +379,48 @@ export class DaemonClient implements LifecycleService {
           const response = JSON.parse(
             buffer.slice(0, newline)
           ) as RpcResponse<T>;
-          if (response.id !== id) throw new Error('Mismatched daemon response');
-          if (response.error) finish(new Error(response.error));
+          if (response.id !== id) {
+            throw new DaemonTransportError('Mismatched daemon response');
+          }
+          if (response.error) finish(new DaemonRpcError(response.error));
           else finish(undefined, response.result);
         } catch (error) {
-          finish(error);
+          finish(
+            error instanceof DaemonRpcError ||
+              error instanceof DaemonTransportError
+              ? error
+              : new DaemonTransportError(String(error))
+          );
         }
       });
-      socket.once('error', (error) => finish(error));
+      socket.once('error', (error) =>
+        finish(new DaemonTransportError(error.message))
+      );
       socket.once('end', () => {
-        if (!settled) finish(new Error('Daemon closed the connection'));
+        if (!settled) {
+          finish(new DaemonTransportError('Daemon closed the connection'));
+        }
+      });
+      socket.once('close', () => {
+        if (!settled) {
+          finish(new DaemonTransportError('Daemon connection closed'));
+        }
       });
     });
+  }
+}
+
+class DaemonRpcError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DaemonRpcError';
+  }
+}
+
+class DaemonTransportError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DaemonTransportError';
   }
 }
 

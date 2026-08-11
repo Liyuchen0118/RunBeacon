@@ -1,7 +1,7 @@
 interface:
   display_name: "RunBeacon Remote Jobs"
-  short_description: "Tracked routing for SSH, GitHub, and remote jobs"
-  default_prompt: "Use $monitor-remote-jobs to configure default credentials and run this remote or GitHub job through RunBeacon."
+  short_description: "Durable SSH, training, signing, and GitHub jobs"
+  default_prompt: "Use $monitor-remote-jobs to run and monitor this remote or GitHub task durably through RunBeacon."
 
 policy:
   allow_implicit_invocation: true
@@ -10,4 +10,4 @@ dependencies:
   tools:
     - type: "mcp"
       value: "runbeacon"
-      description: "RunBeacon tracked jobs, SSH credentials, waits, and live dashboard"
+      description: "Durable RunBeacon jobs, credentials, events, and single-task dashboard"

@@ -1,0 +1,32 @@
+{
+  "name": "runbeacon-runner",
+  "version": "3.0.0",
+  "description": "Signed binary installer for the RunBeacon durable remote runner",
+  "type": "module",
+  "bin": {
+    "runbeacon-runner-install": "./install.mjs"
+  },
+  "files": [
+    "install.mjs",
+    "verify.mjs",
+    "assets",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "author": "RunBeacon contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Liyuchen0118/RunBeacon.git",
+    "directory": "packages/runner-installer"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "sigstore": "^5.0.0"
+  }
+}

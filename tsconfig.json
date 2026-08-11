@@ -24,6 +24,12 @@
     "strictPropertyInitialization": false,
     "downlevelIteration": true
   },
-  "include": ["src/**/*"],
+  "include": [
+    "src/lifecycle/**/*",
+    "src/daemon/lifecycle-daemon.ts",
+    "src/daemon/github-publish-runner.ts",
+    "src/mcp/lifecycle-server.ts",
+    "src/cli/**/*"
+  ],
   "exclude": ["node_modules", "dist", "tests"]
 }

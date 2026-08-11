@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const temporaryDirectory = fs.mkdtempSync(
-  path.join(os.tmpdir(), 'console-automation-installer-')
+  path.join(os.tmpdir(), 'runbeacon-installer-')
 );
 const customPath = path.join(temporaryDirectory, 'config with spaces.json');
 
@@ -54,12 +54,17 @@ try {
   );
 
   const config = JSON.parse(fs.readFileSync(customPath, 'utf8'));
-  const server = config.mcpServers?.['console-automation'];
-  assert.ok(server, 'Installer did not write console-automation configuration');
-  assert.equal(path.resolve(server.command), path.resolve(process.execPath));
+  const server = config.mcpServers?.['remote-job-monitor'];
+  assert.ok(server, 'Installer did not write RunBeacon configuration');
+  assert.equal(path.isAbsolute(server.command), true);
+  assert.equal(fs.existsSync(server.command), true);
+  assert.match(path.basename(server.command), /^node(?:\.exe)?$/i);
   assert.equal(server.args.length, 1);
-  assert.match(server.args[0], /dist[\\/]mcp[\\/]server\.js$/);
-  assert.deepEqual(server.env, { LOG_LEVEL: 'warn' });
+  assert.match(server.args[0], /dist[\\/]mcp[\\/]lifecycle-server\.js$/);
+  assert.deepEqual(server.env, {
+    MCP_SERVER_MODE: 'true',
+    LOG_LEVEL: 'warn',
+  });
 
   const secondRun = spawnSync(invocation.command, invocation.args, {
     cwd: root,

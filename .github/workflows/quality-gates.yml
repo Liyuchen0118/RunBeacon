@@ -2,72 +2,52 @@ name: Quality Gates
 
 on:
   pull_request:
-    branches: [ master, main ]
+    branches: [main, develop]
   push:
-    branches: [ master, main ]
+    branches: [main, develop]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: quality-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  bundle-size:
-    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
-    name: Bundle Size Analysis
+  source-quality:
+    name: Format, lint, and types
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
-      - name: Install dependencies
-        run: npm ci
-      - name: Build
-        run: npm run build
-      - name: Calculate dist size
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: Validate GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+  package-boundary:
+    name: Core package boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Reject legacy runtime files in the npm tarball
         run: |
-          if [ -d dist ]; then
-            echo "Dist size: $(du -sh dist | cut -f1)"
-          else
-            echo "No dist directory found"
-          fi
-
-  lint:
-    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
-    name: Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-      - name: Install dependencies
-        run: npm ci
-      - name: ESLint
-        run: npm run lint
-
-  typecheck:
-    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
-    name: Type Check
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-      - name: Install dependencies
-        run: npm ci
-      - name: TypeScript noEmit
-        run: npm run typecheck
+          npm pack --json > pack.json
+          node -e "const p=require('./pack.json')[0]; const bad=p.files.filter(f=>/^dist\/(core|protocols|testing)\//.test(f.path)); if(bad.length){console.error(bad);process.exit(1)}"

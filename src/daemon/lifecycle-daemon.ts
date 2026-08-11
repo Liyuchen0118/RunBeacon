@@ -12,10 +12,12 @@ import {
 import { ensureDaemonToken, getDaemonPaths } from '../lifecycle/DaemonPaths.js';
 import { safeErrorMessage } from '../lifecycle/security.js';
 import { StartJobInput } from '../lifecycle/types.js';
+import { createSshProfileResolver } from '../lifecycle/CredentialResolver.js';
 import {
   DAEMON_PROTOCOL_VERSION,
   RUNBEACON_VERSION,
 } from '../lifecycle/protocol.js';
+import { runBeaconBoolean, runBeaconEnv } from '../lifecycle/Environment.js';
 
 process.env.MCP_SERVER_MODE = 'true';
 
@@ -32,18 +34,62 @@ const buildId = createHash('sha256')
 const buildVersion = readPluginBuildVersion(import.meta.url);
 let shuttingDown = false;
 const manager = new LifecycleManager({
-  statePath: process.env.RJM_STATE_PATH || paths.statePath,
-  maxConcurrentJobs: Number(process.env.RJM_MAX_CONCURRENT_JOBS || 4),
-  maxOutputBytes: Number(process.env.RJM_MAX_OUTPUT_BYTES || 1024 * 1024),
-  persistOutput: process.env.RJM_PERSIST_OUTPUT === 'true',
-  persistMetadata: process.env.RJM_PERSIST_METADATA === 'true',
-  persistenceDebounceMs: Number(process.env.RJM_PERSIST_DEBOUNCE_MS || 250),
-  maxRetainedJobs: Number(process.env.RJM_MAX_RETAINED_JOBS || 1000),
-  cancellationGraceMs: Number(process.env.RJM_CANCEL_GRACE_MS || 5000),
-  sshHandshakeAttempts: Number(process.env.RJM_SSH_HANDSHAKE_ATTEMPTS || 5),
-  sshRetryBaseDelayMs: Number(process.env.RJM_SSH_RETRY_BASE_DELAY_MS || 250),
-  sshReadyTimeoutMs: Number(process.env.RJM_SSH_READY_TIMEOUT_MS || 12_000),
+  statePath:
+    runBeaconEnv('RUNBEACON_STATE_PATH', 'RJM_STATE_PATH') || paths.statePath,
+  maxConcurrentJobs: envNumber(
+    'RUNBEACON_MAX_CONCURRENT_JOBS',
+    'RJM_MAX_CONCURRENT_JOBS',
+    4
+  ),
+  maxOutputBytes: envNumber(
+    'RUNBEACON_MAX_OUTPUT_BYTES',
+    'RJM_MAX_OUTPUT_BYTES',
+    1024 * 1024
+  ),
+  persistOutput: runBeaconBoolean(
+    'RUNBEACON_PERSIST_OUTPUT',
+    'RJM_PERSIST_OUTPUT'
+  ),
+  persistMetadata: runBeaconBoolean(
+    'RUNBEACON_PERSIST_METADATA',
+    'RJM_PERSIST_METADATA'
+  ),
+  persistenceDebounceMs: envNumber(
+    'RUNBEACON_PERSIST_DEBOUNCE_MS',
+    'RJM_PERSIST_DEBOUNCE_MS',
+    250
+  ),
+  maxRetainedJobs: envNumber(
+    'RUNBEACON_MAX_RETAINED_JOBS',
+    'RJM_MAX_RETAINED_JOBS',
+    1000
+  ),
+  cancellationGraceMs: envNumber(
+    'RUNBEACON_CANCEL_GRACE_MS',
+    'RJM_CANCEL_GRACE_MS',
+    5000
+  ),
+  sshHandshakeAttempts: envNumber(
+    'RUNBEACON_SSH_HANDSHAKE_ATTEMPTS',
+    'RJM_SSH_HANDSHAKE_ATTEMPTS',
+    5
+  ),
+  sshRetryBaseDelayMs: envNumber(
+    'RUNBEACON_SSH_RETRY_BASE_DELAY_MS',
+    'RJM_SSH_RETRY_BASE_DELAY_MS',
+    250
+  ),
+  sshReadyTimeoutMs: envNumber(
+    'RUNBEACON_SSH_READY_TIMEOUT_MS',
+    'RJM_SSH_READY_TIMEOUT_MS',
+    12_000
+  ),
+  recoverRunnerTarget: createSshProfileResolver(dataDir),
 });
+
+function envNumber(name: string, legacy: string, fallback: number): number {
+  return Number(runBeaconEnv(name, legacy) || fallback);
+}
 
 interface RpcRequest {
   id: string;
@@ -110,6 +156,19 @@ async function handle(
           )
         );
         break;
+      case 'watch':
+        respond(
+          socket,
+          request.id,
+          await manager.watchForChange(
+            String(args.jobId),
+            Number(args.afterVersion ?? 0),
+            args.timeoutMs as number | undefined,
+            args.tailLines as number | undefined,
+            signal
+          )
+        );
+        break;
       case 'snapshot':
         respond(
           socket,
@@ -132,6 +191,59 @@ async function handle(
         break;
       case 'cancel':
         respond(socket, request.id, manager.cancel(String(args.jobId)));
+        break;
+      case 'approval':
+        respond(
+          socket,
+          request.id,
+          args.decision === 'reject'
+            ? manager.rejectApproval(String(args.jobId))
+            : manager.approve(String(args.jobId))
+        );
+        break;
+      case 'approval_context':
+        respond(
+          socket,
+          request.id,
+          manager.approvalContext(String(args.jobId))
+        );
+        break;
+      case 'policy':
+        respond(
+          socket,
+          request.id,
+          args.action === 'update'
+            ? manager.updatePolicy(
+                (args.input ?? {}) as Parameters<
+                  LifecycleManager['updatePolicy']
+                >[0]
+              )
+            : manager.policyConfig()
+        );
+        break;
+      case 'audit':
+        respond(
+          socket,
+          request.id,
+          manager.queryAudit(
+            (args.query ?? {}) as Parameters<LifecycleManager['queryAudit']>[0]
+          )
+        );
+        break;
+      case 'event_subscription':
+        respond(
+          socket,
+          request.id,
+          args.action === 'save'
+            ? manager.saveEventSubscription(
+                (args.input ?? {}) as Parameters<
+                  LifecycleManager['saveEventSubscription']
+                >[0]
+              )
+            : args.action === 'delete'
+              ? manager.deleteEventSubscription(String(args.id))
+              : manager.listEventSubscriptions()
+        );
         break;
       case 'shutdown':
         if (args.replacement) {

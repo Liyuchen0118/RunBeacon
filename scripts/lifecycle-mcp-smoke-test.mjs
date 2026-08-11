@@ -44,10 +44,15 @@ const credentialHelperCommand = `!node ${credentialHelperPath.replaceAll('\\', '
 
 assert.ok(fs.existsSync(serverPath), `Missing built server: ${serverPath}`);
 
-const client = new Client({
-  name: 'remote-job-monitor-smoke',
-  version: '0.1.0',
-});
+const client = new Client(
+  {
+    name: 'remote-job-monitor-smoke',
+    version: '0.1.0',
+  },
+  {
+    capabilities: { tasks: { list: {}, cancel: {} } },
+  }
+);
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: [serverPath],
@@ -56,7 +61,7 @@ const transport = new StdioClientTransport({
     ...process.env,
     MCP_SERVER_MODE: 'true',
     PLUGIN_DATA: temporaryData,
-    RJM_INLINE_MANAGER: 'true',
+    RUNBEACON_INLINE_MANAGER: 'true',
     GIT_CONFIG_COUNT: '2',
     GIT_CONFIG_KEY_0: 'credential.helper',
     GIT_CONFIG_VALUE_0: '',
@@ -68,13 +73,14 @@ const transport = new StdioClientTransport({
 try {
   await client.connect(transport);
   assert.equal(client.getServerVersion()?.name, 'remote-job-monitor');
-  assert.equal(client.getServerVersion()?.version, '1.0.0');
+  assert.equal(client.getServerVersion()?.version, '3.0.0');
 
   const { tools } = await client.listTools();
   const toolNames = new Set(tools.map((tool) => tool.name));
   for (const name of [
     'job_start',
     'job_wait',
+    'job_watch',
     'job_snapshot',
     'job_list',
     'job_cancel',
@@ -89,11 +95,44 @@ try {
     'ssh_password_delete',
     'github_token_save',
     'github_token_delete',
+    'runner_manage',
+    'policy_manage',
+    'event_subscription_manage',
+    'audit_query',
   ]) {
     assert.ok(toolNames.has(name), `Missing tool: ${name}`);
   }
+  assert.equal(toolNames.size, 21);
+  assert.equal(toolNames.has('job_approval'), false);
 
   const jobStartTool = tools.find((tool) => tool.name === 'job_start');
+  assert.equal(jobStartTool?.execution?.taskSupport, 'optional');
+
+  const taskMessages = [];
+  for await (const message of client.experimental.tasks.callToolStream(
+    {
+      name: 'job_start',
+      arguments: {
+        command: process.execPath,
+        args: ['-e', 'process.exit(0)'],
+        shell: false,
+        label: 'mcp-task-smoke',
+      },
+    },
+    undefined,
+    { timeout: 10_000 }
+  )) {
+    taskMessages.push(message);
+  }
+  const createdTask = taskMessages.find(
+    (message) => message.type === 'taskCreated'
+  );
+  assert.ok(createdTask?.task.taskId, 'MCP Task was not created');
+  assert.equal(taskMessages.at(-1)?.type, 'result');
+  assert.equal(
+    (await client.experimental.tasks.getTask(createdTask.task.taskId)).status,
+    'completed'
+  );
   assert.equal(
     jobStartTool?._meta?.ui?.resourceUri,
     'ui://remote-job-monitor/dashboard.html'
@@ -167,6 +206,66 @@ try {
   assert.equal(
     typeof completed.structuredContent?.job?.timing?.firstOutputAt,
     'string'
+  );
+
+  const approvalStarted = await client.callTool({
+    name: 'job_start',
+    arguments: {
+      command: process.execPath,
+      args: ['-e', "console.log('RUNBEACON_APPROVAL_OK')", 'npm publish'],
+      shell: false,
+      label: 'approval-capability-smoke',
+    },
+  });
+  assert.equal(
+    approvalStarted.structuredContent?.job?.execution?.phase,
+    'awaiting_approval'
+  );
+  const approvalPrivate = approvalStarted._meta?.['runbeacon/approval'];
+  assert.equal(typeof approvalPrivate?.capability, 'string');
+  assert.equal(
+    approvalPrivate?.jobId,
+    approvalStarted.structuredContent.job.id
+  );
+  assert.doesNotMatch(
+    JSON.stringify({
+      content: approvalStarted.content,
+      structuredContent: approvalStarted.structuredContent,
+    }),
+    new RegExp(approvalPrivate.capability)
+  );
+  const invalidApproval = await client.callTool({
+    name: 'job_approval',
+    arguments: {
+      jobId: approvalPrivate.jobId,
+      decision: 'approve',
+      capability: 'invalid-capability',
+    },
+  });
+  assert.equal(invalidApproval.isError, true);
+  const approved = await client.callTool({
+    name: 'job_approval',
+    arguments: {
+      jobId: approvalPrivate.jobId,
+      decision: 'approve',
+      capability: approvalPrivate.capability,
+    },
+  });
+  assert.notEqual(approved.isError, true);
+  const approvalCompleted = await client.callTool({
+    name: 'job_wait',
+    arguments: {
+      jobId: approvalPrivate.jobId,
+      timeoutMs: 10_000,
+      tailLines: 20,
+    },
+  });
+  assert.equal(approvalCompleted.structuredContent?.job?.state, 'succeeded');
+  assert.match(
+    approvalCompleted.structuredContent.job.tail
+      .map((chunk) => chunk.data)
+      .join(''),
+    /RUNBEACON_APPROVAL_OK/
   );
 
   const rejectedProfile = await client.callTool({
@@ -465,7 +564,8 @@ try {
   const html = resource.contents[0]?.text ?? '';
   assert.match(html, /ui\/initialize/);
   assert.match(html, /tools\/call/);
-  assert.match(html, /callTool\('job_snapshot'/);
+  assert.match(html, /callTool\('job_watch'/);
+  assert.doesNotMatch(html, /callTool\('job_snapshot'/);
   assert.doesNotMatch(html, /callTool\('job_list'/);
   assert.match(html, /focusedJobId/);
   assert.match(html, /document\.hidden/);

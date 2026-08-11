@@ -1,27 +1,31 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const temporaryDirectory = fs.mkdtempSync(
-  path.join(os.tmpdir(), 'console-automation-package-')
+  path.join(root, '.runbeacon-package-smoke-')
 );
-const installDirectory = path.join(temporaryDirectory, 'install');
+const npmEnvironment = {
+  ...process.env,
+  npm_config_cache: path.join(temporaryDirectory, 'npm-cache'),
+};
 
 const npmInvocation = (args) => {
   if (process.env.npm_execpath) {
     return spawnSync(process.execPath, [process.env.npm_execpath, ...args], {
       cwd: root,
       encoding: 'utf8',
+      env: npmEnvironment,
     });
   }
 
   return spawnSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', args, {
     cwd: root,
     encoding: 'utf8',
+    env: npmEnvironment,
   });
 };
 
@@ -43,44 +47,61 @@ try {
     .find((entry) => entry.endsWith('.tgz'));
   assert.ok(archive, 'npm pack did not create an archive');
 
-  fs.mkdirSync(installDirectory, { recursive: true });
-  const installed = npmInvocation([
-    'install',
-    '--prefix',
-    installDirectory,
-    '--no-package-lock',
-    '--omit=dev',
-    '--omit=optional',
-    path.join(temporaryDirectory, archive),
-  ]);
-  assert.equal(
-    installed.status,
-    0,
-    `Production package install failed:\n${installed.stdout}\n${installed.stderr}`
-  );
-
   const packageRoot = path.join(
-    installDirectory,
+    temporaryDirectory,
     'node_modules',
     'console-automation-mcp'
   );
-  const serverPath = path.join(packageRoot, 'dist', 'mcp', 'server.js');
+  fs.mkdirSync(packageRoot, { recursive: true });
+  const installed = spawnSync(
+    'tar',
+    [
+      '-xzf',
+      path.join(temporaryDirectory, archive),
+      '-C',
+      packageRoot,
+      '--strip-components=1',
+    ],
+    { encoding: 'utf8' }
+  );
+  assert.equal(
+    installed.status,
+    0,
+    `Package extraction failed:\n${installed.stdout}\n${installed.stderr}`
+  );
+
+  const serverPath = path.join(
+    packageRoot,
+    'dist',
+    'mcp',
+    'lifecycle-server.js'
+  );
   assert.ok(fs.existsSync(serverPath), 'Packed MCP entry point is missing');
   assert.equal(
     fs.existsSync(path.join(packageRoot, 'src')),
     false,
     'Source tree leaked into the production package'
   );
+  assert.equal(
+    fs.existsSync(path.join(packageRoot, 'dist', 'core')),
+    false,
+    'Legacy core leaked into the production package'
+  );
+  assert.equal(
+    fs.existsSync(path.join(packageRoot, 'dist', 'protocols')),
+    false,
+    'Legacy protocols leaked into the production package'
+  );
 
   const smoke = spawnSync(
     process.execPath,
-    [path.join(root, 'scripts', 'mcp-smoke-test.mjs')],
+    [path.join(root, 'scripts', 'lifecycle-mcp-smoke-test.mjs')],
     {
       cwd: root,
       encoding: 'utf8',
       env: {
         ...process.env,
-        MCP_SERVER_PATH: serverPath,
+        RUNBEACON_SERVER_PATH: serverPath,
       },
     }
   );
@@ -96,7 +117,7 @@ try {
   );
 
   process.stdout.write(
-    `${JSON.stringify({ packageContents: 'minimal', productionInstall: 'passed' })}\n`
+    `${JSON.stringify({ packageContents: 'minimal', isolatedExtraction: 'passed', lifecycleServer: 'passed' })}\n`
   );
 } finally {
   fs.rmSync(temporaryDirectory, { recursive: true, force: true });

@@ -1,11 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { runBeaconEnv } from './Environment.js';
 
 const VERSION_PATTERN =
   /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+codex\.([0-9A-Za-z.-]+))?$/;
 
 export function readPluginBuildVersion(moduleUrl: string): string {
-  const override = process.env.RJM_BUILD_VERSION?.trim();
+  const override = runBeaconEnv('RUNBEACON_BUILD_VERSION', 'RJM_BUILD_VERSION');
   if (override) return validateBuildVersion(override);
   const manifestPath = fileURLToPath(
     new URL('../../.codex-plugin/plugin.json', moduleUrl)

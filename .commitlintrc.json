@@ -25,6 +25,8 @@
     "subject-full-stop": [2, "never", "."],
     "subject-case": [0],
     "header-max-length": [2, "always", 100],
+    "body-max-line-length": [0],
+    "footer-max-line-length": [0],
     "body-leading-blank": [1, "always"],
     "footer-leading-blank": [1, "always"]
   }

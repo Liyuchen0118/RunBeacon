@@ -1,0 +1,16 @@
+[Unit]
+Description=RunBeacon durable job runner
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/runbeacon-runner serve
+Restart=on-failure
+RestartSec=2
+KillMode=process
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

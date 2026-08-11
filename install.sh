@@ -62,38 +62,44 @@ if [[ "$target" != "codex" && "$target" != "custom" ]]; then
 fi
 
 install_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-server_path="$install_dir/dist/mcp/server.js"
+server_path="$install_dir/dist/mcp/lifecycle-server.js"
 node_bin="$(command -v node || true)"
 npm_bin="$(command -v npm || true)"
 
-[[ -n "$node_bin" ]] || { echo 'Node.js 18 or newer is required.' >&2; exit 1; }
-[[ -n "$npm_bin" ]] || { echo 'npm is required.' >&2; exit 1; }
+[[ -n "$node_bin" ]] || { echo 'Node.js 22, 23, or 24 is required.' >&2; exit 1; }
+npm_cli="$(dirname "$node_bin")/node_modules/npm/bin/npm-cli.js"
+if [[ -f "$npm_cli" ]]; then
+  npm_command=("$node_bin" "$npm_cli")
+else
+  [[ -n "$npm_bin" ]] || { echo 'npm is required.' >&2; exit 1; }
+  npm_command=("$npm_bin")
+fi
 
 node_major="$(node --version | sed -E 's/^v([0-9]+).*/\1/')"
-if ((node_major < 18)); then
-  echo "Node.js 18 or newer is required; found $(node --version)." >&2
+if ((node_major < 22 || node_major > 24)); then
+  echo "Node.js 22, 23, or 24 is required; found $(node --version)." >&2
   exit 1
 fi
 
 cd "$install_dir"
 if [[ "$skip_dependencies" == false ]]; then
-  npm ci
+  "${npm_command[@]}" ci
 fi
-npm run build
+"${npm_command[@]}" run build
 
 if [[ "$dev" == false && "$keep_dev_dependencies" == false ]]; then
-  npm prune --omit=dev --omit=optional
+  "${npm_command[@]}" prune --omit=dev --omit=optional
 fi
 
 [[ -f "$server_path" ]] || { echo "Missing MCP entry point: $server_path" >&2; exit 1; }
 
 if [[ "$target" == "codex" ]]; then
   command -v codex >/dev/null || { echo 'Codex CLI is required.' >&2; exit 1; }
-  if codex mcp get console-automation >/dev/null 2>&1; then
-    codex mcp remove console-automation
+  if codex mcp get remote-job-monitor >/dev/null 2>&1; then
+    codex mcp remove remote-job-monitor
   fi
-  codex mcp add console-automation --env LOG_LEVEL=warn -- "$node_bin" "$server_path"
-  codex mcp get console-automation
+  codex mcp add remote-job-monitor --env MCP_SERVER_MODE=true --env LOG_LEVEL=warn -- "$node_bin" "$server_path"
+  codex mcp get remote-job-monitor
   echo 'Installation complete. Restart Codex, then use /mcp to verify the server.'
   exit 0
 fi
@@ -108,10 +114,10 @@ import fs from 'node:fs';
 const [, , outputPath, nodePath, serverPath] = process.argv;
 const config = {
   mcpServers: {
-    'console-automation': {
+    'remote-job-monitor': {
       command: nodePath,
       args: [serverPath],
-      env: { LOG_LEVEL: 'warn' },
+      env: { MCP_SERVER_MODE: 'true', LOG_LEVEL: 'warn' },
     },
   },
 };
