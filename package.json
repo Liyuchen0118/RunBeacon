@@ -30,14 +30,15 @@
     "test:lifecycle:daemon": "node scripts/lifecycle-daemon-smoke-test.mjs",
     "test:github-publish": "node scripts/github-publish-runner-smoke-test.mjs",
     "test:security:performance": "node --expose-gc scripts/security-performance-test.mjs",
-    "test:installer": "node scripts/installer-smoke-test.mjs",
+    "test:installer": "node scripts/installer-smoke-test.mjs && node scripts/runner-installer-security-test.mjs",
     "test:package": "node scripts/package-smoke-test.mjs",
     "lint": "eslint src/lifecycle src/daemon/lifecycle-daemon.ts src/daemon/github-publish-runner.ts src/mcp/lifecycle-server.ts src/cli --ext .ts --max-warnings 0",
     "format": "prettier --write \"src/{lifecycle,daemon,mcp,cli}/**/*.{ts,js,json}\" \"src/tests/{CredentialProfileStore,GitCredentialManager,GitHubActionsMonitor,GitHubApiClient,GitHubPublish,GitHubWorkflowEligibility,LifecycleManager,PluginHooks,RunBeaconV3Security,SshPasswordProfileManager}.test.ts\"",
     "format:check": "prettier --check \"src/{lifecycle,daemon,mcp,cli}/**/*.{ts,js,json}\" \"src/tests/{CredentialProfileStore,GitCredentialManager,GitHubActionsMonitor,GitHubApiClient,GitHubPublish,GitHubWorkflowEligibility,LifecycleManager,PluginHooks,RunBeaconV3Security,SshPasswordProfileManager}.test.ts\"",
     "typecheck": "tsc --noEmit",
     "prepare": "npm run build",
-    "test:runner": "cd runner && go test -race ./..."
+    "test:runner": "cd runner && go test -race ./...",
+    "test:release-evidence": "node scripts/release-evidence-test.mjs && node scripts/codex-exec-json-test.mjs"
   },
   "keywords": [
     "mcp",

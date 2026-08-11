@@ -48,6 +48,7 @@ jobs:
       - run: npm run build
       - run: npm run test:package
       - run: npm run test:installer
+      - run: npm run test:release-evidence
       - run: npm pack --dry-run
 
   dependency-audit:

@@ -24,10 +24,16 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
       - run: npm ci
       - run: npm run format:check
       - run: npm run lint
       - run: npm run typecheck
+      - name: Validate GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
   package-boundary:
     name: Core package boundary
