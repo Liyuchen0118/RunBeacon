@@ -1,6 +1,7 @@
 import { StartJobInput } from './types.js';
 
 export function commandForAdapter(input: StartJobInput): string {
+  validateAdapterInput(input);
   switch (input.adapter ?? 'generic') {
     case 'slurm':
       return slurmCommand(input.command);
@@ -8,6 +9,19 @@ export function commandForAdapter(input: StartJobInput): string {
       return appleSigningCommand(input.command);
     default:
       return input.command;
+  }
+}
+
+export function validateAdapterInput(input: StartJobInput): void {
+  if (input.adapter !== 'slurm') return;
+  const submit = input.command.trim();
+  if (
+    !/^sbatch(?:\s|$)/.test(submit) ||
+    !/(?:^|\s)--parsable(?:=\S+)?(?:\s|$)/.test(submit)
+  ) {
+    throw new Error(
+      'INVALID_REQUEST: slurm adapter requires an sbatch --parsable command'
+    );
   }
 }
 

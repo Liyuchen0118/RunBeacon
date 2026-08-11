@@ -14,7 +14,7 @@ import { RE2JS } from 're2js';
 import { JobStore } from './JobStore.js';
 import { AuditLog, AuditQuery } from './AuditLog.js';
 import { PolicyConfig, PolicyEngine, PolicyUpdate } from './PolicyEngine.js';
-import { commandForAdapter } from './Adapters.js';
+import { commandForAdapter, validateAdapterInput } from './Adapters.js';
 import {
   EventSubscriptionStore,
   SaveEventSubscription,
@@ -325,6 +325,7 @@ export class LifecycleManager extends EventEmitter {
   start(input: StartJobInput): JobSnapshot {
     this.assertNotDisposed();
     if (!input.command?.trim()) throw new Error('command is required');
+    validateAdapterInput(input);
     if (input.timeoutMs !== undefined && input.timeoutMs <= 0) {
       throw new Error('timeoutMs must be greater than zero');
     }
@@ -1763,7 +1764,7 @@ export class LifecycleManager extends EventEmitter {
           if (Number.isFinite(parsed)) percentage = parsed;
           message = matchedText.slice(0, 240);
         }
-      } else if (!structuredEvent) {
+      } else if (!structuredEvent && job.adapter === 'generic') {
         const matches = Array.from(
           boundedData.matchAll(/(?:^|\s)(\d{1,3}(?:\.\d+)?)\s*%/g)
         );
@@ -1778,9 +1779,17 @@ export class LifecycleManager extends EventEmitter {
     } catch {
       // A malformed optional progress pattern must not interrupt the job.
     }
-    if (percentage === undefined) return;
+    if (
+      percentage === undefined &&
+      !(structuredEvent && (phase || message || metrics))
+    ) {
+      return;
+    }
     job.progress = {
-      percentage: Math.max(0, Math.min(100, percentage)),
+      percentage:
+        percentage === undefined
+          ? job.progress?.percentage
+          : Math.max(0, Math.min(100, percentage)),
       phase,
       message,
       metrics,

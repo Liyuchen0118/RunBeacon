@@ -1656,6 +1656,35 @@ describe('LifecycleManager', () => {
     });
   });
 
+  test('ignores unstructured training percentages and keeps phase-only events', async () => {
+    const manager = new LifecycleManager({ statePath });
+    const unstructured = manager.start({
+      command: process.execPath,
+      args: ['-e', "console.log('Epoch 2: 75% complete')"],
+      shell: false,
+      adapter: 'training',
+    });
+    const ignored = await manager.waitForTerminal(unstructured.id, 5_000);
+    expect(ignored.job.progress).toBeUndefined();
+
+    const phaseEvent = JSON.stringify({
+      phase: 'checkpointing',
+      message: 'checkpoint saved',
+    });
+    const structured = manager.start({
+      command: process.execPath,
+      args: ['-e', `console.log('RUNBEACON_EVENT ${phaseEvent}')`],
+      shell: false,
+      adapter: 'training',
+    });
+    const recorded = await manager.waitForTerminal(structured.id, 5_000);
+    expect(recorded.job.progress).toMatchObject({
+      phase: 'checkpointing',
+      message: 'checkpoint saved',
+    });
+    expect(recorded.job.progress?.percentage).toBeUndefined();
+  });
+
   test('wraps Slurm cancellation and requires durable adapter execution', () => {
     const wrapped = commandForAdapter({
       command: 'sbatch --parsable train.slurm',
@@ -1664,8 +1693,27 @@ describe('LifecycleManager', () => {
     expect(wrapped).toContain('scancel');
     expect(wrapped).toContain('sacct');
     expect(wrapped).toContain('squeue');
+    expect(() =>
+      commandForAdapter({
+        command: 'echo 12345',
+        adapter: 'slurm',
+      })
+    ).toThrow(/sbatch --parsable/);
 
     const manager = new LifecycleManager({ statePath });
+    expect(() =>
+      manager.start({
+        command: 'sbatch train.slurm',
+        adapter: 'slurm',
+        executionMode: 'runner',
+        target: {
+          kind: 'ssh',
+          host: 'slurm.example',
+          username: 'runner',
+          allowUnverifiedHostKey: true,
+        },
+      })
+    ).toThrow(/sbatch --parsable/);
     expect(() =>
       manager.start({
         command: 'sbatch --parsable train.slurm',
