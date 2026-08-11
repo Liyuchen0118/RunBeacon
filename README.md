@@ -85,7 +85,7 @@ RunBeacon retains credential, GitHub publishing, and lifecycle tools and adds:
 - `event_subscription_manage`: Codex, desktop, or HMAC HTTPS webhook subscriptions using environment references for URLs and secrets
 - `audit_query`: verified hash-chain audit events
 
-The model-facing completion path remains `job_start -> job_wait`. The MCP App watches only the current job and pauses while hidden.
+Clients that advertise MCP Tasks can map a RunBeacon job ID directly to an experimental MCP Task and use `tasks/get`, `tasks/result`, `tasks/list`, or `tasks/cancel`. Clients without Tasks keep the same tools. The model-facing completion path remains `job_start -> job_wait`; the MCP App watches only the current job and pauses while hidden.
 
 ## Adapters
 
@@ -96,7 +96,7 @@ The model-facing completion path remains `job_start -> job_wait`. The MCP App wa
 
 ## Policy and audit
 
-Privileged, private-key, release, and destructive commands enter `awaiting_approval`. Approval is bound to the job and target for five minutes. It is available only through a user action in the dashboard or interactive CLI:
+Privileged, private-key, release, and destructive commands enter `awaiting_approval`. Approval is bound to the job, command digest, target profile, and risk class for five minutes. The dashboard receives a one-use capability through App-private MCP metadata; it is excluded from model content, snapshots, persistence, and audit. Approval is available only through a user action in the dashboard or interactive CLI:
 
 ```bash
 runbeacon approve <jobId>
@@ -109,7 +109,13 @@ The MCP tool catalog does not expose approval. Audit JSONL files are owner-only 
 
 Credential profiles store safe references only. SSH passwords and GitHub PATs are stored through the OS credential helper; private keys remain at referenced paths or in an SSH agent. Inline secrets are memory-only.
 
-Pin `hostKeySha256` and `hostKeyAlgorithm`. Existing profiles without an algorithm can be migrated through one explicit probe. `allowUnverifiedHostKey` is an explicit insecure override and is never selected automatically.
+Pin `hostKeySha256` and `hostKeyAlgorithm`. Existing profiles without an algorithm can be migrated only after an explicit pinned-fingerprint probe:
+
+```bash
+runbeacon runner migrate-host-key --profile <profileId>
+```
+
+The MCP equivalent is `runner_manage(action="migrate-host-key", credentialProfile=..., confirm=true)`. A fixed algorithm fails closed and is never replaced after a mismatch. `allowUnverifiedHostKey` is an explicit insecure override and is never selected automatically.
 
 ## Configuration migration
 
@@ -130,7 +136,7 @@ cd runner
 go test -race ./...
 ```
 
-Release promotion is manual. It requires green main checks, zero open CodeQL High/Critical alerts, npm and Go vulnerability gates, Linux/macOS Runner tests, four signed assets, Developer ID/Notary validation, Sigstore bundles, provenance, and an SBOM before any tag or package is published.
+Release promotion is manual. Beta requires green main checks, zero open CodeQL High/Critical alerts, npm and Go vulnerability gates, Linux/macOS Runner tests, four signed assets, Developer ID/Notary validation, exact-workflow Sigstore bundles, provenance, and an SBOM. Stable promotes the tested npm versions only after the same commit has a public Beta for seven complete days and attested Linux training, Mac signing, and fresh Codex-task acceptance all pass.
 
 ## License
 

@@ -2,6 +2,8 @@
 
 RunBeacon 3.0 narrows the npm core to persistent job lifecycle work and introduces a durable remote Runner. This is a breaking release.
 
+RunBeacon 3.0 no longer negotiates the deprecated SSH RSA/SHA-1 `ssh-rsa` signature algorithm. RSA host keys remain supported through `rsa-sha2-512` and `rsa-sha2-256`; profiles pinned to `ssh-rsa` must be migrated after verifying the existing SHA-256 host fingerprint.
+
 ## Package and entry points
 
 - Upgrade the coordinator to `console-automation-mcp@3`.
@@ -39,7 +41,7 @@ Active direct SSH or local jobs cannot be reattached after a daemon restart and 
 
 ## Host key profiles
 
-Add `hostKeyAlgorithm` beside `hostKeySha256`. This avoids repeated negotiation across ED25519, ECDSA, and RSA keys. Migrate an old profile with one explicit host-key probe and confirm the returned algorithm and SHA256 fingerprint out of band.
+Add `hostKeyAlgorithm` beside `hostKeySha256`. This avoids repeated negotiation across ED25519, ECDSA, and RSA keys. Migrate an old profile with `runbeacon runner migrate-host-key --profile <id>` or confirmed `runner_manage(action="migrate-host-key")`. The probe requires the existing pinned SHA256 fingerprint, authenticates only after it matches, and updates the profile only after one algorithm succeeds. A profile that already pins an algorithm fails closed without trying another key type.
 
 ## Execution modes
 
@@ -49,7 +51,9 @@ Runner installation on macOS must occur locally in an Aqua login session. RunBea
 
 ## Progress and adapters
 
-RE2 restrictions from 2.0 remain. `generic` also accepts `RUNBEACON_EVENT <JSON>`. Training metrics must be emitted as structured epoch, step, loss, ETA, checkpoint, and GPU fields. Slurm commands must return a numeric ID from `sbatch --parsable`. Apple signing requires environment references `RUNBEACON_APPLE_SIGNING_IDENTITY` and `RUNBEACON_NOTARY_PROFILE` in the Runner's LaunchAgent context.
+RE2 restrictions from 2.0 remain. `generic` also accepts `RUNBEACON_EVENT <JSON>`. Training metrics must be emitted as structured epoch, step, loss, ETA, checkpoint, and GPU fields. Slurm commands must return a numeric ID from `sbatch --parsable`; cancellation succeeds only after `scancel`, queue absence, and a `CANCELLED` or `PREEMPTED` accounting state are all observed. Apple signing requires environment references `RUNBEACON_APPLE_SIGNING_IDENTITY` and `RUNBEACON_NOTARY_PROFILE` in the Runner's LaunchAgent context.
+
+Clients may opt into experimental MCP Tasks. RunBeacon uses the existing job ID as the task ID, so task cancellation and result retrieval do not create or replay another job. Clients without Tasks require no migration.
 
 ## Approval
 
@@ -57,6 +61,6 @@ Commands classified as privileged, credential/private-key, release, or destructi
 
 ## Release and rollback
 
-Stable promotion is manual and stops before tagging if main has any open High/Critical CodeQL alert or a Node, Go, signing, Notary, asset, audit, package, or plugin gate fails.
+Beta and Stable promotion are manual. Stable stops before tagging unless the same commit has soaked as a public Beta for seven complete days, the dedicated acceptance workflow succeeded on that SHA, and its attested Linux training, Mac signing, and fresh Codex task reports match the requested versions. Stable verifies and reuses the exact Beta Runner assets rather than rebuilding timestamped binaries. Main CodeQL High/Critical, unexpected dismissals, Node/Go vulnerabilities, or any signing, Notary, asset, audit, package, or plugin failure also blocks promotion.
 
 To roll back, pin npm major 2 and plugin 1.x. Runner uninstall refuses active tasks and preserves state by default.

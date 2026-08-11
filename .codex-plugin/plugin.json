@@ -1,6 +1,6 @@
 {
   "name": "remote-job-monitor",
-  "version": "2.0.0+codex.20260810214520",
+  "version": "2.0.0+codex.20260811051452",
   "description": "Durable local, SSH, Slurm, Apple-signing, and GitHub task lifecycles with a persistent Runner and event-driven dashboard.",
   "author": {
     "name": "RunBeacon contributors"

@@ -15,6 +15,9 @@
 - add interactive approval, hash-chain audit, event subscriptions, and loopback single-task dashboard fallback
 - add generic, training, Slurm, and macOS Apple-signing adapters
 - add Linux user systemd and macOS Aqua LaunchAgent installers
+- map lifecycle jobs to optional experimental MCP Tasks without changing the `job_start -> job_wait` fallback
+- add explicit pinned-fingerprint SSH host-key algorithm migration and native desktop notifications
+- map verified Slurm scheduler cancellation and timeout outcomes to native lifecycle states
 
 ### Security and release
 
@@ -22,6 +25,13 @@
 - keep commands, credentials, approval metadata, and signing secrets out of Runner argv, snapshots, service files, and audit records
 - add independent JavaScript/TypeScript and Go CodeQL, Go race/vulnerability gates, four-platform assets, SHA256, Sigstore, provenance, SBOM, Developer ID signing, and Notary checks
 - replace automatic releases with a manual promotion gate that refuses tags while main has open CodeQL High/Critical alerts
+- require exact GitHub Actions Sigstore identity verification, signed-byte SBOM generation, a seven-day public Beta, and attested Linux/Mac/Codex acceptance before Stable
+- require Slurm scheduler acknowledgement in addition to process-group exit before reporting cancellation
+- reject deprecated SSH RSA/SHA-1 negotiation while retaining RSA SHA-2 host keys
+- reject coordinator idempotency-key reuse with a different execution digest, including after restart
+- preserve partially written Runner events for continuation and release pruned event cursors
+- isolate desktop notifier processes from credential and task environment variables
+- promote the exact signed Beta Runner assets to Stable instead of rebuilding them
 
 ## 2.0.0 (2026-08-03)
 

@@ -25,15 +25,17 @@ Never issue a second `job_start` to repair quoting, progress parsing, or unexpec
 
 Use `job_snapshot` only when the user explicitly asks for current status. Do not call `job_watch`; it is the dashboard's version-change long poll. Do not call `job_dashboard` after a normal start because `job_start` already mounts it. Use `job_dashboard` only to reopen a known task. Every dashboard is bound to one job and pauses its watch while hidden.
 
-If a direct SSH cancellation returns `cancellationVerified: false`, report that the remote process may still exist. A durable Runner reports `cancelled` as verified only after the entire process group exits. Slurm uses `scancel`; an unverified cancellation must never be described as successful.
+Some clients expose the same RunBeacon job as an experimental MCP Task. Treat its task ID as the job ID; task get/result/cancel must not create another job. Continue to prefer the explicit `job_start` followed immediately by one `job_wait` flow unless the client itself requests Tasks mode.
+
+If a direct SSH cancellation returns `cancellationVerified: false`, report that the remote process may still exist. A durable Runner reports `cancelled` as verified only after the entire process group exits. Slurm additionally requires queue disappearance and a cancelled/preempted accounting state after `scancel`; an unverified cancellation must never be described as successful.
 
 ## Durable Runner and approvals
 
 `auto` probes the Runner first and may use direct SSH only before submission when `requireDurable` is false. `runner` or `requireDurable` fails with `RUNNER_UNAVAILABLE` instead of degrading. Runner jobs expose `durable`, `resumable`, connection state, event sequence, reconnect count, and Runner version in their snapshot.
 
-Use `runner_manage` only to probe from a model task. Installation, upgrade, and uninstall require the interactive signed-asset CLI. macOS installation must run locally in an active Aqua session; never try to unlock Keychain over SSH. The Runner installs as a Linux user systemd service or macOS LaunchAgent and exposes no network port.
+Use `runner_manage` only to probe from a model task or to migrate a saved profile's missing host-key algorithm after an explicit pinned-fingerprint check. Migration requires a named profile plus `confirm: true`; never use it to replace a mismatching fingerprint. Installation, upgrade, and uninstall require the interactive signed-asset CLI. macOS installation must run locally in an active Aqua session; never try to unlock Keychain over SSH. The Runner installs as a Linux user systemd service or macOS LaunchAgent and exposes no network port.
 
-Privileged, private-key, release, and destructive commands may remain in `awaiting_approval`. Do not retry or alter the command. Tell the user to approve or reject in the dashboard or with `runbeacon approve|reject <jobId>`. The MCP tool catalog intentionally has no approval operation. Policy changes do not approve pending work.
+Privileged, private-key, release, and destructive commands may remain in `awaiting_approval`. Do not retry or alter the command. Tell the user to approve or reject in the dashboard or with `runbeacon approve|reject <jobId>`. The App receives its one-use capability only through private tool-result metadata; never request, echo, or reconstruct it. The MCP tool catalog intentionally has no approval operation. Policy changes do not approve pending work.
 
 Use adapters deliberately:
 
