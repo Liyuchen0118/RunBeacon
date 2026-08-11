@@ -26,6 +26,7 @@ import {
 } from './RunnerTransport.js';
 import { redactCommand, safeErrorMessage } from './security.js';
 import {
+  ApprovalContext,
   isTerminalJobState,
   JobOutputChunk,
   JobRecord,
@@ -135,7 +136,6 @@ const SSH_SERVER_HOST_KEY_ALGORITHMS: ServerHostKeyAlgorithm[] = [
   'ecdsa-sha2-nistp521',
   'rsa-sha2-512',
   'rsa-sha2-256',
-  'ssh-rsa',
 ];
 
 function normalizeSshSha256Fingerprint(value: string): string {
@@ -152,7 +152,7 @@ function hostKeyAlgorithmsForRawKey(key: Buffer): ServerHostKeyAlgorithm[] {
 
   const keyType = key.subarray(4, 4 + typeLength).toString('ascii');
   if (keyType === 'ssh-rsa') {
-    return ['rsa-sha2-512', 'rsa-sha2-256', 'ssh-rsa'];
+    return ['rsa-sha2-512', 'rsa-sha2-256'];
   }
   if (
     keyType === 'ssh-ed25519' ||
@@ -180,6 +180,7 @@ export class LifecycleManager extends EventEmitter {
   private readonly pendingInputs = new Map<string, StartJobInput>();
   private readonly queue: string[] = [];
   private readonly activeJobs = new Set<string>();
+  private readonly approvalContexts = new Map<string, ApprovalContext>();
   private readonly runtimeHandles = new Map<string, RuntimeHandle>();
   private readonly store: JobStore;
   private readonly policyEngine: PolicyEngine;
@@ -358,29 +359,7 @@ export class LifecycleManager extends EventEmitter {
       );
       if (existing) return this.snapshot(existing.id);
     }
-    if (input.idempotencyKey !== undefined) {
-      const key = input.idempotencyKey.trim();
-      if (!key || key.length > 200) {
-        throw new Error('idempotencyKey must contain 1 to 200 characters');
-      }
-      const existing = Array.from(this.jobs.values()).find(
-        (job) => job.idempotencyKey === key
-      );
-      if (existing) return this.snapshot(existing.id);
-      input = { ...input, idempotencyKey: key };
-    }
-    const progressPattern =
-      input.progressPattern !== undefined
-        ? this.compileProgressPattern(input.progressPattern)
-        : undefined;
-
-    const id = randomUUID();
-    const now = new Date().toISOString();
     const target = this.publicTarget(input);
-    const policyDecision = this.policyEngine.classify(
-      [input.command, ...(input.args ?? [])].join(' '),
-      input.adapter ?? 'generic'
-    );
     const commandDigest = `sha256:${createHash('sha256')
       .update(
         JSON.stringify({
@@ -391,6 +370,35 @@ export class LifecycleManager extends EventEmitter {
         })
       )
       .digest('hex')}`;
+    if (input.idempotencyKey !== undefined) {
+      const key = input.idempotencyKey.trim();
+      if (!key || key.length > 200) {
+        throw new Error('idempotencyKey must contain 1 to 200 characters');
+      }
+      const existing = Array.from(this.jobs.values()).find(
+        (job) => job.idempotencyKey === key
+      );
+      if (existing) {
+        if (existing.commandDigest !== commandDigest) {
+          throw new Error(
+            'IDEMPOTENCY_CONFLICT: idempotency key is already bound to a different execution digest'
+          );
+        }
+        return this.snapshot(existing.id);
+      }
+      input = { ...input, idempotencyKey: key };
+    }
+    const progressPattern =
+      input.progressPattern !== undefined
+        ? this.compileProgressPattern(input.progressPattern)
+        : undefined;
+
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const policyDecision = this.policyEngine.classify(
+      [input.command, ...(input.args ?? [])].join(' '),
+      input.adapter ?? 'generic'
+    );
     const runnerRequested =
       target.kind === 'ssh' && (input.executionMode ?? 'auto') !== 'direct';
     const eventSubscriptions = this.eventSubscriptions.validateIds(
@@ -399,6 +407,7 @@ export class LifecycleManager extends EventEmitter {
     const record: JobRecord = {
       id,
       idempotencyKey: input.idempotencyKey,
+      commandDigest,
       label: redactCommand(
         input.label?.trim() || redactCommand(input.command)
       ).slice(0, 120),
@@ -441,6 +450,15 @@ export class LifecycleManager extends EventEmitter {
     };
 
     this.jobs.set(id, record);
+    if (policyDecision.requiresApproval) {
+      this.approvalContexts.set(id, {
+        jobId: id,
+        commandDigest,
+        target: { ...target },
+        credentialProfileId: input.credentialProfileId,
+        risk: policyDecision.risk,
+      });
+    }
     if (progressPattern) this.progressPatterns.set(id, progressPattern);
     this.pendingInputs.set(id, input);
     this.auditLog.append({
@@ -478,6 +496,7 @@ export class LifecycleManager extends EventEmitter {
     if (!this.pendingInputs.has(jobId)) {
       throw new Error('REMOTE_STATE_LOST: pending command is unavailable');
     }
+    const approvalContext = this.approvalContext(jobId);
     const now = new Date();
     job.policy.approval = 'approved';
     job.policy.approvedAt = now.toISOString();
@@ -492,7 +511,9 @@ export class LifecycleManager extends EventEmitter {
       jobId,
       target: this.auditTarget(job.target),
       risk: job.policy.risk,
+      commandDigest: approvalContext.commandDigest,
     });
+    this.approvalContexts.delete(jobId);
     this.touch(job, 'Approval granted.', 'system', 'immediate');
     this.scheduleDrain();
     return this.snapshot(jobId);
@@ -507,6 +528,7 @@ export class LifecycleManager extends EventEmitter {
     ) {
       throw new Error('APPROVAL_REQUIRED: job is not awaiting approval');
     }
+    const approvalContext = this.approvalContext(jobId);
     job.policy.approval = 'rejected';
     this.pendingInputs.delete(jobId);
     this.auditLog.append({
@@ -515,9 +537,29 @@ export class LifecycleManager extends EventEmitter {
       jobId,
       target: this.auditTarget(job.target),
       risk: job.policy.risk,
+      commandDigest: approvalContext.commandDigest,
     });
+    this.approvalContexts.delete(jobId);
     this.finish(job, 'cancelled', 'Approval was rejected.');
     return this.snapshot(jobId);
+  }
+
+  approvalContext(jobId: string): ApprovalContext {
+    const job = this.requireJob(jobId);
+    if (
+      job.execution.phase !== 'awaiting_approval' ||
+      job.policy.approval !== 'pending'
+    ) {
+      throw new Error('APPROVAL_REQUIRED: job is not awaiting approval');
+    }
+    const context = this.approvalContexts.get(jobId);
+    if (!context) {
+      throw new Error('REMOTE_STATE_LOST: approval context is unavailable');
+    }
+    return {
+      ...context,
+      target: { ...context.target },
+    };
   }
 
   policyConfig(): PolicyConfig {
@@ -573,8 +615,9 @@ export class LifecycleManager extends EventEmitter {
     const tail = safeTailLines === 0 ? [] : job.output.slice(-safeTailLines);
     const summary = { ...job } as Partial<JobRecord>;
     delete summary.output;
+    delete summary.commandDigest;
     return {
-      ...(summary as Omit<JobRecord, 'output'>),
+      ...(summary as Omit<JobRecord, 'output' | 'commandDigest'>),
       tail,
       assessment: this.assess(job),
     };
@@ -756,6 +799,7 @@ export class LifecycleManager extends EventEmitter {
     this.persistenceTimer = undefined;
     this.progressPatterns.clear();
     this.progressRemainders.clear();
+    this.approvalContexts.clear();
     this.removeAllListeners();
   }
 
@@ -1011,6 +1055,8 @@ export class LifecycleManager extends EventEmitter {
       cwd: input.cwd,
       env: input.env,
       timeoutMillis: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      cancellationMode:
+        input.adapter === 'slurm' ? 'external' : 'process_group',
       outputPolicy: job.outputPolicy,
     };
     let submit: { job: RunnerJobPayload; created?: boolean } | undefined;
@@ -1111,12 +1157,16 @@ export class LifecycleManager extends EventEmitter {
     if (job.cancelRequested) runtimeHandle.cancel();
 
     let remoteJob = initialRemoteJob;
-    while (!isTerminalJobState(remoteJob.state)) {
+    while (
+      !isTerminalJobState(remoteJob.state) ||
+      job.execution.lastEventSequence < Number(remoteJob.lastEventSequence ?? 0)
+    ) {
       try {
         const watched = await transport.call<{
           job: RunnerJobPayload;
           events?: RunnerEventPayload[];
           truncated?: boolean;
+          nextSequence?: number;
           timedOut?: boolean;
         }>(
           'watch',
@@ -1152,11 +1202,17 @@ export class LifecycleManager extends EventEmitter {
             this.append(job, event.stream, event.data, input);
           }
         }
+        if (
+          watched.truncated &&
+          (watched.events?.length ?? 0) === 0 &&
+          Number.isFinite(watched.nextSequence)
+        ) {
+          job.execution.lastEventSequence = Math.max(
+            job.execution.lastEventSequence,
+            Number(watched.nextSequence)
+          );
+        }
         remoteJob = watched.job;
-        job.execution.lastEventSequence = Math.max(
-          job.execution.lastEventSequence,
-          Number(remoteJob.lastEventSequence ?? 0)
-        );
         if (!watched.timedOut) this.changed(job);
       } catch (error) {
         if (
@@ -1455,10 +1511,12 @@ export class LifecycleManager extends EventEmitter {
           failureHandled = true;
 
           let addedHostKeyAlgorithm = false;
-          for (const algorithm of rejectedHostKeyAlgorithms) {
-            if (!excludedHostKeyAlgorithms.has(algorithm)) {
-              excludedHostKeyAlgorithms.add(algorithm);
-              addedHostKeyAlgorithm = true;
+          if (!target.hostKeyAlgorithm) {
+            for (const algorithm of rejectedHostKeyAlgorithms) {
+              if (!excludedHostKeyAlgorithms.has(algorithm)) {
+                excludedHostKeyAlgorithms.add(algorithm);
+                addedHostKeyAlgorithm = true;
+              }
             }
           }
 
@@ -1469,7 +1527,8 @@ export class LifecycleManager extends EventEmitter {
             attempt >= this.sshHandshakeAttempts ||
             timedOut ||
             (hostKeyRejected &&
-              (rejectedHostKeyAlgorithms.length === 0 ||
+              (Boolean(target.hostKeyAlgorithm) ||
+                rejectedHostKeyAlgorithms.length === 0 ||
                 !addedHostKeyAlgorithm))
           ) {
             settle(
@@ -1754,6 +1813,7 @@ export class LifecycleManager extends EventEmitter {
       job.execution.backend === 'local' ? 'not_applicable' : 'disconnected';
     job.error = error;
     job.finishedAt = new Date().toISOString();
+    this.approvalContexts.delete(job.id);
     const terminalMessage =
       state === 'succeeded'
         ? 'Job completed successfully.'

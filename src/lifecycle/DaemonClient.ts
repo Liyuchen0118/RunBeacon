@@ -14,6 +14,7 @@ import {
   getDaemonPaths,
 } from './DaemonPaths.js';
 import {
+  ApprovalContext,
   JobSnapshot,
   StartJobInput,
   WaitResult,
@@ -70,6 +71,7 @@ export interface LifecycleService {
   cancel(jobId: string): Promise<JobSnapshot> | JobSnapshot;
   approve(jobId: string): Promise<JobSnapshot> | JobSnapshot;
   rejectApproval(jobId: string): Promise<JobSnapshot> | JobSnapshot;
+  approvalContext(jobId: string): Promise<ApprovalContext> | ApprovalContext;
   policyConfig(): Promise<PolicyConfig> | PolicyConfig;
   updatePolicy(input: PolicyUpdate): Promise<PolicyConfig> | PolicyConfig;
   queryAudit(query?: AuditQuery): Promise<AuditEvent[]> | AuditEvent[];
@@ -207,6 +209,10 @@ export class DaemonClient implements LifecycleService {
 
   rejectApproval(jobId: string): Promise<JobSnapshot> {
     return this.request('approval', { jobId, decision: 'reject' });
+  }
+
+  approvalContext(jobId: string): Promise<ApprovalContext> {
+    return this.request('approval_context', { jobId });
   }
 
   policyConfig(): Promise<PolicyConfig> {

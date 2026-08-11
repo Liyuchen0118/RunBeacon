@@ -44,10 +44,15 @@ const credentialHelperCommand = `!node ${credentialHelperPath.replaceAll('\\', '
 
 assert.ok(fs.existsSync(serverPath), `Missing built server: ${serverPath}`);
 
-const client = new Client({
-  name: 'remote-job-monitor-smoke',
-  version: '0.1.0',
-});
+const client = new Client(
+  {
+    name: 'remote-job-monitor-smoke',
+    version: '0.1.0',
+  },
+  {
+    capabilities: { tasks: { list: {}, cancel: {} } },
+  }
+);
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: [serverPath],
@@ -97,8 +102,37 @@ try {
   ]) {
     assert.ok(toolNames.has(name), `Missing tool: ${name}`);
   }
+  assert.equal(toolNames.size, 21);
+  assert.equal(toolNames.has('job_approval'), false);
 
   const jobStartTool = tools.find((tool) => tool.name === 'job_start');
+  assert.equal(jobStartTool?.execution?.taskSupport, 'optional');
+
+  const taskMessages = [];
+  for await (const message of client.experimental.tasks.callToolStream(
+    {
+      name: 'job_start',
+      arguments: {
+        command: process.execPath,
+        args: ['-e', 'process.exit(0)'],
+        shell: false,
+        label: 'mcp-task-smoke',
+      },
+    },
+    undefined,
+    { timeout: 10_000 }
+  )) {
+    taskMessages.push(message);
+  }
+  const createdTask = taskMessages.find(
+    (message) => message.type === 'taskCreated'
+  );
+  assert.ok(createdTask?.task.taskId, 'MCP Task was not created');
+  assert.equal(taskMessages.at(-1)?.type, 'result');
+  assert.equal(
+    (await client.experimental.tasks.getTask(createdTask.task.taskId)).status,
+    'completed'
+  );
   assert.equal(
     jobStartTool?._meta?.ui?.resourceUri,
     'ui://remote-job-monitor/dashboard.html'
@@ -172,6 +206,66 @@ try {
   assert.equal(
     typeof completed.structuredContent?.job?.timing?.firstOutputAt,
     'string'
+  );
+
+  const approvalStarted = await client.callTool({
+    name: 'job_start',
+    arguments: {
+      command: process.execPath,
+      args: ['-e', "console.log('RUNBEACON_APPROVAL_OK')", 'npm publish'],
+      shell: false,
+      label: 'approval-capability-smoke',
+    },
+  });
+  assert.equal(
+    approvalStarted.structuredContent?.job?.execution?.phase,
+    'awaiting_approval'
+  );
+  const approvalPrivate = approvalStarted._meta?.['runbeacon/approval'];
+  assert.equal(typeof approvalPrivate?.capability, 'string');
+  assert.equal(
+    approvalPrivate?.jobId,
+    approvalStarted.structuredContent.job.id
+  );
+  assert.doesNotMatch(
+    JSON.stringify({
+      content: approvalStarted.content,
+      structuredContent: approvalStarted.structuredContent,
+    }),
+    new RegExp(approvalPrivate.capability)
+  );
+  const invalidApproval = await client.callTool({
+    name: 'job_approval',
+    arguments: {
+      jobId: approvalPrivate.jobId,
+      decision: 'approve',
+      capability: 'invalid-capability',
+    },
+  });
+  assert.equal(invalidApproval.isError, true);
+  const approved = await client.callTool({
+    name: 'job_approval',
+    arguments: {
+      jobId: approvalPrivate.jobId,
+      decision: 'approve',
+      capability: approvalPrivate.capability,
+    },
+  });
+  assert.notEqual(approved.isError, true);
+  const approvalCompleted = await client.callTool({
+    name: 'job_wait',
+    arguments: {
+      jobId: approvalPrivate.jobId,
+      timeoutMs: 10_000,
+      tailLines: 20,
+    },
+  });
+  assert.equal(approvalCompleted.structuredContent?.job?.state, 'succeeded');
+  assert.match(
+    approvalCompleted.structuredContent.job.tail
+      .map((chunk) => chunk.data)
+      .join(''),
+    /RUNBEACON_APPROVAL_OK/
   );
 
   const rejectedProfile = await client.callTool({

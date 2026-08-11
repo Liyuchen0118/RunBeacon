@@ -279,6 +279,11 @@ function normalizeJob(
       typeof raw.idempotencyKey === 'string'
         ? raw.idempotencyKey.slice(0, 200)
         : undefined,
+    commandDigest:
+      typeof raw.commandDigest === 'string' &&
+      /^sha256:[0-9a-f]{64}$/i.test(raw.commandDigest)
+        ? raw.commandDigest.toLowerCase()
+        : undefined,
     label:
       typeof raw.label === 'string'
         ? redactPersistedText(raw.label, 120)

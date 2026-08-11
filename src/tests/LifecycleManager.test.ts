@@ -238,7 +238,18 @@ describe('LifecycleManager', () => {
     const retried = manager.start(input);
 
     expect(retried.id).toBe(first.id);
+    expect(retried).not.toHaveProperty('commandDigest');
     await manager.waitForTerminal(first.id, 5_000);
+
+    manager.dispose();
+    const recovered = new LifecycleManager({ statePath });
+    expect(recovered.start(input).id).toBe(first.id);
+    expect(() =>
+      recovered.start({
+        ...input,
+        args: ['-e', "throw new Error('different execution')"],
+      })
+    ).toThrow(/IDEMPOTENCY_CONFLICT/);
   });
 
   test('binds one prompt trace to one job and persists safe timing fields', async () => {
@@ -756,6 +767,53 @@ describe('LifecycleManager', () => {
     expect(observedConfigs[1].algorithms?.serverHostKey).not.toContain(
       'ssh-ed25519'
     );
+    expect(observedConfigs[1].algorithms?.serverHostKey).not.toContain(
+      'ssh-rsa'
+    );
+  });
+
+  test('fails closed without algorithm fallback when a profile pins the algorithm', async () => {
+    const offeredKey = createRawHostKey('ssh-ed25519', 'wrong-fixed-key');
+    const expectedKey = createRawHostKey('ssh-ed25519', 'expected-fixed-key');
+    let clientsCreated = 0;
+    const manager = new LifecycleManager({
+      statePath,
+      sshRetryBaseDelayMs: 1,
+      sshClientFactory: () => {
+        clientsCreated += 1;
+        return createFakeSshClient(
+          (client, config) => {
+            expect(config.algorithms?.serverHostKey).toEqual(['ssh-ed25519']);
+            const accepted = Boolean(
+              (config.hostVerifier as (key: Buffer) => boolean)(offeredKey)
+            );
+            setImmediate(() =>
+              accepted
+                ? client.emit('ready')
+                : client.emit('error', new Error('Host denied'))
+            );
+          },
+          (_client, _command, callback) => callback(new Error('must not exec'))
+        );
+      },
+    });
+    const started = manager.start({
+      command: 'run-training',
+      executionMode: 'direct',
+      target: {
+        kind: 'ssh',
+        host: 'example.test',
+        username: 'runner',
+        hostKeySha256: opensshSha256Fingerprint(expectedKey),
+        hostKeyAlgorithm: 'ssh-ed25519',
+      },
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000);
+
+    expect(completed.job.state).toBe('failed');
+    expect(completed.job.error).toContain('HOST_KEY_MISMATCH');
+    expect(clientsCreated).toBe(1);
   });
 
   test('retries handshake failures before executing the remote command', async () => {
@@ -1030,6 +1088,142 @@ describe('LifecycleManager', () => {
     ]);
   });
 
+  test('drains every bounded Runner event page before accepting terminal state', async () => {
+    const watchOffsets: number[] = [];
+    const call = jest.fn(
+      async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'ping') return { version: '3.0.0' };
+        if (method === 'submit') {
+          return {
+            created: true,
+            job: {
+              id: params!.jobId,
+              state: 'running',
+              lastEventSequence: 1,
+            },
+          };
+        }
+        if (method === 'watch') {
+          const after = Number(params!.afterSequence);
+          watchOffsets.push(after);
+          const end = Math.min(260, after + 128);
+          const events = Array.from({ length: end - after }, (_, index) => {
+            const sequence = after + index + 1;
+            return sequence === 260
+              ? { sequence, type: 'state', state: 'succeeded' }
+              : {
+                  sequence,
+                  type: 'output',
+                  stream: 'stdout',
+                  data: `${sequence}\n`,
+                };
+          });
+          return {
+            events,
+            job: {
+              id: params!.jobId,
+              state: 'succeeded',
+              exitCode: 0,
+              lastEventSequence: 260,
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      }
+    );
+    const manager = new LifecycleManager({
+      statePath,
+      runnerTransportFactory: () => ({ call }) as unknown as RunnerRPCClient,
+    });
+    const started = manager.start({
+      command: 'emit-many-events',
+      executionMode: 'runner',
+      target: {
+        kind: 'ssh',
+        host: 'runner.example',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000, 500);
+
+    expect(completed.job.state).toBe('succeeded');
+    expect(completed.job.execution.lastEventSequence).toBe(260);
+    expect(watchOffsets).toEqual([0, 128, 256]);
+    expect(completed.job.tail.map((chunk) => chunk.data).join('')).toContain(
+      '259\n'
+    );
+  });
+
+  test('advances only an explicit empty retention gap from the Runner', async () => {
+    const watchOffsets: number[] = [];
+    let watchCall = 0;
+    const call = jest.fn(
+      async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'ping') return { version: '3.0.0' };
+        if (method === 'submit') {
+          return {
+            created: true,
+            job: {
+              id: params!.jobId,
+              state: 'running',
+              lastEventSequence: 20,
+            },
+          };
+        }
+        if (method === 'watch') {
+          watchOffsets.push(Number(params!.afterSequence));
+          watchCall += 1;
+          if (watchCall === 1) {
+            return {
+              events: [],
+              truncated: true,
+              nextSequence: 20,
+              job: {
+                id: params!.jobId,
+                state: 'running',
+                lastEventSequence: 20,
+              },
+            };
+          }
+          return {
+            events: [{ sequence: 21, type: 'state', state: 'succeeded' }],
+            nextSequence: 21,
+            job: {
+              id: params!.jobId,
+              state: 'succeeded',
+              exitCode: 0,
+              lastEventSequence: 21,
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      }
+    );
+    const manager = new LifecycleManager({
+      statePath,
+      runnerTransportFactory: () => ({ call }) as unknown as RunnerRPCClient,
+    });
+    const started = manager.start({
+      command: 'bounded-full-output',
+      executionMode: 'runner',
+      target: {
+        kind: 'ssh',
+        host: 'runner.example',
+        username: 'runner',
+        allowUnverifiedHostKey: true,
+      },
+    });
+
+    const completed = await manager.waitForTerminal(started.id, 5_000, 20);
+
+    expect(completed.job.state).toBe('succeeded');
+    expect(completed.job.outputTruncated).toBe(true);
+    expect(completed.job.execution.lastEventSequence).toBe(21);
+    expect(watchOffsets).toEqual([0, 20]);
+  });
+
   test('reattaches a persisted Runner job after coordinator restart without resubmitting', async () => {
     const originalWatch = new Promise<Record<string, unknown>>(() => undefined);
     const firstCall = jest.fn(
@@ -1164,7 +1358,7 @@ describe('LifecycleManager', () => {
         if (method === 'watch') {
           expect(params!.afterSequence).toBe(0);
           return {
-            events: [],
+            events: [{ sequence: 8, type: 'state', state: 'succeeded' }],
             job: {
               id: params!.jobId,
               state: 'succeeded',
@@ -1368,6 +1562,16 @@ describe('LifecycleManager', () => {
       risk: 'privileged',
       approval: 'pending',
     });
+    const approvalContext = manager.approvalContext(started.id);
+    expect(approvalContext).toMatchObject({
+      jobId: started.id,
+      risk: 'privileged',
+      target: { kind: 'local' },
+    });
+    expect(approvalContext.commandDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(JSON.stringify(started)).not.toContain(
+      approvalContext.commandDigest
+    );
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(manager.snapshot(started.id).startedAt).toBeUndefined();
 
@@ -1376,6 +1580,9 @@ describe('LifecycleManager', () => {
     expect(approved.policy.grantExpiresAt).toBeDefined();
     const completed = await manager.waitForTerminal(started.id, 5_000);
     expect(completed.job.state).toBe('succeeded');
+    expect(() => manager.approvalContext(started.id)).toThrow(
+      /not awaiting approval/
+    );
 
     const audit = manager.queryAudit({ jobId: started.id, limit: 10 });
     expect(audit.map((event) => `${event.action}:${event.outcome}`)).toEqual(
@@ -1389,6 +1596,9 @@ describe('LifecycleManager', () => {
     expect(
       audit.find((event) => event.action === 'job_start')?.commandDigest
     ).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(
+      audit.find((event) => event.action === 'approval')?.commandDigest
+    ).toBe(approvalContext.commandDigest);
   });
 
   test('rejects approval without executing the pending command', async () => {
@@ -1535,6 +1745,9 @@ describe('lifecycle safety and UI helpers', () => {
     expect(html).toContain('job.progress.phase');
     expect(html).toContain("job.metadata?.kind === 'github_publish'");
     expect(html).toContain("callTool('job_start'");
+    expect(html).toContain("callTool('job_approval'");
+    expect(html).toContain("['runbeacon/approval']");
+    expect(html).toContain('data-approval="approve"');
     expect(html).toContain('useDefaultCredential:true');
     expect(html).toContain('requestTraceId:launcherAttempt.requestTraceId');
     expect(html).toContain('Default SSH task');

@@ -1,11 +1,17 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import type { Client, ConnectConfig } from 'ssh2';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AuditIntegrityError, AuditLog } from '../lifecycle/AuditLog.js';
 import { commandForAdapter } from '../lifecycle/Adapters.js';
-import { EventSubscriptionStore } from '../lifecycle/EventSubscriptionStore.js';
+import {
+  desktopNotificationEnvironment,
+  EventSubscriptionStore,
+} from '../lifecycle/EventSubscriptionStore.js';
 import { PolicyEngine } from '../lifecycle/PolicyEngine.js';
+import { probeSshHostKeyAlgorithm } from '../lifecycle/RunnerTransport.js';
 
 describe('RunBeacon 3 security services', () => {
   let root: string;
@@ -139,6 +145,41 @@ describe('RunBeacon 3 security services', () => {
     ).toThrow(/at most 16/);
   });
 
+  test('delivers desktop subscriptions through the platform notifier', async () => {
+    const notifier = jest.fn(async () => undefined);
+    const store = new EventSubscriptionStore(
+      join(root, 'desktop-subscriptions.json'),
+      notifier
+    );
+    store.save({ id: 'desktop-main', kind: 'desktop' });
+    const result = await store.dispatch(['desktop-main'], {
+      event: 'job_terminal',
+      jobId: 'job-desktop-1234',
+      state: 'succeeded',
+      finishedAt: new Date().toISOString(),
+    });
+    expect(result).toEqual([{ id: 'desktop-main', delivered: true }]);
+    expect(notifier).toHaveBeenCalledWith(
+      'RunBeacon job finished',
+      'job-desktop-1234: succeeded'
+    );
+  });
+
+  test('desktop notifier environment excludes unrelated secrets', () => {
+    const environment = desktopNotificationEnvironment({
+      PATH: 'untrusted-path',
+      HOME: '/home/runbeacon',
+      DISPLAY: ':1',
+      RUNBEACON_GITHUB_TOKEN: 'must-not-leak',
+      SSH_PASSWORD: 'must-not-leak',
+    });
+    expect(environment.HOME).toBe('/home/runbeacon');
+    expect(environment.DISPLAY).toBe(':1');
+    expect(environment.PATH).not.toBe('untrusted-path');
+    expect(environment).not.toHaveProperty('RUNBEACON_GITHUB_TOKEN');
+    expect(environment).not.toHaveProperty('SSH_PASSWORD');
+  });
+
   test('builds durable Slurm and Aqua Apple-signing wrappers without passwords', () => {
     const slurm = commandForAdapter({
       command: 'sbatch --parsable train.slurm',
@@ -147,6 +188,13 @@ describe('RunBeacon 3 security services', () => {
     expect(slurm).toContain('squeue');
     expect(slurm).toContain('sacct');
     expect(slurm).toContain('scancel');
+    expect(slurm).toContain('RUNBEACON_CANCELLATION_ACK_FILE');
+    expect(slurm).toContain('RUNBEACON_TERMINAL_STATE_FILE');
+    expect(slurm).toContain("printf 'timed_out\\n'");
+    expect(slurm).toContain('scancel could not be verified');
+    expect(slurm).not.toContain(
+      'scancel "$rb_slurm_id" >/dev/null 2>&1 || true'
+    );
 
     const signing = commandForAdapter({
       command: 'echo release-ready',
@@ -154,7 +202,56 @@ describe('RunBeacon 3 security services', () => {
     });
     expect(signing).toContain('launchctl print "gui/$rb_uid"');
     expect(signing).toContain('codesign --force --options runtime --timestamp');
+    expect(signing).toContain('xcrun clang');
+    expect(signing).toContain('--timestamp=none');
+    expect(signing).toContain("grep -q '^Timestamp='");
     expect(signing).toContain('notarytool history --keychain-profile');
     expect(signing).not.toMatch(/keychain-password|apple-id-password/i);
+  });
+
+  test('explicitly probes and pins the SSH host-key algorithm', async () => {
+    const hostKey = Buffer.from('runbeacon-host-key-probe');
+    const fingerprint = createHash('sha256').update(hostKey).digest('base64');
+    const attempted: string[] = [];
+    class FakeSshClient extends EventEmitter {
+      connect(config: ConnectConfig): void {
+        const algorithm = config.algorithms?.serverHostKey?.[0];
+        attempted.push(String(algorithm));
+        setImmediate(() => {
+          if (algorithm !== 'rsa-sha2-512') {
+            this.emit('error', new Error('algorithm unavailable'));
+            return;
+          }
+          if (config.hostVerifier?.(hostKey)) this.emit('ready');
+          else this.emit('error', new Error('host key rejected'));
+        });
+      }
+
+      destroy(): void {
+        // The production helper owns and closes every probe connection.
+      }
+    }
+
+    await expect(
+      probeSshHostKeyAlgorithm(
+        {
+          kind: 'ssh',
+          host: 'runner.example',
+          username: 'runner',
+          password: 'memory-only',
+          hostKeySha256: `SHA256:${fingerprint}`,
+        },
+        () => new FakeSshClient() as unknown as Client,
+        1_000
+      )
+    ).resolves.toBe('rsa-sha2-512');
+    expect(attempted).toEqual([
+      'ssh-ed25519',
+      'ecdsa-sha2-nistp256',
+      'ecdsa-sha2-nistp384',
+      'ecdsa-sha2-nistp521',
+      'rsa-sha2-512',
+    ]);
+    expect(attempted).not.toContain('ssh-rsa');
   });
 });

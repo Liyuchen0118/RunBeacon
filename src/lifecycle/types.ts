@@ -57,6 +57,14 @@ export interface JobPolicyStatus {
   grantExpiresAt?: string;
 }
 
+export interface ApprovalContext {
+  jobId: string;
+  commandDigest: string;
+  target: PublicJobTarget;
+  credentialProfileId?: string;
+  risk: JobPolicyStatus['risk'];
+}
+
 export type JobOutputStream = 'stdout' | 'stderr' | 'system';
 
 export interface JobOutputChunk {
@@ -165,6 +173,8 @@ export interface PublicJobTarget {
 export interface JobRecord {
   id: string;
   idempotencyKey?: string;
+  /** Private execution-spec digest used for idempotency conflict detection. */
+  commandDigest?: string;
   label: string;
   displayCommand: string;
   target: PublicJobTarget;
@@ -198,7 +208,8 @@ export interface JobRecord {
   metadata?: Record<string, unknown>;
 }
 
-export interface JobSnapshot extends Omit<JobRecord, 'output'> {
+export interface JobSnapshot
+  extends Omit<JobRecord, 'output' | 'commandDigest'> {
   tail: JobOutputChunk[];
   assessment: LifecycleAssessment;
 }

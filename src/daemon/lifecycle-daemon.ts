@@ -201,6 +201,13 @@ async function handle(
             : manager.approve(String(args.jobId))
         );
         break;
+      case 'approval_context':
+        respond(
+          socket,
+          request.id,
+          manager.approvalContext(String(args.jobId))
+        );
+        break;
       case 'policy':
         respond(
           socket,

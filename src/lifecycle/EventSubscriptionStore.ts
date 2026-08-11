@@ -1,4 +1,5 @@
 import { createHmac } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import {
   chmodSync,
   mkdirSync,
@@ -42,10 +43,15 @@ interface SubscriptionDocument {
 
 const ENVIRONMENT_REFERENCE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 
+export type DesktopNotifier = (title: string, body: string) => Promise<void>;
+
 export class EventSubscriptionStore {
   private readonly subscriptions = new Map<string, EventSubscription>();
 
-  constructor(private readonly path: string) {
+  constructor(
+    private readonly path: string,
+    private readonly desktopNotifier: DesktopNotifier = sendDesktopNotification
+  ) {
     this.load();
   }
 
@@ -126,9 +132,19 @@ export class EventSubscriptionStore {
           return { id, delivered: subscription.enabled };
         }
         if (subscription.kind === 'desktop') {
-          // Desktop delivery is consumed by the Codex host integration. The
-          // daemon records the durable event even when no host is attached.
-          return { id, delivered: true };
+          try {
+            await this.desktopNotifier(
+              'RunBeacon job finished',
+              `${event.jobId}: ${event.state}`
+            );
+            return { id, delivered: true };
+          } catch {
+            return {
+              id,
+              delivered: false,
+              error: 'Desktop notification delivery failed',
+            };
+          }
         }
         const configuredUrl = process.env[subscription.urlEnvVar!];
         if (!configuredUrl) {
@@ -222,6 +238,130 @@ export class EventSubscriptionStore {
     renameSync(temporary, this.path);
     if (process.platform !== 'win32') chmodSync(this.path, 0o600);
   }
+}
+
+function sendDesktopNotification(title: string, body: string): Promise<void> {
+  const safeTitle = boundedNotificationText(title, 80);
+  const safeBody = boundedNotificationText(body, 240);
+  if (process.platform === 'win32') {
+    const script = [
+      '$ErrorActionPreference="Stop"',
+      '[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] > $null',
+      '[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime] > $null',
+      '$title=[System.Security.SecurityElement]::Escape($env:RUNBEACON_NOTIFICATION_TITLE)',
+      '$body=[System.Security.SecurityElement]::Escape($env:RUNBEACON_NOTIFICATION_BODY)',
+      '$xml=New-Object Windows.Data.Xml.Dom.XmlDocument',
+      '$xml.LoadXml("<toast><visual><binding template=\'ToastGeneric\'><text>$title</text><text>$body</text></binding></visual></toast>")',
+      '[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("RunBeacon").Show([Windows.UI.Notifications.ToastNotification]::new($xml))',
+    ].join(';');
+    const systemRoot =
+      process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows';
+    return runNotifier(
+      `${systemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      {
+        ...desktopNotificationEnvironment(),
+        RUNBEACON_NOTIFICATION_TITLE: safeTitle,
+        RUNBEACON_NOTIFICATION_BODY: safeBody,
+      }
+    );
+  }
+  if (process.platform === 'darwin') {
+    return runNotifier(
+      '/usr/bin/osascript',
+      [
+        '-e',
+        'on run argv',
+        '-e',
+        'display notification (item 2 of argv) with title (item 1 of argv)',
+        '-e',
+        'end run',
+        '--',
+        safeTitle,
+        safeBody,
+      ],
+      desktopNotificationEnvironment()
+    );
+  }
+  return runNotifier(
+    '/usr/bin/notify-send',
+    ['--app-name=RunBeacon', safeTitle, safeBody],
+    desktopNotificationEnvironment()
+  );
+}
+
+function runNotifier(
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      env,
+      shell: false,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error('notification timed out'));
+    }, 10_000);
+    timer.unref?.();
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('exit', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`notification exited with code ${code}`));
+    });
+  });
+}
+
+export function desktopNotificationEnvironment(
+  source: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+  const allowed = new Set(
+    [
+      'APPDATA',
+      'DBUS_SESSION_BUS_ADDRESS',
+      'DISPLAY',
+      'HOME',
+      'LANG',
+      'LC_ALL',
+      'LC_CTYPE',
+      'LOCALAPPDATA',
+      'LOGNAME',
+      'SYSTEMROOT',
+      'TEMP',
+      'TMP',
+      'TMPDIR',
+      'USER',
+      'USERPROFILE',
+      'WAYLAND_DISPLAY',
+      'WINDIR',
+      'XDG_RUNTIME_DIR',
+    ].map((key) => key.toUpperCase())
+  );
+  const result: NodeJS.ProcessEnv = {
+    PATH:
+      process.platform === 'win32'
+        ? `${source.SystemRoot || source.WINDIR || 'C:\\Windows'}\\System32`
+        : '/usr/bin:/bin',
+  };
+  for (const [key, value] of Object.entries(source)) {
+    if (value !== undefined && allowed.has(key.toUpperCase())) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+function boundedNotificationText(value: string, limit: number): string {
+  return String(value)
+    .replace(/[\r\n\0\u0001-\u001f\u007f]/g, ' ')
+    .slice(0, limit);
 }
 
 function isStoredSubscription(value: unknown): value is EventSubscription {

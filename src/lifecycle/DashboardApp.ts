@@ -72,6 +72,7 @@ export function createDashboardHtml(): string {
       let renderedSignature = null;
       let latestJobs = [];
       let focusedJobId;
+      let approvalCapability;
       let launcherAttempt;
       const pending = new Map();
 
@@ -83,6 +84,15 @@ export function createDashboardHtml(): string {
       });
       const structured = (value) =>
         value?.structuredContent ?? value?.result?.structuredContent ?? value?.params?.structuredContent;
+      const privateMetadata = (value) => value?._meta ?? value?.result?._meta ?? value?.params?._meta;
+      const captureApproval = (value, jobId) => {
+        const candidate = privateMetadata(value)?.['runbeacon/approval'];
+        if (candidate?.jobId === jobId && typeof candidate.capability === 'string') {
+          approvalCapability = candidate;
+        }
+      };
+      const hasApproval = (jobId) => approvalCapability?.jobId === jobId &&
+        Date.parse(approvalCapability.expiresAt || '') > Date.now();
 
       window.addEventListener('message', (event) => {
         if (event.source !== window.parent) return;
@@ -98,8 +108,12 @@ export function createDashboardHtml(): string {
         if (message.method === 'ui/notifications/tool-result') {
           const data = structured(message.params);
           if (data?.dashboardJobId && data?.job?.id === data.dashboardJobId) {
-            if (focusedJobId !== data.dashboardJobId) watchGeneration += 1;
+            if (focusedJobId !== data.dashboardJobId) {
+              watchGeneration += 1;
+              approvalCapability = undefined;
+            }
             focusedJobId = data.dashboardJobId;
+            captureApproval(message.params, focusedJobId);
             render([data.job]);
             beginWatch();
           } else if (focusedJobId && data?.job?.id === focusedJobId) {
@@ -199,6 +213,13 @@ export function createDashboardHtml(): string {
           const output = tail ? '<pre>' + escapeHtml(tail) + '</pre>' : '';
           const cancel = isTerminal(job.state) ? ''
             : '<div style="margin-top:9px"><button data-cancel="' + escapeHtml(job.id) + '">Cancel</button></div>';
+          const approval = execution.phase !== 'awaiting_approval' ? ''
+            : hasApproval(job.id)
+              ? '<div style="margin-top:9px;display:flex;gap:7px">' +
+                  '<button data-approval="approve" data-job="' + escapeHtml(job.id) + '">Approve</button>' +
+                  '<button data-approval="reject" data-job="' + escapeHtml(job.id) + '">Reject</button>' +
+                '</div>'
+              : '<div class="meta">Approval required</div>';
           return '<section class="job">' +
             '<div class="top">' +
               '<div><div class="label">' + escapeHtml(job.label) + '</div>' +
@@ -207,7 +228,7 @@ export function createDashboardHtml(): string {
               '<span class="state ' + escapeHtml(job.state) + '">' + escapeHtml(job.state) + '</span>' +
             '</div>' + runner + github + credential + timing + progressBar + progressInfo +
             (job.error ? '<div class="meta">' + escapeHtml(job.error) + '</div>' : '') +
-            output + cancel + '</section>';
+            output + approval + cancel + '</section>';
         }).join('');
       }
 
@@ -227,11 +248,18 @@ export function createDashboardHtml(): string {
           while (generation === watchGeneration && focusedJobId && !document.hidden) {
             const current = latestJobs.find((job) => job.id === focusedJobId);
             if (current && isTerminal(current.state)) {
+              approvalCapability = undefined;
               connectionEl.textContent = 'Complete';
               return;
             }
             try {
               const requestedJobId = focusedJobId;
+              if (current?.execution?.phase === 'awaiting_approval' && !hasApproval(requestedJobId)) {
+                const dashboardResponse = await callTool('job_dashboard', { jobId:requestedJobId });
+                captureApproval(dashboardResponse, requestedJobId);
+                const dashboardData = structured(dashboardResponse);
+                if (dashboardData?.job?.id === requestedJobId) render([dashboardData.job]);
+              }
               const response = await callTool('job_watch', {
                 jobId:requestedJobId,
                 afterVersion:current?.version || 0,
@@ -258,6 +286,22 @@ export function createDashboardHtml(): string {
       }
 
       jobsEl.addEventListener('click', async (event) => {
+        const approvalButton = event.target.closest('button[data-approval]');
+        if (approvalButton) {
+          approvalButton.disabled = true;
+          try {
+            if (!hasApproval(approvalButton.dataset.job)) throw new Error('approval capability expired');
+            const response = await callTool('job_approval', {
+              jobId:approvalButton.dataset.job,
+              decision:approvalButton.dataset.approval,
+              capability:approvalCapability.capability,
+            });
+            approvalCapability = undefined;
+            const data = structured(response);
+            if (data?.job?.id === focusedJobId) render([data.job]);
+          } finally { void beginWatch(); }
+          return;
+        }
         const button = event.target.closest('button[data-cancel]');
         if (!button) return;
         button.disabled = true;
@@ -294,7 +338,9 @@ export function createDashboardHtml(): string {
           if (!data?.job) throw new Error('RunBeacon returned no job');
           launcherAttempt = undefined;
           watchGeneration += 1;
+          approvalCapability = undefined;
           focusedJobId = data.job.id;
+          captureApproval(response, focusedJobId);
           launchStatusEl.textContent = 'Started job ' + data.job.id.slice(0,8) + '. Live updates use no model polling.';
           render([data.job]);
           void beginWatch();

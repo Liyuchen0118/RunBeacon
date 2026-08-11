@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -6,10 +7,15 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   CallToolResult,
+  CancelTaskRequestSchema,
+  GetTaskPayloadRequestSchema,
+  GetTaskRequestSchema,
+  ListTasksRequestSchema,
   ListResourcesRequestSchema,
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
   TextContent,
+  Task,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { LifecycleManager } from '../lifecycle/LifecycleManager.js';
@@ -37,12 +43,17 @@ import {
 } from '../lifecycle/DashboardApp.js';
 import { safeErrorMessage } from '../lifecycle/security.js';
 import {
+  ApprovalContext,
   isTerminalJobState,
+  JobSnapshot,
   SshJobTarget,
   StartJobInput,
 } from '../lifecycle/types.js';
 import { RUNBEACON_VERSION } from '../lifecycle/protocol.js';
-import { SshRunnerTransport } from '../lifecycle/RunnerTransport.js';
+import {
+  probeSshHostKeyAlgorithm,
+  SshRunnerTransport,
+} from '../lifecycle/RunnerTransport.js';
 import { PolicyUpdate } from '../lifecycle/PolicyEngine.js';
 import { EventSubscriptionKind } from '../lifecycle/EventSubscriptionStore.js';
 import {
@@ -61,6 +72,14 @@ const credentialProfiles = new CredentialProfileStore(
   join(pluginData, 'credential-profiles.json')
 );
 const sshPasswordProfiles = new SshPasswordProfileManager(credentialProfiles);
+const APPROVAL_CAPABILITY_TTL_MS = 5 * 60_000;
+const MAX_APPROVAL_CAPABILITIES = 1_024;
+interface ApprovalCapabilityRecord {
+  tokenHash: Buffer;
+  contextDigest: Buffer;
+  expiresAt: number;
+}
+const approvalCapabilities = new Map<string, ApprovalCapabilityRecord>();
 
 let manager: LifecycleService;
 if (runBeaconBoolean('RUNBEACON_INLINE_MANAGER', 'RJM_INLINE_MANAGER')) {
@@ -161,7 +180,6 @@ const sshTargetSchema = {
         'ecdsa-sha2-nistp521',
         'rsa-sha2-512',
         'rsa-sha2-256',
-        'ssh-rsa',
       ],
       description:
         'Pinned server host-key algorithm. Supplying it avoids negotiation retries.',
@@ -587,6 +605,7 @@ const tools: Tool[] = [
       idempotentHint: false,
       openWorldHint: true,
     },
+    execution: { taskSupport: 'optional' },
     _meta: {
       ui: { resourceUri: DASHBOARD_RESOURCE_URI },
       'openai/outputTemplate': DASHBOARD_RESOURCE_URI,
@@ -723,6 +742,7 @@ const tools: Tool[] = [
       idempotentHint: false,
       openWorldHint: true,
     },
+    execution: { taskSupport: 'optional' },
     _meta: {
       ui: { resourceUri: DASHBOARD_RESOURCE_URI },
       'openai/outputTemplate': DASHBOARD_RESOURCE_URI,
@@ -872,11 +892,23 @@ const tools: Tool[] = [
       properties: {
         action: {
           type: 'string',
-          enum: ['probe', 'install', 'upgrade', 'uninstall'],
+          enum: [
+            'probe',
+            'migrate-host-key',
+            'install',
+            'upgrade',
+            'uninstall',
+          ],
         },
         credentialProfile: { type: 'string' },
         useDefaultCredential: { type: 'boolean', default: false },
         target: sshTargetSchema,
+        confirm: {
+          type: 'boolean',
+          default: false,
+          description:
+            'Required for migrate-host-key because it updates the saved SSH profile after a successful pinned-fingerprint probe.',
+        },
       },
       required: ['action'],
     },
@@ -972,7 +1004,13 @@ const tools: Tool[] = [
 
 const server = new Server(
   { name: 'remote-job-monitor', version: RUNBEACON_VERSION },
-  { capabilities: { tools: {}, resources: {} } }
+  {
+    capabilities: {
+      tools: {},
+      resources: {},
+      tasks: { list: {}, cancel: {}, requests: { tools: { call: {} } } },
+    },
+  }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
@@ -1001,12 +1039,156 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   };
 });
 
-function reply(structuredContent: Record<string, unknown>, message: string) {
+function reply(
+  structuredContent: Record<string, unknown>,
+  message: string,
+  privateMetadata?: Record<string, unknown>
+) {
   return {
     content: [{ type: 'text', text: message } as TextContent],
     structuredContent,
+    ...(privateMetadata ? { _meta: privateMetadata } : {}),
   } as CallToolResult;
 }
+
+function digestApprovalContext(context: ApprovalContext): Buffer {
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        jobId: context.jobId,
+        commandDigest: context.commandDigest,
+        target: context.target,
+        credentialProfileId: context.credentialProfileId ?? null,
+        risk: context.risk,
+      })
+    )
+    .digest();
+}
+
+function pruneApprovalCapabilities(now = Date.now()): void {
+  for (const [jobId, record] of approvalCapabilities) {
+    if (record.expiresAt <= now) approvalCapabilities.delete(jobId);
+  }
+  while (approvalCapabilities.size >= MAX_APPROVAL_CAPABILITIES) {
+    const oldest = approvalCapabilities.keys().next().value as
+      | string
+      | undefined;
+    if (!oldest) break;
+    approvalCapabilities.delete(oldest);
+  }
+}
+
+async function issueApprovalMetadata(
+  job: JobSnapshot
+): Promise<Record<string, unknown> | undefined> {
+  if (
+    job.execution.phase !== 'awaiting_approval' ||
+    job.policy.approval !== 'pending'
+  ) {
+    approvalCapabilities.delete(job.id);
+    return undefined;
+  }
+  pruneApprovalCapabilities();
+  const context = await manager.approvalContext(job.id);
+  const token = randomBytes(32).toString('base64url');
+  const expiresAt = Date.now() + APPROVAL_CAPABILITY_TTL_MS;
+  approvalCapabilities.delete(job.id);
+  approvalCapabilities.set(job.id, {
+    tokenHash: createHash('sha256').update(token).digest(),
+    contextDigest: digestApprovalContext(context),
+    expiresAt,
+  });
+  return {
+    'runbeacon/approval': {
+      jobId: job.id,
+      capability: token,
+      expiresAt: new Date(expiresAt).toISOString(),
+    },
+  };
+}
+
+async function consumeApprovalCapability(
+  jobId: string,
+  capability: string
+): Promise<void> {
+  pruneApprovalCapabilities();
+  const record = approvalCapabilities.get(jobId);
+  if (!record || record.expiresAt < Date.now()) {
+    approvalCapabilities.delete(jobId);
+    throw new Error(
+      'APPROVAL_REQUIRED: approval capability is missing or expired'
+    );
+  }
+  const suppliedHash = createHash('sha256').update(capability).digest();
+  if (!timingSafeEqual(record.tokenHash, suppliedHash)) {
+    throw new Error('APPROVAL_REQUIRED: approval capability is invalid');
+  }
+  const currentContext = await manager.approvalContext(jobId);
+  if (
+    !timingSafeEqual(
+      record.contextDigest,
+      digestApprovalContext(currentContext)
+    )
+  ) {
+    approvalCapabilities.delete(jobId);
+    throw new Error('APPROVAL_REQUIRED: approval context changed');
+  }
+  approvalCapabilities.delete(jobId);
+}
+
+function taskForJob(job: JobSnapshot): Task {
+  let status: Task['status'] = 'working';
+  if (job.execution.phase === 'awaiting_approval') status = 'input_required';
+  else if (job.state === 'succeeded') status = 'completed';
+  else if (job.state === 'cancelled') status = 'cancelled';
+  else if (
+    job.state === 'failed' ||
+    job.state === 'timed_out' ||
+    job.state === 'lost'
+  ) {
+    status = 'failed';
+  }
+  return {
+    taskId: job.id,
+    status,
+    ttl: null,
+    createdAt: job.createdAt,
+    lastUpdatedAt: job.updatedAt,
+    pollInterval: 1_000,
+    statusMessage: (job.error || `${job.label}: ${job.state}`).slice(0, 240),
+  };
+}
+
+server.setRequestHandler(GetTaskRequestSchema, async (request) => {
+  const job = await manager.snapshot(request.params.taskId, 0);
+  return taskForJob(job);
+});
+
+server.setRequestHandler(GetTaskPayloadRequestSchema, async (request) => {
+  const job = await manager.snapshot(request.params.taskId, 120);
+  if (!isTerminalJobState(job.state)) {
+    throw new Error(`Task ${job.id} is not complete`);
+  }
+  return reply({ job }, `Job ${job.id} finished with state ${job.state}.`);
+});
+
+server.setRequestHandler(ListTasksRequestSchema, async (request) => {
+  const offset = Math.max(0, Number(request.params?.cursor ?? 0) || 0);
+  const jobs = await manager.list(0, 500);
+  const page = jobs.slice(offset, offset + 100);
+  return {
+    tasks: page.map(taskForJob),
+    nextCursor:
+      offset + page.length < jobs.length
+        ? String(offset + page.length)
+        : undefined,
+  };
+});
+
+server.setRequestHandler(CancelTaskRequestSchema, async (request) => {
+  const job = await manager.cancel(request.params.taskId);
+  return taskForJob(job);
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const args = (request.params.arguments ?? {}) as Record<string, unknown>;
@@ -1240,16 +1422,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
             credentialProfile: credentialProfile?.id,
           },
         });
+        if (request.params.task) {
+          return { task: taskForJob(job) };
+        }
         return reply(
           { job, dashboardJobId: job.id },
-          `GitHub publish job ${job.id} started. The dashboard tracks commit, push, and Actions without model polling; call job_wait once if you need to continue automatically.`
+          `GitHub publish job ${job.id} started. The dashboard tracks commit, push, and Actions without model polling; call job_wait once if you need to continue automatically.`,
+          await issueApprovalMetadata(job)
         );
       }
       case 'runner_manage': {
         const action = String(args.action ?? '');
-        if (action !== 'probe') {
+        if (action !== 'probe' && action !== 'migrate-host-key') {
           throw new Error(
             'RUNNER_ASSET_REQUIRED: install, upgrade, and uninstall must use the interactive runbeacon runner CLI with a signed release asset'
+          );
+        }
+        const requestedProfile = optionalString(args.credentialProfile);
+        if (
+          action === 'migrate-host-key' &&
+          (!requestedProfile || args.confirm !== true)
+        ) {
+          throw new Error(
+            'migrate-host-key requires credentialProfile and confirm=true'
           );
         }
         const resolved = await resolveJobStartInput({
@@ -1260,6 +1455,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         });
         if (!resolved.target || resolved.target.kind !== 'ssh') {
           throw new Error('runner_manage requires an SSH target or profile');
+        }
+        if (action === 'migrate-host-key') {
+          const current = credentialProfiles.get(requestedProfile!);
+          if (current.kind !== 'ssh') {
+            throw new Error(`${requestedProfile} is not an SSH profile`);
+          }
+          const algorithm = await probeSshHostKeyAlgorithm(resolved.target);
+          const { createdAt, updatedAt, ...safe } = current;
+          void createdAt;
+          void updatedAt;
+          const profile = credentialProfiles.save({
+            ...safe,
+            hostKeyAlgorithm: algorithm,
+          });
+          return reply(
+            { profile, hostKeyAlgorithm: algorithm },
+            `Pinned SSH host-key algorithm ${algorithm} for profile ${profile.id}.`
+          );
         }
         const status = await new SshRunnerTransport(resolved.target).call(
           'ping',
@@ -1337,9 +1550,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           new Date().toISOString()
         );
         const job = await manager.start(input);
+        if (request.params.task) {
+          return { task: taskForJob(job) };
+        }
         return reply(
           { job, dashboardJobId: job.id },
-          `Tracked job ${job.id} queued. Call job_wait once to resume when it finishes; do not poll.`
+          `Tracked job ${job.id} queued. Call job_wait once to resume when it finishes; do not poll.`,
+          await issueApprovalMetadata(job)
+        );
+      }
+      case 'job_approval': {
+        const jobId = String(args.jobId ?? '');
+        const decision = String(args.decision ?? '');
+        const capability = String(args.capability ?? '');
+        delete args.capability;
+        if (decision !== 'approve' && decision !== 'reject') {
+          throw new Error('Approval decision must be approve or reject');
+        }
+        await consumeApprovalCapability(jobId, capability);
+        const job =
+          decision === 'approve'
+            ? await manager.approve(jobId)
+            : await manager.rejectApproval(jobId);
+        return reply(
+          { job, dashboardJobId: job.id },
+          `Job ${job.id} approval decision recorded.`
         );
       }
       case 'job_wait': {
@@ -1398,7 +1633,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
           { job: job ?? null, dashboardJobId: job?.id ?? null },
           job
             ? `Opened the live dashboard for job ${job.id}.`
-            : 'No active tracked task is available to display.'
+            : 'No active tracked task is available to display.',
+          job ? await issueApprovalMetadata(job) : undefined
         );
       }
       default:
