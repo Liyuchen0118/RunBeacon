@@ -22,6 +22,8 @@ const requirements = {
     'runnerExactlyOnce',
     'runnerRestartRecovery',
     'daemonRecovery',
+    'sameWaitDaemonCrashRecovery',
+    'durableCoordinatorRecovery',
     'tenMinuteEventContinuity',
     'trainingProgress',
     'verifiedCancellation',

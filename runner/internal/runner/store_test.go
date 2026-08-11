@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -278,6 +279,9 @@ func TestEventContinuationAcrossTenThousandEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobDir, _ := store.JobDir(job.ID)
+	runtime.GC()
+	var baselineMemory runtime.MemStats
+	runtime.ReadMemStats(&baselineMemory)
 	var journal strings.Builder
 	for sequence := uint64(2); sequence <= 10001; sequence++ {
 		encoded, marshalErr := json.Marshal(Event{
@@ -294,12 +298,19 @@ func TestEventContinuationAcrossTenThousandEvents(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(jobDir, eventFileName), []byte(journal.String()), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	journal = strings.Builder{}
 	events, truncated, err := store.EventsAfter(job.ID, 9990)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if truncated || len(events) != 11 || events[0].Sequence != 9991 || events[10].Sequence != 10001 {
 		t.Fatalf("event continuation failed: first=%d last=%d count=%d truncated=%v", events[0].Sequence, events[len(events)-1].Sequence, len(events), truncated)
+	}
+	runtime.GC()
+	var currentMemory runtime.MemStats
+	runtime.ReadMemStats(&currentMemory)
+	if growth := int64(currentMemory.Alloc) - int64(baselineMemory.Alloc); growth > 20*1024*1024 {
+		t.Fatalf("10000 event continuation grew stable memory by %d bytes", growth)
 	}
 }
 

@@ -53,11 +53,13 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run test:lifecycle:daemon
+        env:
+          RUNBEACON_DAEMON_EVIDENCE: acceptance-results/daemon-recovery.json
       - name: Disconnect for ten minutes and recover the same Runner job
         run: node scripts/acceptance/linux-training.mjs
         env:
           RUNBEACON_ACCEPTANCE_DISCONNECT_MS: 600000
-          RUNBEACON_DAEMON_TESTED: 'true'
+          RUNBEACON_DAEMON_EVIDENCE: acceptance-results/daemon-recovery.json
           RUNBEACON_ACCEPTANCE_OUTPUT: acceptance-results/linux-training.json
       - uses: actions/upload-artifact@v4
         with:

@@ -7,6 +7,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { writeAcceptanceReport } from './report.mjs';
+import { LifecycleManager } from '../../dist/lifecycle/LifecycleManager.js';
 
 assert.equal(process.platform, 'linux', 'Linux acceptance requires Linux');
 const startedAt = new Date().toISOString();
@@ -27,7 +28,16 @@ const output =
 const disconnectMs = Number(
   process.env.RUNBEACON_ACCEPTANCE_DISCONNECT_MS || 600_000
 );
+const daemonEvidencePath = requiredPath(
+  process.env.RUNBEACON_DAEMON_EVIDENCE,
+  'RUNBEACON_DAEMON_EVIDENCE'
+);
 let server;
+
+function requiredPath(value, name) {
+  assert.ok(value?.trim(), `${name} is required`);
+  return path.resolve(root, value);
+}
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -173,6 +183,77 @@ try {
   assert.match(text, /TRAIN_PROGRESS 100%/);
   assert.match(text, /TRAINING_COMPLETED/);
 
+  const daemonEvidence = JSON.parse(
+    fs.readFileSync(daemonEvidencePath, 'utf8')
+  );
+  assert.equal(daemonEvidence.sameWaitDaemonCrashRecovery, 'passed');
+  assert.equal(daemonEvidence.nonDurableCrashState, 'lost');
+
+  const coordinatorStatePath = path.join(
+    temporary,
+    'coordinator-recovery.json'
+  );
+  const coordinatorProfile = 'linux-acceptance-runner';
+  const coordinatorTarget = {
+    kind: 'ssh',
+    host: 'local-runner.invalid',
+    username: 'acceptance',
+    allowUnverifiedHostKey: true,
+  };
+  const firstCoordinator = new LifecycleManager({
+    statePath: coordinatorStatePath,
+    persistenceDebounceMs: 25,
+    runnerTransportFactory: () => ({
+      call: async (method, rpcParams = {}) => {
+        if (method === 'watch') {
+          return new Promise(() => undefined);
+        }
+        return rpc(method, rpcParams);
+      },
+    }),
+  });
+  const coordinatorJob = firstCoordinator.start({
+    command: 'sleep 2; echo COORDINATOR_RECOVERED',
+    idempotencyKey: `coordinator-recovery-${randomUUID()}`,
+    credentialProfileId: coordinatorProfile,
+    executionMode: 'runner',
+    requireDurable: true,
+    target: coordinatorTarget,
+  });
+  const acceptedDeadline = Date.now() + 10_000;
+  while (!firstCoordinator.snapshot(coordinatorJob.id).execution.remoteJobId) {
+    assert.ok(
+      Date.now() < acceptedDeadline,
+      'coordinator recovery fixture was not accepted by the Runner'
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  firstCoordinator.dispose();
+  const recoveredCoordinator = new LifecycleManager({
+    statePath: coordinatorStatePath,
+    persistenceDebounceMs: 25,
+    recoverRunnerTarget: async (profileId) => {
+      assert.equal(profileId, coordinatorProfile);
+      return coordinatorTarget;
+    },
+    runnerTransportFactory: () => ({
+      call: async (method, rpcParams = {}) => rpc(method, rpcParams),
+    }),
+  });
+  const recoveredCoordinatorJob = await recoveredCoordinator.waitForTerminal(
+    coordinatorJob.id,
+    20_000,
+    50
+  );
+  assert.equal(recoveredCoordinatorJob.timedOut, false);
+  assert.equal(recoveredCoordinatorJob.job.state, 'succeeded');
+  assert.match(
+    recoveredCoordinatorJob.job.tail.map((chunk) => chunk.data).join(''),
+    /COORDINATOR_RECOVERED/
+  );
+  assert.ok(recoveredCoordinatorJob.job.execution.reconnectCount > 0);
+  recoveredCoordinator.dispose();
+
   const cancelId = randomUUID();
   const cancelCommand = "trap 'exit 143' TERM; while :; do sleep 1; done";
   rpc('submit', submitParams(cancelId, `cancel-${cancelId}`, cancelCommand));
@@ -195,7 +276,9 @@ try {
     checks: {
       runnerExactlyOnce: true,
       runnerRestartRecovery: true,
-      daemonRecovery: process.env.RUNBEACON_DAEMON_TESTED === 'true',
+      daemonRecovery: true,
+      sameWaitDaemonCrashRecovery: true,
+      durableCoordinatorRecovery: true,
       tenMinuteEventContinuity: disconnectMs >= 600_000,
       trainingProgress: true,
       verifiedCancellation: true,
@@ -204,6 +287,7 @@ try {
       disconnectMs,
       eventCount: events.length,
       reconnectFromSequence: 0,
+      coordinatorJobId: coordinatorJob.id,
     },
   });
   process.stdout.write(`${JSON.stringify(report)}\n`);

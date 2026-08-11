@@ -88,8 +88,16 @@ func TestUnixSocketRPCDoesNotLeakGoroutines(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	baseline := runtime.NumGoroutine()
 	request, _ := json.Marshal(Request{ProtocolVersion: ProtocolVersion, Method: "ping"})
+	if _, err := Call(paths.SocketPath, request); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	runtime.GC()
+	baseline := runtime.NumGoroutine()
+	baselineFDs, tracksFDs := openFileDescriptorCount()
+	var baselineMemory runtime.MemStats
+	runtime.ReadMemStats(&baselineMemory)
 	for attempt := 0; attempt < 1000; attempt++ {
 		if _, err := Call(paths.SocketPath, request); err != nil {
 			cancel()
@@ -102,6 +110,19 @@ func TestUnixSocketRPCDoesNotLeakGoroutines(t *testing.T) {
 		cancel()
 		t.Fatalf("1000 RPC reconnects leaked %d goroutines", growth)
 	}
+	if tracksFDs {
+		currentFDs, _ := openFileDescriptorCount()
+		if growth := currentFDs - baselineFDs; growth > 4 {
+			cancel()
+			t.Fatalf("1000 RPC reconnects leaked %d file descriptors", growth)
+		}
+	}
+	var currentMemory runtime.MemStats
+	runtime.ReadMemStats(&currentMemory)
+	if growth := int64(currentMemory.Alloc) - int64(baselineMemory.Alloc); growth > 20*1024*1024 {
+		cancel()
+		t.Fatalf("1000 RPC reconnects grew stable memory by %d bytes", growth)
+	}
 	cancel()
 	select {
 	case err := <-finished:
@@ -111,4 +132,14 @@ func TestUnixSocketRPCDoesNotLeakGoroutines(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("runner server did not stop")
 	}
+}
+
+func openFileDescriptorCount() (int, bool) {
+	for _, directory := range []string{"/proc/self/fd", "/dev/fd"} {
+		entries, err := os.ReadDir(directory)
+		if err == nil {
+			return len(entries), true
+		}
+	}
+	return 0, false
 }
