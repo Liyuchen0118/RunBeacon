@@ -69,8 +69,8 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           if [ "$CHANNEL" = beta ]; then
-            ! npm view "console-automation-mcp@$VERSION" version >/dev/null 2>&1
-            ! npm view "runbeacon-runner@$VERSION" version >/dev/null 2>&1
+            if npm view "console-automation-mcp@$VERSION" version >/dev/null 2>&1; then exit 1; fi
+            if npm view "runbeacon-runner@$VERSION" version >/dev/null 2>&1; then exit 1; fi
           else
             test "$(npm view "console-automation-mcp@$VERSION" version)" = "$VERSION"
             test "$(npm view "runbeacon-runner@$VERSION" version)" = "$VERSION"

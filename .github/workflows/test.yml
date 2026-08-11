@@ -58,8 +58,8 @@ jobs:
           sudo useradd -m -s /bin/bash testuser
           echo 'testuser:testpass' | sudo chpasswd
           sudo mkdir -p /run/sshd
-          sudo /usr/sbin/sshd -D -e -p 2222 -o ListenAddress=127.0.0.1 -o PasswordAuthentication=yes -o PubkeyAuthentication=no >/tmp/runbeacon-sshd.log 2>&1 &
-          for attempt in {1..20}; do ss -ltn | grep -q '127.0.0.1:2222' && exit 0; sleep .5; done
+          sudo sh -c '/usr/sbin/sshd -D -e -p 2222 -o ListenAddress=127.0.0.1 -o PasswordAuthentication=yes -o PubkeyAuthentication=no >/tmp/runbeacon-sshd.log 2>&1' &
+          for _ in {1..20}; do ss -ltn | grep -q '127.0.0.1:2222' && exit 0; sleep .5; done
           cat /tmp/runbeacon-sshd.log
           exit 1
       - run: npm run test:ssh:smoke
