@@ -8,6 +8,7 @@
   },
   "files": [
     "install.mjs",
+    "verify.mjs",
     "assets",
     "README.md"
   ],
@@ -24,5 +25,8 @@
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "sigstore": "^5.0.0"
   }
 }
