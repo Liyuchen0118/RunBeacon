@@ -160,19 +160,34 @@ export class DaemonClient implements LifecycleService {
     return this.request('start', { input });
   }
 
-  waitForTerminal(
+  async waitForTerminal(
     jobId: string,
     timeoutMs?: number,
     tailLines?: number,
     signal?: AbortSignal
   ): Promise<WaitResult> {
-    const requestTimeout = Math.max(5_000, (timeoutMs ?? 86_400_000) + 5_000);
-    return this.request(
-      'wait',
-      { jobId, timeoutMs, tailLines },
-      requestTimeout,
-      signal
-    );
+    const waitBudget = timeoutMs ?? 86_400_000;
+    const deadline = Date.now() + waitBudget;
+    for (;;) {
+      const remaining = Math.max(0, deadline - Date.now());
+      try {
+        return await this.request(
+          'wait',
+          { jobId, timeoutMs: remaining, tailLines },
+          Math.max(5_000, remaining + 5_000),
+          signal
+        );
+      } catch (error) {
+        if (
+          signal?.aborted ||
+          error instanceof DaemonRpcError ||
+          Date.now() >= deadline
+        ) {
+          throw error;
+        }
+        await this.ensureReady();
+      }
+    }
   }
 
   watchForChange(
@@ -319,7 +334,9 @@ export class DaemonClient implements LifecycleService {
     signal?: AbortSignal
   ): Promise<T> {
     if (signal?.aborted) {
-      return Promise.reject(new Error(`Daemon request ${method} was aborted`));
+      return Promise.reject(
+        new DaemonTransportError(`Daemon request ${method} was aborted`)
+      );
     }
     return new Promise<T>((resolve, reject) => {
       const id = randomUUID();
@@ -336,12 +353,17 @@ export class DaemonClient implements LifecycleService {
         else resolve(result as T);
       };
       const timer = setTimeout(
-        () => finish(new Error(`Daemon request ${method} timed out`)),
+        () =>
+          finish(
+            new DaemonTransportError(`Daemon request ${method} timed out`)
+          ),
         timeoutMs
       );
       timer.unref?.();
       const abortListener = () =>
-        finish(new Error(`Daemon request ${method} was aborted`));
+        finish(
+          new DaemonTransportError(`Daemon request ${method} was aborted`)
+        );
       signal?.addEventListener('abort', abortListener, { once: true });
 
       socket.setEncoding('utf8');
@@ -357,18 +379,48 @@ export class DaemonClient implements LifecycleService {
           const response = JSON.parse(
             buffer.slice(0, newline)
           ) as RpcResponse<T>;
-          if (response.id !== id) throw new Error('Mismatched daemon response');
-          if (response.error) finish(new Error(response.error));
+          if (response.id !== id) {
+            throw new DaemonTransportError('Mismatched daemon response');
+          }
+          if (response.error) finish(new DaemonRpcError(response.error));
           else finish(undefined, response.result);
         } catch (error) {
-          finish(error);
+          finish(
+            error instanceof DaemonRpcError ||
+              error instanceof DaemonTransportError
+              ? error
+              : new DaemonTransportError(String(error))
+          );
         }
       });
-      socket.once('error', (error) => finish(error));
+      socket.once('error', (error) =>
+        finish(new DaemonTransportError(error.message))
+      );
       socket.once('end', () => {
-        if (!settled) finish(new Error('Daemon closed the connection'));
+        if (!settled) {
+          finish(new DaemonTransportError('Daemon closed the connection'));
+        }
+      });
+      socket.once('close', () => {
+        if (!settled) {
+          finish(new DaemonTransportError('Daemon connection closed'));
+        }
       });
     });
+  }
+}
+
+class DaemonRpcError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DaemonRpcError';
+  }
+}
+
+class DaemonTransportError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DaemonTransportError';
   }
 }
 

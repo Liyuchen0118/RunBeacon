@@ -96,16 +96,54 @@ try {
   assert.equal(downgradeProtectedStatus.pid, upgradedStatus.pid);
   assert.equal(downgradeProtectedStatus.buildId, upgradedStatus.buildId);
 
-  process.stdout.write(
-    `${JSON.stringify({
-      residentDaemon: 'passed',
-      secondClientReattach: 'passed',
-      eventWait: 'passed',
-      abortPropagation: 'passed',
-      daemonBuildUpgrade: 'passed',
-      daemonDowngradeProtection: 'passed',
-    })}\n`
+  const crashRecovery = await upgradedClient.start({
+    command: process.execPath,
+    args: ['-e', 'setTimeout(() => process.exit(0), 5000)'],
+    shell: false,
+    label: 'daemon-crash-recovery-smoke',
+    idempotencyKey: 'daemon-smoke-crash-recovery',
+  });
+  const runningDeadline = Date.now() + 5_000;
+  while (
+    (await upgradedClient.snapshot(crashRecovery.id)).state !== 'running'
+  ) {
+    assert.ok(Date.now() < runningDeadline, 'crash fixture did not start');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const uninterruptedWait = upgradedClient.waitForTerminal(
+    crashRecovery.id,
+    15_000,
+    10
   );
+  process.kill(upgradedStatus.pid);
+  const recoveredAfterCrash = await uninterruptedWait;
+  assert.equal(recoveredAfterCrash.timedOut, false);
+  assert.equal(recoveredAfterCrash.job.state, 'lost');
+  const recoveredDaemonStatus = await upgradedClient.status();
+  assert.notEqual(recoveredDaemonStatus.pid, upgradedStatus.pid);
+
+  const result = {
+    residentDaemon: 'passed',
+    secondClientReattach: 'passed',
+    eventWait: 'passed',
+    abortPropagation: 'passed',
+    daemonBuildUpgrade: 'passed',
+    daemonDowngradeProtection: 'passed',
+    sameWaitDaemonCrashRecovery: 'passed',
+    nonDurableCrashState: 'lost',
+  };
+  if (process.env.RUNBEACON_DAEMON_EVIDENCE) {
+    const evidencePath = path.resolve(
+      root,
+      process.env.RUNBEACON_DAEMON_EVIDENCE
+    );
+    fs.mkdirSync(path.dirname(evidencePath), { recursive: true });
+    fs.writeFileSync(evidencePath, `${JSON.stringify(result)}\n`, {
+      mode: 0o600,
+    });
+  }
+  process.stdout.write(`${JSON.stringify(result)}\n`);
 } finally {
   if (daemonReady) {
     try {
