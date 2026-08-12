@@ -138,6 +138,8 @@ go test -race ./...
 
 Release promotion is manual. Beta requires green main checks, zero open CodeQL High/Critical alerts, npm and Go vulnerability gates, Linux/macOS Runner tests, four signed assets, Developer ID/Notary validation, exact-workflow Sigstore bundles, provenance, and an SBOM. Stable promotes the tested npm versions only after the same commit has a public Beta for seven complete days and attested Linux training, Mac signing, and fresh Codex-task acceptance all pass.
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/liyuchen0118-console-automation-mcp-legacy-r4affg)](https://m8ven.ai/mcp/liyuchen0118-console-automation-mcp-legacy-r4affg)
+
 ## License
 
 MIT
