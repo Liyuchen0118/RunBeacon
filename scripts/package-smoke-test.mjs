@@ -77,6 +77,41 @@ try {
     'lifecycle-server.js'
   );
   assert.ok(fs.existsSync(serverPath), 'Packed MCP entry point is missing');
+  const pluginManifest = JSON.parse(
+    fs.readFileSync(
+      path.join(packageRoot, '.codex-plugin', 'plugin.json'),
+      'utf8'
+    )
+  );
+  const pluginPackage = JSON.parse(
+    fs.readFileSync(
+      path.join(root, 'packages', 'codex-plugin', 'package.json'),
+      'utf8'
+    )
+  );
+  assert.equal(pluginManifest.name, 'remote-job-monitor');
+  const pluginBaseVersion = pluginPackage.version.replaceAll('.', '\\.');
+  assert.match(
+    pluginManifest.version,
+    new RegExp(`^${pluginBaseVersion}\\+codex\\.\\d{14}$`),
+    'Packed plugin manifest is not bound to the workspace plugin version'
+  );
+  assert.equal(pluginManifest.mcpServers, './.mcp.json');
+  for (const relative of [
+    '.mcp.json',
+    'hooks/hooks.json',
+    'hooks/inject-job-trace.cjs',
+    'hooks/pending-trace.cjs',
+    'hooks/route-remote-prompt.cjs',
+    'hooks/route-ssh.cjs',
+    'skills/monitor-remote-jobs/SKILL.md',
+    'skills/monitor-remote-jobs/agents/openai.yaml',
+  ]) {
+    assert.ok(
+      fs.existsSync(path.join(packageRoot, relative)),
+      `Packed Codex plugin file is missing: ${relative}`
+    );
+  }
   assert.equal(
     fs.existsSync(path.join(packageRoot, 'src')),
     false,
@@ -117,7 +152,7 @@ try {
   );
 
   process.stdout.write(
-    `${JSON.stringify({ packageContents: 'minimal', isolatedExtraction: 'passed', lifecycleServer: 'passed' })}\n`
+    `${JSON.stringify({ packageContents: 'minimal', isolatedExtraction: 'passed', lifecycleServer: 'passed', codexPlugin: 'passed' })}\n`
   );
 } finally {
   fs.rmSync(temporaryDirectory, { recursive: true, force: true });

@@ -36,6 +36,35 @@ const requirements = {
   ],
 };
 
+const releaseWorkflow = fs.readFileSync(
+  path.join(root, '.github', 'workflows', 'release.yml'),
+  'utf8'
+);
+assert.match(
+  releaseWorkflow,
+  /attest:\s*[\s\S]*?permissions:\s*[\s\S]*?id-token:\s*write[\s\S]*?attestations:\s*write[\s\S]*?actions\/attest-build-provenance@v2/,
+  'Runner provenance job is missing write permissions'
+);
+assert.match(
+  releaseWorkflow,
+  /manifest_version=.*\.codex-plugin\/plugin\.json[\s\S]*?PLUGIN_VERSION\+codex\./,
+  'Release gate does not bind the Codex manifest to plugin_version'
+);
+const provenancePermissionContract =
+  /attest:\s*[\s\S]*?permissions:\s*[\s\S]*?id-token:\s*write[\s\S]*?attestations:\s*write[\s\S]*?actions\/attest-build-provenance@v2/;
+assert.doesNotMatch(
+  releaseWorkflow.replace('attestations: write', 'attestations: read'),
+  provenancePermissionContract,
+  'Release evidence test accepted read-only attestation permissions'
+);
+const pluginVersionContract =
+  /manifest_version=.*\.codex-plugin\/plugin\.json[\s\S]*?PLUGIN_VERSION\+codex\./;
+assert.doesNotMatch(
+  releaseWorkflow.replace('PLUGIN_VERSION+codex.', 'VERSION+codex.'),
+  pluginVersionContract,
+  'Release evidence test accepted an unbound plugin manifest version'
+);
+
 try {
   for (const [kind, checks] of Object.entries(requirements)) {
     fs.writeFileSync(
