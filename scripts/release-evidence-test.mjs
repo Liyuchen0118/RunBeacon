@@ -13,6 +13,7 @@ const requirements = {
   'linux-training': [
     'runnerExactlyOnce',
     'runnerRestartRecovery',
+    'systemdUserService',
     'daemonRecovery',
     'sameWaitDaemonCrashRecovery',
     'durableCoordinatorRecovery',
@@ -64,7 +65,6 @@ assert.doesNotMatch(
   pluginVersionContract,
   'Release evidence test accepted an unbound plugin manifest version'
 );
-
 const acceptanceWorkflow = fs.readFileSync(
   path.join(root, '.github', 'workflows', 'acceptance.yml'),
   'utf8'
@@ -78,6 +78,36 @@ const codexPluginAcceptance = fs.readFileSync(
 );
 assert.match(codexPluginAcceptance, /buildCodexAcceptanceArgs\(prompt\)/);
 assert.doesNotMatch(codexPluginAcceptance, /'--sandbox'/);
+const linuxAcceptance = fs.readFileSync(
+  path.join(root, 'scripts', 'acceptance', 'linux-training.mjs'),
+  'utf8'
+);
+for (const role of ['linux-training', 'mac-signing', 'codex-plugin']) {
+  assert.match(
+    acceptanceWorkflow,
+    new RegExp(`machine-preflight\\.mjs ${role}`),
+    `${role} machine preflight is not required by acceptance`
+  );
+}
+assert.match(acceptanceWorkflow, /PyYAML==6\.0\.2/);
+assert.match(linuxAcceptance, /runnerServiceStopped = true/);
+assert.match(
+  linuxAcceptance,
+  /if \(runnerInstalled && runnerServiceStopped\)[\s\S]*?'start',[\s\S]*?'runbeacon-runner\.service'/,
+  'Linux acceptance must recover a service that it stopped before failing'
+);
+
+const operatorGuide = fs.readFileSync(
+  path.join(root, 'docs', 'SELF_HOSTED_ACCEPTANCE.md'),
+  'utf8'
+);
+for (const label of [
+  'runbeacon-training',
+  'runbeacon-signing',
+  'runbeacon-codex',
+]) {
+  assert.match(operatorGuide, new RegExp(label));
+}
 
 try {
   for (const [kind, checks] of Object.entries(requirements)) {

@@ -21,6 +21,7 @@ const requirements = {
   'linux-training': [
     'runnerExactlyOnce',
     'runnerRestartRecovery',
+    'systemdUserService',
     'daemonRecovery',
     'sameWaitDaemonCrashRecovery',
     'durableCoordinatorRecovery',

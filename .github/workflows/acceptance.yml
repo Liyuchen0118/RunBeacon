@@ -50,6 +50,8 @@ jobs:
         with:
           go-version: stable
           cache: false
+      - name: Verify dedicated Linux acceptance machine
+        run: node scripts/acceptance/machine-preflight.mjs linux-training
       - run: npm ci
       - run: npm run build
       - run: npm run test:lifecycle:daemon
@@ -85,6 +87,11 @@ jobs:
         with:
           go-version: stable
           cache: false
+      - name: Verify dedicated macOS acceptance machine
+        run: node scripts/acceptance/machine-preflight.mjs mac-signing
+        env:
+          RUNBEACON_APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          RUNBEACON_NOTARY_PROFILE: ${{ vars.APPLE_NOTARY_PROFILE }}
       - name: Verify Developer ID and Notary through the Aqua LaunchAgent Runner
         run: node scripts/acceptance/mac-signing.mjs
         env:
@@ -117,6 +124,8 @@ jobs:
           python-version: '3.12'
       - name: Install plugin validation dependency
         run: python -m pip install --disable-pip-version-check PyYAML==6.0.2
+      - name: Verify dedicated Windows acceptance machine
+        run: node scripts/acceptance/machine-preflight.mjs codex-plugin
       - run: npm ci
       - run: npm run build
       - name: Reinstall marketplace plugin and execute a fresh Codex task

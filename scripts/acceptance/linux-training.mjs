@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { writeAcceptanceReport } from './report.mjs';
@@ -18,9 +18,8 @@ const root = path.resolve(
 const temporary = fs.mkdtempSync(
   path.join(os.tmpdir(), 'runbeacon-linux-acceptance-')
 );
-const binary = path.join(temporary, 'runbeacon-runner');
-const stateDir = path.join(temporary, 'state');
-const socket = path.join(temporary, 'runner.sock');
+const buildBinary = path.join(temporary, 'runbeacon-runner');
+const binary = path.join(os.homedir(), '.local', 'bin', 'runbeacon-runner');
 const marker = path.join(temporary, 'execution-count');
 const output =
   process.env.RUNBEACON_ACCEPTANCE_OUTPUT ||
@@ -32,7 +31,8 @@ const daemonEvidencePath = requiredPath(
   process.env.RUNBEACON_DAEMON_EVIDENCE,
   'RUNBEACON_DAEMON_EVIDENCE'
 );
-let server;
+let runnerInstalled = false;
+let runnerServiceStopped = false;
 
 function requiredPath(value, name) {
   assert.ok(value?.trim(), `${name} is required`);
@@ -56,7 +56,7 @@ function run(command, args, options = {}) {
 
 function rpc(method, params = {}) {
   const request = JSON.stringify({ protocolVersion: 1, method, params });
-  const result = run(binary, ['rpc', '--socket', socket], {
+  const result = run(binary, ['rpc'], {
     input: `${request}\n`,
   });
   const response = JSON.parse(result.stdout);
@@ -68,33 +68,8 @@ function rpc(method, params = {}) {
   return response.result;
 }
 
-async function waitForSocket() {
-  const deadline = Date.now() + 10_000;
-  while (!fs.existsSync(socket)) {
-    assert.ok(Date.now() < deadline, 'Runner socket did not become ready');
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-}
-
-async function startServer() {
-  server = spawn(
-    binary,
-    ['serve', '--state-dir', stateDir, '--socket', socket],
-    {
-      detached: false,
-      stdio: 'ignore',
-    }
-  );
-  await waitForSocket();
-}
-
-async function stopServer() {
-  if (!server) return;
-  const current = server;
-  server = undefined;
-  const exited = new Promise((resolve) => current.once('exit', resolve));
-  current.kill('SIGTERM');
-  await exited;
+function systemctl(...args) {
+  return run('systemctl', ['--user', ...args]);
 }
 
 function submitParams(jobId, idempotencyKey, command) {
@@ -118,10 +93,30 @@ function shellQuote(value) {
 }
 
 try {
-  run('go', ['build', '-trimpath', '-o', binary, './cmd/runbeacon-runner'], {
-    cwd: path.join(root, 'runner'),
-  });
-  await startServer();
+  run(
+    'go',
+    ['build', '-trimpath', '-o', buildBinary, './cmd/runbeacon-runner'],
+    {
+      cwd: path.join(root, 'runner'),
+    }
+  );
+  run(buildBinary, ['install']);
+  runnerInstalled = true;
+  systemctl('is-active', '--quiet', 'runbeacon-runner.service');
+  assert.equal(
+    systemctl(
+      'show',
+      '-p',
+      'KillMode',
+      '--value',
+      'runbeacon-runner.service'
+    ).stdout.trim(),
+    'process',
+    'systemd must leave independent supervisors alive when the Runner restarts'
+  );
+  const ping = rpc('ping');
+  assert.equal(ping.protocolVersion, 1);
+  assert.equal(ping.version, '3.0.0');
   const stepSeconds = Math.ceil(disconnectMs / 10_000) + 1;
   const trainingCommand = [
     'set -eu',
@@ -143,9 +138,32 @@ try {
   );
   const submitted = rpc('submit', params);
   assert.equal(submitted.created, true);
-  await stopServer();
+  const trainingRunningDeadline = Date.now() + 10_000;
+  while (rpc('get', { jobId }).job.processGroupId <= 0) {
+    assert.ok(
+      Date.now() < trainingRunningDeadline,
+      'training supervisor did not enter the running state'
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  systemctl('stop', 'runbeacon-runner.service');
+  runnerServiceStopped = true;
+  const inactive = systemctl(
+    'show',
+    '-p',
+    'ActiveState',
+    '--value',
+    'runbeacon-runner.service'
+  );
+  assert.match(
+    inactive.stdout.trim(),
+    /^(inactive|failed)$/,
+    'Runner service must remain unavailable during the disconnect window'
+  );
   await new Promise((resolve) => setTimeout(resolve, disconnectMs));
-  await startServer();
+  systemctl('start', 'runbeacon-runner.service');
+  systemctl('is-active', '--quiet', 'runbeacon-runner.service');
+  runnerServiceStopped = false;
   const duplicate = rpc('submit', params);
   assert.equal(duplicate.created, false);
   assert.equal(duplicate.job.id, jobId);
@@ -276,6 +294,7 @@ try {
     checks: {
       runnerExactlyOnce: true,
       runnerRestartRecovery: true,
+      systemdUserService: true,
       daemonRecovery: true,
       sameWaitDaemonCrashRecovery: true,
       durableCoordinatorRecovery: true,
@@ -288,10 +307,15 @@ try {
       eventCount: events.length,
       reconnectFromSequence: 0,
       coordinatorJobId: coordinatorJob.id,
+      runnerService: 'runbeacon-runner.service',
+      runnerVersion: ping.version,
     },
   });
+  systemctl('is-active', '--quiet', 'runbeacon-runner.service');
   process.stdout.write(`${JSON.stringify(report)}\n`);
 } finally {
-  await stopServer();
+  if (runnerInstalled && runnerServiceStopped) {
+    spawnSync('systemctl', ['--user', 'start', 'runbeacon-runner.service']);
+  }
   fs.rmSync(temporary, { recursive: true, force: true });
 }
