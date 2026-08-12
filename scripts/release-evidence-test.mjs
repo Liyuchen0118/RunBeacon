@@ -36,6 +36,20 @@ const requirements = {
   ],
 };
 
+const acceptanceWorkflow = fs.readFileSync(
+  path.join(root, '.github', 'workflows', 'acceptance.yml'),
+  'utf8'
+);
+assert.match(acceptanceWorkflow, /actions\/setup-python@v5/);
+assert.match(acceptanceWorkflow, /PyYAML==6\.0\.2/);
+
+const codexPluginAcceptance = fs.readFileSync(
+  path.join(root, 'scripts', 'acceptance', 'codex-plugin.mjs'),
+  'utf8'
+);
+assert.match(codexPluginAcceptance, /buildCodexAcceptanceArgs\(prompt\)/);
+assert.doesNotMatch(codexPluginAcceptance, /'--sandbox'/);
+
 try {
   for (const [kind, checks] of Object.entries(requirements)) {
     fs.writeFileSync(

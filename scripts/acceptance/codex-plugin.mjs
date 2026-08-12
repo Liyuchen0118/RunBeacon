@@ -13,6 +13,7 @@ import {
   swapPluginSource as swapPluginDirectories,
 } from './codex-plugin-files.mjs';
 import {
+  buildCodexAcceptanceArgs,
   parseCodexPluginInstallResult,
   prepareCodexCommand,
 } from './codex-command.mjs';
@@ -198,15 +199,7 @@ try {
   );
   const task = run(
     codexInvocation.command,
-    [
-      'exec',
-      '--json',
-      '--approve-for-me',
-      '--skip-git-repo-check',
-      '--sandbox',
-      'workspace-write',
-      prompt,
-    ],
+    buildCodexAcceptanceArgs(prompt),
     {
       cwd: pluginTarget,
       env: {
@@ -236,9 +229,13 @@ try {
   if (sourceSwapped) fs.rmSync(backup, { recursive: true, force: true });
   process.stdout.write(`${JSON.stringify(report)}\n`);
 } catch (error) {
-  let rollbackError;
+  const rollbackErrors = [];
   if (sourceSwapped) {
-    restorePluginSource(pluginTarget, backup, pluginSourceExisted);
+    try {
+      restorePluginSource(pluginTarget, backup, pluginSourceExisted);
+    } catch (cause) {
+      rollbackErrors.push(cause);
+    }
   }
   if (stagePrepared) {
     fs.rmSync(staging, { recursive: true, force: true });
@@ -264,12 +261,12 @@ try {
         ]);
       }
     } catch (cause) {
-      rollbackError = cause;
+      rollbackErrors.push(cause);
     }
   }
-  if (rollbackError) {
+  if (rollbackErrors.length > 0) {
     throw new AggregateError(
-      [error, rollbackError],
+      [error, ...rollbackErrors],
       'Codex plugin acceptance failed and the installed plugin rollback also failed'
     );
   }

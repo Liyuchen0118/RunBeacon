@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  buildCodexAcceptanceArgs,
   isCodexPluginInstalled,
   isWindowsStoreCodexBinary,
   parseCodexPluginInstallResult,
@@ -10,10 +11,21 @@ import {
   WINDOWS_CODEX_COMPANIONS,
 } from './acceptance/codex-command.mjs';
 import {
+  renameDirectoryWithRetry,
   restorePluginSource,
   stagePluginSource,
   swapPluginSource,
 } from './acceptance/codex-plugin-files.mjs';
+
+const acceptanceArgs = buildCodexAcceptanceArgs('acceptance prompt');
+assert.deepEqual(acceptanceArgs, [
+  'exec',
+  '--json',
+  '--approve-for-me',
+  '--skip-git-repo-check',
+  'acceptance prompt',
+]);
+assert.equal(acceptanceArgs.includes('--sandbox'), false);
 
 const pluginList = `Marketplace \`personal\`
 C:\\Users\\example\\.agents\\plugins\\marketplace.json
@@ -186,6 +198,80 @@ try {
   restorePluginSource(pluginTarget, pluginBackup, targetExisted);
   assert.equal(
     fs.readFileSync(path.join(pluginTarget, 'version'), 'utf8'),
+    'old'
+  );
+
+  const retrySource = path.join(fixtureRoot, 'retry-source');
+  const retryTarget = path.join(fixtureRoot, 'retry-target');
+  fs.mkdirSync(retrySource);
+  let renameAttempts = 0;
+  renameDirectoryWithRetry(retrySource, retryTarget, {
+    attempts: 3,
+    delayMs: 0,
+    sleep() {},
+    rename(source, target) {
+      renameAttempts += 1;
+      if (renameAttempts < 3) {
+        const error = new Error('directory is temporarily locked');
+        error.code = 'EPERM';
+        throw error;
+      }
+      fs.renameSync(source, target);
+    },
+  });
+  assert.equal(renameAttempts, 3);
+  assert.equal(fs.existsSync(retryTarget), true);
+
+  let permanentAttempts = 0;
+  assert.throws(
+    () =>
+      renameDirectoryWithRetry('missing', 'target', {
+        attempts: 10,
+        delayMs: 0,
+        sleep() {},
+        rename() {
+          permanentAttempts += 1;
+          const error = new Error('source is missing');
+          error.code = 'ENOENT';
+          throw error;
+        },
+      }),
+    /source is missing/
+  );
+  assert.equal(permanentAttempts, 1);
+
+  const atomicTarget = path.join(fixtureRoot, 'atomic-target');
+  const atomicBackup = path.join(fixtureRoot, 'atomic-backup');
+  fs.mkdirSync(atomicTarget);
+  fs.mkdirSync(atomicBackup);
+  fs.writeFileSync(path.join(atomicTarget, 'version'), 'new');
+  fs.writeFileSync(path.join(atomicBackup, 'version'), 'old');
+  let atomicRenameAttempts = 0;
+  assert.throws(
+    () =>
+      restorePluginSource(atomicTarget, atomicBackup, true, {
+        attempts: 1,
+        delayMs: 0,
+        sleep() {},
+        rename(source, target) {
+          atomicRenameAttempts += 1;
+          if (source === atomicBackup) {
+            const error = new Error('backup remains temporarily unavailable');
+            error.code = 'ENOENT';
+            throw error;
+          }
+          fs.renameSync(source, target);
+        },
+      }),
+    /backup remains temporarily unavailable/
+  );
+  assert.equal(atomicRenameAttempts, 3);
+  assert.equal(
+    fs.readFileSync(path.join(atomicTarget, 'version'), 'utf8'),
+    'new'
+  );
+  assert.equal(
+    fs.readFileSync(path.join(atomicBackup, 'version'), 'utf8'),
     'old'
   );
 

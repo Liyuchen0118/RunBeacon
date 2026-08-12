@@ -9,6 +9,16 @@ export const WINDOWS_CODEX_COMPANIONS = [
   'codex-windows-sandbox-setup.exe',
 ];
 
+export function buildCodexAcceptanceArgs(prompt) {
+  return [
+    'exec',
+    '--json',
+    '--approve-for-me',
+    '--skip-git-repo-check',
+    prompt,
+  ];
+}
+
 export function isCodexPluginInstalled(output, selector) {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`^${escaped}\\s+installed(?:,\\s*enabled)?\\s`, 'm').test(
