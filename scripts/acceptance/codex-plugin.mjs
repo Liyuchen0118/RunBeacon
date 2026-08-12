@@ -189,6 +189,7 @@ try {
   const prompt = [
     'Use RunBeacon job_start to run this as a local tracked command:',
     'node -e "console.log(\'RUNBEACON_CODEX_ACCEPTANCE\')"',
+    'Call job_start exactly once. If that call is rejected or fails before returning a jobId, stop and report the failure without retrying.',
     'Immediately call job_wait exactly once. Do not call job_snapshot or job_list.',
     'Return the final job state.',
   ].join('\n');
