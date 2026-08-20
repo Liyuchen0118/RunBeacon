@@ -55,12 +55,12 @@ try {
   const results = await Promise.all(
     Array.from({ length: 64 }, () => runChild(source))
   );
+  for (const token of results) assert.match(token, /^[0-9a-f]{64}$/);
   assert.equal(
     new Set(results).size,
     1,
     'daemon callers observed different tokens'
   );
-  assert.match(results[0], /^[0-9a-f]{64}$/);
   const profiles = JSON.parse(
     fs.readFileSync(path.join(dataDir, 'credential-profiles.json'), 'utf8')
   );
@@ -90,7 +90,6 @@ function runChild(source) {
       ['--input-type=module', '--eval', source],
       {
         cwd: root,
-        encoding: 'utf8',
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       }
@@ -106,7 +105,7 @@ function runChild(source) {
       stderr += chunk;
     });
     child.once('error', reject);
-    child.once('exit', (code) => {
+    child.once('close', (code) => {
       if (code === 0) resolve(stdout.trim());
       else reject(new Error(`security-state child exited ${code}: ${stderr}`));
     });
