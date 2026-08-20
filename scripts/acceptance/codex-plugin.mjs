@@ -8,7 +8,13 @@ import { fileURLToPath } from 'node:url';
 import { writeAcceptanceReport } from './report.mjs';
 import { assertRunBeaconCodexAcceptance } from './codex-exec-json.mjs';
 import {
-  isCodexPluginInstalled,
+  restorePluginSource,
+  stagePluginSource,
+  swapPluginSource as swapPluginDirectories,
+} from './codex-plugin-files.mjs';
+import {
+  buildCodexAcceptanceArgs,
+  parseCodexPluginInstallResult,
   prepareCodexCommand,
 } from './codex-command.mjs';
 
@@ -45,14 +51,15 @@ const python =
 const output =
   process.env.RUNBEACON_ACCEPTANCE_OUTPUT ||
   path.join(root, 'acceptance-results', 'codex-plugin.json');
+const staging = `${pluginTarget}.acceptance-stage-${process.pid}`;
 const backup = `${pluginTarget}.acceptance-backup-${process.pid}`;
 const pluginSourceExisted = fs.existsSync(pluginTarget);
-let staged = false;
+let stagePrepared = false;
+let sourceSwapped = false;
 let codexInvocation;
 let marketplaceName;
 let pluginSelector;
-let installationChanged = false;
-let pluginWasInstalled = false;
+let installationAttempted = false;
 let acceptanceData;
 
 function run(command, args, options = {}) {
@@ -108,33 +115,49 @@ function stagePlugin() {
     ),
     'personal marketplace must already contain the local remote-job-monitor entry'
   );
-  if (path.resolve(root) === path.resolve(pluginTarget)) return;
   fs.mkdirSync(path.dirname(pluginTarget), { recursive: true });
   fs.rmSync(backup, { recursive: true, force: true });
-  if (fs.existsSync(pluginTarget)) fs.renameSync(pluginTarget, backup);
   try {
-    fs.cpSync(root, pluginTarget, {
-      recursive: true,
-      filter: (source) => {
-        const relative = path.relative(root, source);
-        return !relative
-          .split(path.sep)
-          .some((part) =>
-            [
-              '.git',
-              'node_modules',
-              'acceptance-results',
-              'runner-assets',
-            ].includes(part)
-          );
-      },
-    });
-    staged = true;
+    stagePluginSource(root, staging);
+    stagePrepared = true;
   } catch (error) {
-    fs.rmSync(pluginTarget, { recursive: true, force: true });
-    if (fs.existsSync(backup)) fs.renameSync(backup, pluginTarget);
+    fs.rmSync(staging, { recursive: true, force: true });
     throw error;
   }
+}
+
+function swapPluginSource() {
+  try {
+    swapPluginDirectories(staging, pluginTarget, backup);
+    stagePrepared = false;
+    sourceSwapped = true;
+  } catch (error) {
+    throw error;
+  }
+}
+
+function installPlugin() {
+  installationAttempted = true;
+  const installed = parseCodexPluginInstallResult(
+    run(codexInvocation.command, ['plugin', 'add', pluginSelector, '--json'])
+      .stdout,
+    pluginSelector
+  );
+  const installedManifest = JSON.parse(
+    fs.readFileSync(
+      path.join(installed.installedPath, '.codex-plugin', 'plugin.json'),
+      'utf8'
+    )
+  );
+  const sourceManifest = JSON.parse(
+    fs.readFileSync(
+      path.join(pluginTarget, '.codex-plugin', 'plugin.json'),
+      'utf8'
+    )
+  );
+  assert.equal(installed.version, sourceManifest.version);
+  assert.equal(installedManifest.version, sourceManifest.version);
+  return installed;
 }
 
 try {
@@ -146,31 +169,28 @@ try {
   ]).stdout.trim();
   assert.match(marketplaceName, /^[A-Za-z0-9._-]+$/);
   pluginSelector = `remote-job-monitor@${marketplaceName}`;
-  pluginWasInstalled = isCodexPluginInstalled(
-    run(codexInvocation.command, ['plugin', 'list']).stdout,
-    pluginSelector
-  );
   stagePlugin();
   run(python, [
     path.join(pluginCreator, 'scripts', 'update_plugin_cachebuster.py'),
-    pluginTarget,
+    staging,
   ]);
   runNpm(['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'], {
-    cwd: pluginTarget,
+    cwd: staging,
   });
   run(python, [
     path.join(pluginCreator, 'scripts', 'validate_plugin.py'),
-    pluginTarget,
+    staging,
   ]);
   run(python, [
     path.join(skillCreator, 'scripts', 'quick_validate.py'),
-    path.join(pluginTarget, 'skills', 'monitor-remote-jobs'),
+    path.join(staging, 'skills', 'monitor-remote-jobs'),
   ]);
-  installationChanged = true;
-  run(codexInvocation.command, ['plugin', 'add', pluginSelector]);
+  swapPluginSource();
+  const installed = installPlugin();
   const prompt = [
     'Use RunBeacon job_start to run this as a local tracked command:',
     'node -e "console.log(\'RUNBEACON_CODEX_ACCEPTANCE\')"',
+    'Call job_start exactly once. If that call is rejected or fails before returning a jobId, stop and report the failure without retrying.',
     'Immediately call job_wait exactly once. Do not call job_snapshot or job_list.',
     'Return the final job state.',
   ].join('\n');
@@ -179,15 +199,7 @@ try {
   );
   const task = run(
     codexInvocation.command,
-    [
-      'exec',
-      '--json',
-      '--approve-for-me',
-      '--skip-git-repo-check',
-      '--sandbox',
-      'workspace-write',
-      prompt,
-    ],
+    buildCodexAcceptanceArgs(prompt),
     {
       cwd: pluginTarget,
       env: {
@@ -209,42 +221,60 @@ try {
       freshCodexTask: true,
       jobStartWait: true,
     },
-    details: { marketplaceName },
+    details: {
+      marketplaceName,
+      installedVersion: installed.version,
+    },
   });
-  if (staged) fs.rmSync(backup, { recursive: true, force: true });
+  if (sourceSwapped) fs.rmSync(backup, { recursive: true, force: true });
   process.stdout.write(`${JSON.stringify(report)}\n`);
 } catch (error) {
-  let rollbackError;
-  if (staged) {
-    fs.rmSync(pluginTarget, { recursive: true, force: true });
-    if (pluginSourceExisted && fs.existsSync(backup)) {
-      fs.renameSync(backup, pluginTarget);
+  const rollbackErrors = [];
+  if (sourceSwapped) {
+    try {
+      restorePluginSource(pluginTarget, backup, pluginSourceExisted);
+    } catch (cause) {
+      rollbackErrors.push(cause);
     }
   }
-  if (installationChanged && codexInvocation && pluginSelector) {
+  if (stagePrepared) {
+    fs.rmSync(staging, { recursive: true, force: true });
+  }
+  if (installationAttempted && codexInvocation && pluginSelector) {
     try {
-      const currentlyInstalled = isCodexPluginInstalled(
-        run(codexInvocation.command, ['plugin', 'list']).stdout,
-        pluginSelector
-      );
-      if (currentlyInstalled) {
-        run(codexInvocation.command, ['plugin', 'remove', pluginSelector]);
-      }
-      if (pluginWasInstalled) {
-        run(codexInvocation.command, ['plugin', 'add', pluginSelector]);
+      if (pluginSourceExisted) {
+        parseCodexPluginInstallResult(
+          run(codexInvocation.command, [
+            'plugin',
+            'add',
+            pluginSelector,
+            '--json',
+          ]).stdout,
+          pluginSelector
+        );
+      } else {
+        run(codexInvocation.command, [
+          'plugin',
+          'remove',
+          pluginSelector,
+          '--json',
+        ]);
       }
     } catch (cause) {
-      rollbackError = cause;
+      rollbackErrors.push(cause);
     }
   }
-  if (rollbackError) {
+  if (rollbackErrors.length > 0) {
     throw new AggregateError(
-      [error, rollbackError],
+      [error, ...rollbackErrors],
       'Codex plugin acceptance failed and the installed plugin rollback also failed'
     );
   }
   throw error;
 } finally {
+  if (stagePrepared) {
+    fs.rmSync(staging, { recursive: true, force: true });
+  }
   if (acceptanceData) {
     fs.rmSync(acceptanceData, { recursive: true, force: true });
   }
