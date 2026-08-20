@@ -34,7 +34,15 @@ assert.ok(process.env.RUNNER_NAME?.trim(), 'RUNNER_NAME is required');
 const commands = ['git', 'node'];
 if (role === 'linux-training') commands.push('go', 'systemctl');
 if (role === 'mac-signing') {
-  commands.push('go', 'launchctl', 'security', 'codesign', 'xcrun');
+  commands.push(
+    'go',
+    'launchctl',
+    'security',
+    'codesign',
+    'xcrun',
+    'ditto',
+    'plutil'
+  );
 }
 if (role === 'codex-plugin') commands.push('python', 'codex');
 for (const command of commands) commandPath(command);

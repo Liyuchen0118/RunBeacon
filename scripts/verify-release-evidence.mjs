@@ -34,6 +34,7 @@ const requirements = {
     'developerIdUntimestamped',
     'developerIdTimestamped',
     'notaryProfile',
+    'temporaryNotaryAccepted',
     'keychainSecretStayedLocal',
   ],
   'codex-plugin': [
@@ -48,9 +49,19 @@ const requirements = {
 for (const [kind, checks] of Object.entries(requirements)) {
   const file = path.join(evidenceDir, `${kind}.json`);
   const report = JSON.parse(fs.readFileSync(file, 'utf8'));
-  assert.equal(report.schemaVersion, 1, `${kind}: unsupported schema`);
+  assert.equal(report.schemaVersion, 2, `${kind}: unsupported schema`);
   assert.equal(report.kind, kind, `${kind}: wrong report kind`);
   assert.equal(report.passed, true, `${kind}: report did not pass`);
+  assert.equal(
+    report.acceptanceMode,
+    'beta',
+    `${kind}: rehearsal evidence is not Stable-eligible`
+  );
+  assert.equal(
+    report.stableEligible,
+    true,
+    `${kind}: evidence is not Stable-eligible`
+  );
   assert.equal(
     report.commitSha,
     commitSha,

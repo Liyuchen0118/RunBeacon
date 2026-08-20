@@ -1,9 +1,9 @@
-# Self-hosted Stable Acceptance
+# Self-hosted Acceptance
 
-RunBeacon Stable promotion requires three dedicated GitHub Actions runners. The
-workflow fails closed when a machine, login session, toolchain, release
-environment, or commit binding is missing. Do not reuse these labels on general
-purpose runners.
+RunBeacon uses the same three dedicated GitHub Actions runners for pre-release
+rehearsals and post-Beta Stable evidence. The workflow fails closed when a
+machine, login session, toolchain, release environment, or commit binding is
+missing. Do not reuse these labels on general purpose runners.
 
 ## Required runners
 
@@ -60,6 +60,9 @@ APPLE_NOTARY_PROFILE=meetflow-notary
 The workflow passes only when `launchctl print gui/$UID` succeeds and the
 LaunchAgent Runner completes untimestamped signing, timestamped signing, and a
 Notary history query without receiving a Keychain password or `.p8` content.
+It then signs a temporary copy of the Runner, submits a temporary ZIP with
+`notarytool --wait`, and requires the returned status to be `Accepted`. The ZIP
+is deleted at the end of the task and is never published as a release asset.
 
 ## Windows Codex machine
 
@@ -74,10 +77,29 @@ Otherwise run it interactively for acceptance. The test uses an isolated
 `PLUGIN_DATA` directory and restores the previous plugin source/cache after a
 failure.
 
+## Rehearsal and Beta modes
+
+`workflow_dispatch` defaults to `mode: rehearsal`. Rehearsal requires the exact
+`main` commit but does not require or create a tag, Release, npm publication, or
+promotion. Its schema v2 reports always contain:
+
+```json
+{
+  "acceptanceMode": "rehearsal",
+  "stableEligible": false
+}
+```
+
+Use rehearsal while preparing 3.0. A future `mode: beta` run additionally
+requires `beta_tag` to name a public prerelease whose tag resolves to the exact
+workflow SHA. Beta reports may set `stableEligible: true` only when every
+machine check passes. The Stable verifier rejects rehearsal reports even when
+all their checks passed.
+
 ## Preflight and promotion
 
-Before publishing Beta, all three runners must be online and idle in GitHub's
-runner settings. Do not dispatch Stable Acceptance until the public Beta tag
+Before dispatching either mode, all three runners must be online and idle in
+GitHub's runner settings. Do not dispatch beta mode until the public Beta tag
 exists on the exact `main` commit. The workflow itself runs:
 
 ```text

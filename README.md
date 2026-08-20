@@ -124,8 +124,8 @@ Use `RUNBEACON_*` variables. 3.x accepts corresponding `RJM_*` aliases with a de
 See [Migration to 3.0](docs/MIGRATION_3.0.md) and [Security migration 2.0](docs/SECURITY_MIGRATION_2.0.md).
 
 Stable release operators must configure the three dedicated GitHub runners in
-[Self-hosted Stable Acceptance](docs/SELF_HOSTED_ACCEPTANCE.md) before
-dispatching the Beta or Stable acceptance workflows.
+[Self-hosted Acceptance](docs/SELF_HOSTED_ACCEPTANCE.md) before dispatching a
+three-machine rehearsal or post-Beta acceptance workflow.
 
 ## Development
 

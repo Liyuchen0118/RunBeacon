@@ -22,10 +22,20 @@ export function writeAcceptanceReport({
       'utf8'
     )
   );
+  const acceptanceMode =
+    process.env.RUNBEACON_ACCEPTANCE_MODE?.trim() || 'rehearsal';
+  if (!['rehearsal', 'beta'].includes(acceptanceMode)) {
+    throw new Error(
+      `RUNBEACON_ACCEPTANCE_MODE must be rehearsal or beta, received ${acceptanceMode}`
+    );
+  }
+  const passed = Object.values(checks).every((value) => value === true);
   const report = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind,
-    passed: Object.values(checks).every((value) => value === true),
+    acceptanceMode,
+    stableEligible: acceptanceMode === 'beta' && passed,
+    passed,
     commitSha: requiredEnvironment('GITHUB_SHA'),
     coreVersion: core.version,
     runnerVersion: core.version,

@@ -1,16 +1,27 @@
-name: RunBeacon Stable Acceptance
+name: RunBeacon Three-machine Acceptance
 
 on:
   workflow_dispatch:
     inputs:
-      beta_tag:
-        description: Public beta tag under acceptance
+      mode:
+        description: Acceptance mode; rehearsal never produces Stable-eligible evidence
         required: true
+        default: rehearsal
+        type: choice
+        options:
+          - rehearsal
+          - beta
+      beta_tag:
+        description: Public prerelease tag; required only in beta mode
+        required: false
         type: string
 
 concurrency:
-  group: stable-acceptance-${{ inputs.beta_tag }}
+  group: acceptance-${{ inputs.mode }}-${{ inputs.beta_tag || github.sha }}
   cancel-in-progress: false
+
+env:
+  RUNBEACON_ACCEPTANCE_MODE: ${{ inputs.mode }}
 
 permissions:
   contents: read
@@ -25,14 +36,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Require main and an existing prerelease
+      - name: Bind mode and commit
         env:
           GH_TOKEN: ${{ github.token }}
+          ACCEPTANCE_MODE: ${{ inputs.mode }}
           BETA_TAG: ${{ inputs.beta_tag }}
         run: |
           test "$GITHUB_REF" = refs/heads/main
-          gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$BETA_TAG" --jq 'select(.prerelease == true) | .tag_name' | grep -Fx "$BETA_TAG"
-          test "$(git rev-list -n 1 "$BETA_TAG")" = "$GITHUB_SHA"
+          case "$ACCEPTANCE_MODE" in
+            rehearsal)
+              ;;
+            beta)
+              test -n "$BETA_TAG"
+              gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$BETA_TAG" --jq 'select(.prerelease == true) | .tag_name' | grep -Fx "$BETA_TAG"
+              test "$(git rev-list -n 1 "$BETA_TAG")" = "$GITHUB_SHA"
+              ;;
+            *)
+              echo "Unsupported acceptance mode: $ACCEPTANCE_MODE" >&2
+              exit 2
+              ;;
+          esac
 
   linux-training:
     name: Linux durable training machine
@@ -76,7 +99,7 @@ jobs:
     name: macOS LaunchAgent signing and Notary
     needs: require-main
     runs-on: [self-hosted, macOS, runbeacon-signing]
-    timeout-minutes: 20
+    timeout-minutes: 30
     environment: apple-release
     steps:
       - uses: actions/checkout@v4
