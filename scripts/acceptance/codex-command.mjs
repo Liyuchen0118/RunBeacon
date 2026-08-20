@@ -9,11 +9,48 @@ export const WINDOWS_CODEX_COMPANIONS = [
   'codex-windows-sandbox-setup.exe',
 ];
 
+export function buildCodexAcceptanceArgs(prompt) {
+  return [
+    'exec',
+    '--json',
+    '--approve-for-me',
+    '--skip-git-repo-check',
+    prompt,
+  ];
+}
+
 export function isCodexPluginInstalled(output, selector) {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`^${escaped}\\s+installed(?:,\\s*enabled)?\\s`, 'm').test(
     output
   );
+}
+
+export function parseCodexPluginInstallResult(output, selector) {
+  let result;
+  try {
+    result = JSON.parse(output.trim());
+  } catch (error) {
+    throw new Error(`codex plugin add emitted invalid JSON: ${error.message}`);
+  }
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    throw new Error('codex plugin add did not return an object');
+  }
+  if (result.pluginId !== selector) {
+    throw new Error(
+      `codex plugin add returned ${String(result.pluginId)} instead of ${selector}`
+    );
+  }
+  if (typeof result.version !== 'string' || !result.version.trim()) {
+    throw new Error('codex plugin add did not return a version');
+  }
+  if (
+    typeof result.installedPath !== 'string' ||
+    !result.installedPath.trim()
+  ) {
+    throw new Error('codex plugin add did not return an installed path');
+  }
+  return result;
 }
 
 export function isWindowsStoreCodexBinary(command) {
