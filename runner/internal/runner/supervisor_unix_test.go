@@ -179,26 +179,31 @@ func TestSupervisorCancellationBeforeProcessStartExecutesNothing(t *testing.T) {
 func TestExternalCancellationRequiresAdapterAcknowledgement(t *testing.T) {
 	for _, fixture := range []struct {
 		name          string
-		command       string
+		trap          string
 		expectedState JobState
 		verified      bool
 	}{
 		{
 			name:          "acknowledged",
-			command:       "trap 'printf verified > \"$RUNBEACON_CANCELLATION_ACK_FILE\"; exit 130' TERM; while :; do sleep 1; done",
+			trap:          `'printf verified > "$RUNBEACON_CANCELLATION_ACK_FILE"; exit 130'`,
 			expectedState: StateCancelled,
 			verified:      true,
 		},
 		{
 			name:          "unacknowledged",
-			command:       "trap 'exit 70' TERM; while :; do sleep 1; done",
+			trap:          `'exit 70'`,
 			expectedState: StateFailed,
 			verified:      false,
 		},
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
 			store, _ := newTestStore(t)
-			params := submitFixture(fixture.command, "external-"+fixture.name, "job-external-"+fixture.name)
+			readyFile := filepath.Join(t.TempDir(), "adapter.ready")
+			command := fmt.Sprintf(
+				`trap %s TERM; printf ready > "$RUNBEACON_TEST_READY_FILE"; while :; do sleep 1; done`,
+				fixture.trap,
+			)
+			params := submitFixture(command, "external-"+fixture.name, "job-external-"+fixture.name)
 			params.CancellationMode = "external"
 			job, _, err := store.Create(params)
 			if err != nil {
@@ -208,7 +213,8 @@ func TestExternalCancellationRequiresAdapterAcknowledgement(t *testing.T) {
 			finished := make(chan error, 1)
 			go func() {
 				finished <- Supervise(jobDir, SupervisorSpec{
-					Command:          fixture.command,
+					Command:          command,
+					Env:              map[string]string{"RUNBEACON_TEST_READY_FILE": readyFile},
 					TimeoutMillis:    30_000,
 					CancellationMode: "external",
 				})
@@ -218,10 +224,12 @@ func TestExternalCancellationRequiresAdapterAcknowledgement(t *testing.T) {
 			for {
 				running, err = store.Get(job.ID)
 				if err == nil && running.ProcessGroupID > 0 {
-					break
+					if _, readyErr := os.Stat(readyFile); readyErr == nil {
+						break
+					}
 				}
 				if time.Now().After(deadline) {
-					t.Fatal("supervisor did not record its process group")
+					t.Fatal("external adapter did not become ready")
 				}
 				time.Sleep(10 * time.Millisecond)
 			}

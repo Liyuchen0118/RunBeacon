@@ -63,6 +63,8 @@ jobs:
           test "$(node -p "require('./package.json').version")" = "$VERSION"
           test "$(node -p "require('./packages/runner-installer/package.json').version")" = "$VERSION"
           test "$(node -p "require('./packages/codex-plugin/package.json').version")" = "$PLUGIN_VERSION"
+          manifest_version=$(node -p "require('./.codex-plugin/plugin.json').version")
+          case "$manifest_version" in "$PLUGIN_VERSION+codex."[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;; *) exit 1;; esac
       - name: Verify npm channel state
         env:
           CHANNEL: ${{ inputs.channel }}
@@ -206,6 +208,10 @@ jobs:
     if: inputs.channel == 'beta'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
