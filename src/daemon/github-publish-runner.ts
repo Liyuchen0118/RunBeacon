@@ -152,7 +152,7 @@ async function publish(input: RunnerOptions): Promise<void> {
       branch,
       sha,
       client,
-      deadlineAt: Date.now() + Math.min(30_000, input.discoveryTimeoutMs),
+      deadlineAt: Date.now() + input.discoveryTimeoutMs,
     });
     if (!eligibility.eligible) {
       const message =

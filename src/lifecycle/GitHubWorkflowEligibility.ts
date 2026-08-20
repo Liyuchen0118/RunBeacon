@@ -25,6 +25,8 @@ export interface WorkflowEligibilityInput {
   sha: string;
   client: GitHubApiClient;
   deadlineAt: number;
+  delay?: (milliseconds: number) => Promise<void>;
+  now?: () => number;
 }
 
 export interface WorkflowEligibility {
@@ -70,23 +72,8 @@ export async function determineWorkflowEligibility(
     };
   }
 
-  let pulls: PullRequest[];
-  try {
-    const url =
-      `https://api.github.com/repos/${encodeURIComponent(input.owner)}/` +
-      `${encodeURIComponent(input.repository)}/pulls?state=open&per_page=100`;
-    pulls = await input.client.getJson<PullRequest[]>(url, input.deadlineAt);
-  } catch (error) {
-    return {
-      eligible: true,
-      reason: 'uncertain',
-      workflowCount: workflows.length,
-      unavailableCode:
-        error instanceof GitHubApiError
-          ? error.code
-          : 'actions_monitoring_unavailable',
-    };
-  }
+  const pulls = await fetchPullRequestsUntilDeadline(input, workflows.length);
+  if (!Array.isArray(pulls)) return pulls;
 
   const matchingPulls = pulls.filter(
     (pull) => pull.head?.sha === input.sha || pull.head?.ref === input.branch
@@ -102,6 +89,61 @@ export async function determineWorkflowEligibility(
     eligible,
     reason: eligible ? 'pull-request' : 'no-workflows',
     workflowCount: workflows.length,
+  };
+}
+
+async function fetchPullRequestsUntilDeadline(
+  input: WorkflowEligibilityInput,
+  workflowCount: number
+): Promise<PullRequest[] | WorkflowEligibility> {
+  const now = input.now ?? Date.now;
+  const sleep =
+    input.delay ??
+    ((milliseconds: number) =>
+      new Promise<void>((resolvePromise) =>
+        setTimeout(resolvePromise, milliseconds)
+      ));
+  const url =
+    `https://api.github.com/repos/${encodeURIComponent(input.owner)}/` +
+    `${encodeURIComponent(input.repository)}/pulls?state=open&per_page=100`;
+  let lastError: GitHubApiError | undefined;
+
+  while (now() < input.deadlineAt) {
+    try {
+      return await input.client.getJson<PullRequest[]>(url, input.deadlineAt);
+    } catch (error) {
+      if (!(error instanceof GitHubApiError) || !error.retryable) {
+        return unavailableEligibility(error, workflowCount);
+      }
+      lastError = error;
+      const remainingMs = input.deadlineAt - now();
+      if (remainingMs <= 0) break;
+      await sleep(Math.min(1_000, remainingMs));
+    }
+  }
+
+  return unavailableEligibility(
+    lastError ?? new GitHubApiError('github_api_timeout', true),
+    workflowCount,
+    true
+  );
+}
+
+function unavailableEligibility(
+  error: unknown,
+  workflowCount: number,
+  deadlineExpired = false
+): WorkflowEligibility {
+  return {
+    eligible: true,
+    reason: 'uncertain',
+    workflowCount,
+    unavailableCode:
+      deadlineExpired && error instanceof GitHubApiError && error.retryable
+        ? 'github_api_timeout'
+        : error instanceof GitHubApiError
+          ? error.code
+          : 'actions_monitoring_unavailable',
   };
 }
 

@@ -45,6 +45,7 @@ export async function monitorGitHubActions(
     : Math.max(60_000, input.pollIntervalMs);
   const discoveryDeadline = now() + input.discoveryTimeoutMs;
   let runs: WorkflowRun[] = [];
+  let discoveryError: GitHubApiError | undefined;
 
   input.onProgress?.(
     65,
@@ -54,14 +55,17 @@ export async function monitorGitHubActions(
   while (now() < discoveryDeadline) {
     try {
       runs = await fetchWorkflowRuns(input, discoveryDeadline);
+      discoveryError = undefined;
     } catch (error) {
-      return {
-        kind: 'unavailable',
-        code:
-          error instanceof GitHubApiError
-            ? error.code
-            : 'actions_monitoring_unavailable',
-      };
+      if (!(error instanceof GitHubApiError) || !error.retryable) {
+        return unavailable(error);
+      }
+      discoveryError = error;
+      if (now() >= discoveryDeadline) break;
+      await sleep(
+        Math.min(pollIntervalMs, Math.max(1, discoveryDeadline - now()))
+      );
+      continue;
     }
     if (runs.length > 0) break;
     await sleep(
@@ -69,10 +73,13 @@ export async function monitorGitHubActions(
     );
   }
   if (runs.length === 0) {
-    return { kind: 'unavailable', code: 'actions_not_discovered' };
+    return discoveryError
+      ? { kind: 'unavailable', code: deadlineCode(discoveryError) }
+      : { kind: 'unavailable', code: 'actions_not_discovered' };
   }
 
   const deadline = now() + input.actionsTimeoutMs;
+  let reconnectingError: GitHubApiError | undefined;
   for (;;) {
     const summary = summarize(runs);
     if (runs.every((run) => run.status === 'completed')) {
@@ -81,25 +88,34 @@ export async function monitorGitHubActions(
       );
       return { kind: failed ? 'failed' : 'passed', summary };
     }
-    if (now() >= deadline) return { kind: 'timed-out', summary };
+    if (now() >= deadline) {
+      return reconnectingError
+        ? { kind: 'unavailable', code: deadlineCode(reconnectingError) }
+        : { kind: 'timed-out', summary };
+    }
 
     const elapsed = input.actionsTimeoutMs - (deadline - now());
     const percentage = Math.min(
       95,
       70 + Math.round((25 * elapsed) / input.actionsTimeoutMs)
     );
-    input.onProgress?.(percentage, 'actions', summary);
+    input.onProgress?.(
+      percentage,
+      reconnectingError ? 'actions-reconnecting' : 'actions',
+      reconnectingError
+        ? `Connection interrupted; retaining last workflow state: ${summary}`
+        : summary
+    );
     await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - now())));
     try {
-      runs = await fetchWorkflowRuns(input, deadline);
+      const refreshedRuns = await fetchWorkflowRuns(input, deadline);
+      if (refreshedRuns.length > 0) runs = refreshedRuns;
+      reconnectingError = undefined;
     } catch (error) {
-      return {
-        kind: 'unavailable',
-        code:
-          error instanceof GitHubApiError
-            ? error.code
-            : 'actions_monitoring_unavailable',
-      };
+      if (!(error instanceof GitHubApiError) || !error.retryable) {
+        return unavailable(error);
+      }
+      reconnectingError = error;
     }
   }
 }
@@ -131,6 +147,22 @@ async function fetchWorkflowRuns(
     deadlineAt
   );
   return (body.workflow_runs ?? []).filter((run) => run.head_sha === input.sha);
+}
+
+function unavailable(error: unknown): GitHubActionsOutcome {
+  return {
+    kind: 'unavailable',
+    code:
+      error instanceof GitHubApiError
+        ? error.code
+        : 'actions_monitoring_unavailable',
+  };
+}
+
+function deadlineCode(error: GitHubApiError): string {
+  return error.code === 'github_api_timeout'
+    ? error.code
+    : 'github_api_timeout';
 }
 
 function summarize(runs: WorkflowRun[]): string {

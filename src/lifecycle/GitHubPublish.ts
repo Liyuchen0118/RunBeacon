@@ -42,6 +42,13 @@ export function parseGitHubRepository(
 
 export function classifyGitPushFailure(output: string): GitPushFailureKind {
   if (
+    /could not resolve host|failed to connect|connection timed out|network is unreachable|connection (?:was )?reset|recv failure|send failure|unexpected disconnect|remote end hung up|early eof|schannel:.*(?:failed|error)|ssl\/tls connection failed|tls handshake/i.test(
+      output
+    )
+  ) {
+    return 'network';
+  }
+  if (
     /authentication failed|could not read username|terminal prompts disabled|credential|logon failed/i.test(
       output
     )
@@ -55,13 +62,6 @@ export function classifyGitPushFailure(output: string): GitPushFailureKind {
     /permission.*denied|not permitted|repository not found|403/i.test(output)
   ) {
     return 'permission';
-  }
-  if (
-    /could not resolve host|failed to connect|connection timed out|network is unreachable|connection (?:was )?reset|recv failure|send failure|unexpected disconnect|remote end hung up|early eof/i.test(
-      output
-    )
-  ) {
-    return 'network';
   }
   return 'unknown';
 }
