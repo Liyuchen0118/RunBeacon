@@ -36,6 +36,11 @@ describe('GitHub publishing helpers', () => {
     ['remote: Permission to acme/repo denied', 'permission'],
     ['fatal: unable to access: Could not resolve host', 'network'],
     ['fatal: unable to access: Recv failure: Connection was reset', 'network'],
+    ['fatal: unable to access: schannel: SSL/TLS connection failed', 'network'],
+    [
+      'fatal: unable to access: schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS',
+      'network',
+    ],
     [
       'send-pack: unexpected disconnect while reading sideband packet',
       'network',
