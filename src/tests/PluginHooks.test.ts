@@ -20,7 +20,7 @@ function runHook(
   const result = spawnSync(process.execPath, [hook], {
     input: JSON.stringify(event),
     encoding: 'utf8',
-    env: { ...process.env, PLUGIN_DATA: pluginData },
+    env: { ...process.env, RUNBEACON_DATA_DIR: pluginData },
   });
   expect(result.status).toBe(0);
   expect(result.stderr).toBe('');
@@ -34,7 +34,7 @@ function runHookAsync(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [hook], {
-      env: { ...process.env, PLUGIN_DATA: pluginData },
+      env: { ...process.env, RUNBEACON_DATA_DIR: pluginData },
       stdio: ['pipe', 'ignore', 'pipe'],
     });
     let stderr = '';

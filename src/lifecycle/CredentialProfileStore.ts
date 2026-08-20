@@ -1,11 +1,16 @@
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 
 interface CredentialProfileBase {
@@ -43,7 +48,7 @@ export type SaveCredentialProfileInput =
   | Omit<SshCredentialProfile, 'createdAt' | 'updatedAt'>
   | Omit<GitHubCredentialProfile, 'createdAt' | 'updatedAt'>;
 
-interface CredentialProfileDocument {
+export interface CredentialProfileDocument {
   version: 1;
   profiles: CredentialProfile[];
   defaults?: Partial<Record<CredentialProfile['kind'], string>>;
@@ -56,7 +61,7 @@ export class CredentialProfileStore {
   > = {};
 
   constructor(private readonly filePath: string) {
-    const document = this.load();
+    const document = readCredentialProfileDocument(this.filePath);
     for (const profile of document.profiles) {
       this.profiles.set(profile.id, profile);
     }
@@ -184,45 +189,71 @@ export class CredentialProfileStore {
     );
   }
 
-  private load(): CredentialProfileDocument {
-    if (!existsSync(this.filePath)) return { version: 1, profiles: [] };
-    try {
-      const document = JSON.parse(
-        readFileSync(this.filePath, 'utf8')
-      ) as CredentialProfileDocument;
-      if (document.version !== 1 || !Array.isArray(document.profiles))
-        return { version: 1, profiles: [] };
-      return {
-        version: 1,
-        profiles: document.profiles
-          .map(normalizeStoredProfile)
-          .filter((profile): profile is CredentialProfile => Boolean(profile)),
-        defaults:
-          document.defaults && typeof document.defaults === 'object'
-            ? document.defaults
-            : undefined,
-      };
-    } catch {
-      return { version: 1, profiles: [] };
-    }
-  }
-
   private persist(): void {
-    const directory = dirname(this.filePath);
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    const temporaryPath = `${this.filePath}.tmp`;
     const document: CredentialProfileDocument = {
       version: 1,
       profiles: this.list(),
       defaults: this.defaults(),
     };
+    writeCredentialProfileDocument(this.filePath, document);
+  }
+}
+
+export function readCredentialProfileDocument(
+  filePath: string
+): CredentialProfileDocument {
+  if (!existsSync(filePath)) return { version: 1, profiles: [] };
+  try {
+    return parseCredentialProfileDocument(readFileSync(filePath, 'utf8'));
+  } catch {
+    return { version: 1, profiles: [] };
+  }
+}
+
+export function parseCredentialProfileDocument(
+  serialized: string
+): CredentialProfileDocument {
+  const details = JSON.parse(serialized) as CredentialProfileDocument;
+  if (details.version !== 1 || !Array.isArray(details.profiles)) {
+    throw new Error('Unsupported RunBeacon credential profile document');
+  }
+  return {
+    version: 1,
+    profiles: details.profiles
+      .map(normalizeStoredProfile)
+      .filter((profile): profile is CredentialProfile => Boolean(profile)),
+    defaults:
+      details.defaults && typeof details.defaults === 'object'
+        ? details.defaults
+        : undefined,
+  };
+}
+
+export function writeCredentialProfileDocument(
+  filePath: string,
+  document: CredentialProfileDocument
+): void {
+  const directory = dirname(filePath);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (process.platform !== 'win32') chmodSync(directory, 0o700);
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
     writeFileSync(temporaryPath, JSON.stringify(document, null, 2), {
       encoding: 'utf8',
       mode: 0o600,
+      flag: 'wx',
     });
+    const descriptor = openSync(temporaryPath, 'r+');
+    try {
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
     if (process.platform !== 'win32') chmodSync(temporaryPath, 0o600);
-    renameSync(temporaryPath, this.filePath);
-    if (process.platform !== 'win32') chmodSync(this.filePath, 0o600);
+    renameSync(temporaryPath, filePath);
+    if (process.platform !== 'win32') chmodSync(filePath, 0o600);
+  } finally {
+    rmSync(temporaryPath, { force: true });
   }
 }
 

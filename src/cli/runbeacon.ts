@@ -7,8 +7,12 @@ import { fileURLToPath } from 'node:url';
 import { DaemonClient } from '../lifecycle/DaemonClient.js';
 import { isTerminalJobState, JobSnapshot } from '../lifecycle/types.js';
 import { safeErrorMessage } from '../lifecycle/security.js';
-import { resolveRunBeaconDataDir } from '../lifecycle/Environment.js';
+import {
+  resolveRunBeaconDataDir,
+  runBeaconCredentialMigrationSources,
+} from '../lifecycle/Environment.js';
 import { CredentialProfileStore } from '../lifecycle/CredentialProfileStore.js';
+import { migrateRunBeaconCredentialProfiles } from '../lifecycle/CredentialProfileMigration.js';
 import { createSshProfileResolver } from '../lifecycle/CredentialResolver.js';
 import {
   probeSshHostKeyAlgorithm,
@@ -16,6 +20,10 @@ import {
 } from '../lifecycle/RunnerTransport.js';
 
 const dataDir = resolveRunBeaconDataDir();
+migrateRunBeaconCredentialProfiles(
+  dataDir,
+  runBeaconCredentialMigrationSources()
+);
 const daemonEntry = fileURLToPath(
   new URL('../daemon/lifecycle-daemon.js', import.meta.url)
 );

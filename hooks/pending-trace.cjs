@@ -15,6 +15,7 @@ const {
   statSync,
   writeFileSync,
 } = require('node:fs');
+const { homedir } = require('node:os');
 const { join } = require('node:path');
 
 const TRACE_TTL_MS = 30 * 60 * 1000;
@@ -106,7 +107,7 @@ function clearPendingTracesForSession(event) {
 
 function traceLocation(event) {
   const dataRoot = String(
-    process.env.PLUGIN_DATA || process.env.CLAUDE_PLUGIN_DATA || ''
+    process.env.RUNBEACON_DATA_DIR || join(homedir(), '.runbeacon')
   ).trim();
   const sessionId = validHookId(event?.session_id);
   const turnId = validHookId(event?.turn_id);

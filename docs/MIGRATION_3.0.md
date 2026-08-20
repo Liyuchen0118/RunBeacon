@@ -20,18 +20,20 @@ Rename `RJM_*` variables to `RUNBEACON_*`. 3.x accepts old names and emits a dep
 
 Common mappings:
 
-| Old | New |
-| --- | --- |
-| `RJM_STATE_PATH` | `RUNBEACON_STATE_PATH` |
-| `RJM_MAX_CONCURRENT_JOBS` | `RUNBEACON_MAX_CONCURRENT_JOBS` |
-| `RJM_MAX_OUTPUT_BYTES` | `RUNBEACON_MAX_OUTPUT_BYTES` |
-| `RJM_PERSIST_OUTPUT` | `RUNBEACON_PERSIST_OUTPUT` |
-| `RJM_PERSIST_METADATA` | `RUNBEACON_PERSIST_METADATA` |
-| `RJM_SSH_HANDSHAKE_ATTEMPTS` | `RUNBEACON_SSH_HANDSHAKE_ATTEMPTS` |
+| Old                           | New                                 |
+| ----------------------------- | ----------------------------------- |
+| `RJM_STATE_PATH`              | `RUNBEACON_STATE_PATH`              |
+| `RJM_MAX_CONCURRENT_JOBS`     | `RUNBEACON_MAX_CONCURRENT_JOBS`     |
+| `RJM_MAX_OUTPUT_BYTES`        | `RUNBEACON_MAX_OUTPUT_BYTES`        |
+| `RJM_PERSIST_OUTPUT`          | `RUNBEACON_PERSIST_OUTPUT`          |
+| `RJM_PERSIST_METADATA`        | `RUNBEACON_PERSIST_METADATA`        |
+| `RJM_SSH_HANDSHAKE_ATTEMPTS`  | `RUNBEACON_SSH_HANDSHAKE_ATTEMPTS`  |
 | `RJM_SSH_RETRY_BASE_DELAY_MS` | `RUNBEACON_SSH_RETRY_BASE_DELAY_MS` |
-| `RJM_SSH_READY_TIMEOUT_MS` | `RUNBEACON_SSH_READY_TIMEOUT_MS` |
+| `RJM_SSH_READY_TIMEOUT_MS`    | `RUNBEACON_SSH_READY_TIMEOUT_MS`    |
 
-The default data directory moves from `~/.remote-job-monitor` to `~/.runbeacon`. RunBeacon attempts one atomic rename and falls back to the old directory if the rename is unavailable. Credential files contain references only; passwords, PATs, passphrases, and private key material are not copied.
+The default data directory is the stable `~/.runbeacon` path. `PLUGIN_DATA` and `CLAUDE_PLUGIN_DATA` no longer select runtime state, so a plugin cachebuster or reinstall cannot silently switch credential stores. At startup, RunBeacon merges missing safe credential references from those plugin-host paths and `~/.remote-job-monitor`; canonical profiles and per-kind defaults win every conflict. The merge uses an exclusive lock, owner-only backup, atomic canonical write, and a content-hash marker before retiring each source as `credential-profiles.json.migrated-v3.bak`.
+
+Credential files contain references only. Passwords and PATs remain in the OS credential manager, while passphrases and private-key contents are never migrated. Invalid source files remain untouched. Set `RUNBEACON_DATA_DIR` for an intentionally isolated deployment or test; an explicit override disables automatic imports from home and plugin-host directories.
 
 ## State migration
 

@@ -204,7 +204,7 @@ try {
       cwd: pluginTarget,
       env: {
         ...process.env,
-        PLUGIN_DATA: acceptanceData,
+        RUNBEACON_DATA_DIR: acceptanceData,
         RUNBEACON_INLINE_MANAGER: 'true',
       },
     }
