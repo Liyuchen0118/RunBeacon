@@ -60,7 +60,7 @@ const transport = new StdioClientTransport({
   env: {
     ...process.env,
     MCP_SERVER_MODE: 'true',
-    PLUGIN_DATA: temporaryData,
+    RUNBEACON_DATA_DIR: temporaryData,
     RUNBEACON_INLINE_MANAGER: 'true',
     GIT_CONFIG_COUNT: '2',
     GIT_CONFIG_KEY_0: 'credential.helper',

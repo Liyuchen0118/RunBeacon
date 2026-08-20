@@ -58,13 +58,19 @@ import { PolicyUpdate } from '../lifecycle/PolicyEngine.js';
 import { EventSubscriptionKind } from '../lifecycle/EventSubscriptionStore.js';
 import {
   resolveRunBeaconDataDir,
+  runBeaconCredentialMigrationSources,
   runBeaconBoolean,
   runBeaconEnv,
 } from '../lifecycle/Environment.js';
+import { migrateRunBeaconCredentialProfiles } from '../lifecycle/CredentialProfileMigration.js';
 
 process.env.MCP_SERVER_MODE = 'true';
 
 const pluginData = resolveRunBeaconDataDir();
+migrateRunBeaconCredentialProfiles(
+  pluginData,
+  runBeaconCredentialMigrationSources()
+);
 const githubPublishRunner = fileURLToPath(
   new URL('../daemon/github-publish-runner.js', import.meta.url)
 );

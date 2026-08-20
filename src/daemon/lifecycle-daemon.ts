@@ -17,15 +17,26 @@ import {
   DAEMON_PROTOCOL_VERSION,
   RUNBEACON_VERSION,
 } from '../lifecycle/protocol.js';
-import { runBeaconBoolean, runBeaconEnv } from '../lifecycle/Environment.js';
+import {
+  runBeaconBoolean,
+  runBeaconCredentialMigrationSources,
+  runBeaconEnv,
+} from '../lifecycle/Environment.js';
+import { migrateRunBeaconCredentialProfiles } from '../lifecycle/CredentialProfileMigration.js';
 
 process.env.MCP_SERVER_MODE = 'true';
 
 const dataDirIndex = process.argv.indexOf('--data-dir');
 const dataDir =
-  dataDirIndex >= 0 ? process.argv[dataDirIndex + 1] : process.env.PLUGIN_DATA;
+  dataDirIndex >= 0
+    ? process.argv[dataDirIndex + 1]
+    : process.env.RUNBEACON_DATA_DIR;
 if (!dataDir) throw new Error('--data-dir is required');
 
+migrateRunBeaconCredentialProfiles(
+  dataDir,
+  runBeaconCredentialMigrationSources()
+);
 const paths = getDaemonPaths(dataDir);
 const token = ensureDaemonToken(paths);
 const buildId = createHash('sha256')

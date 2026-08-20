@@ -1,6 +1,5 @@
-import { existsSync, renameSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 const warned = new Set<string>();
 
@@ -24,20 +23,30 @@ export function runBeaconBoolean(name: string, legacyName?: string): boolean {
   return runBeaconEnv(name, legacyName)?.toLowerCase() === 'true';
 }
 
-export function resolveRunBeaconDataDir(): string {
-  const configured =
-    runBeaconEnv('RUNBEACON_DATA_DIR') ||
-    process.env.PLUGIN_DATA ||
-    process.env.CLAUDE_PLUGIN_DATA;
-  if (configured) return configured;
-  const current = join(homedir(), '.runbeacon');
-  const legacy = join(homedir(), '.remote-job-monitor');
-  if (!existsSync(current) && existsSync(legacy)) {
-    try {
-      renameSync(legacy, current);
-    } catch {
-      return legacy;
-    }
-  }
-  return current;
+export function resolveRunBeaconDataDir(
+  environment: NodeJS.ProcessEnv = process.env,
+  home: string = homedir()
+): string {
+  const configured = environment.RUNBEACON_DATA_DIR?.trim();
+  return resolve(configured || join(home, '.runbeacon'));
+}
+
+export function runBeaconCredentialMigrationSources(
+  environment: NodeJS.ProcessEnv = process.env,
+  home: string = homedir()
+): string[] {
+  if (environment.RUNBEACON_DATA_DIR?.trim()) return [];
+  const canonical = resolveRunBeaconDataDir(environment, home);
+  return Array.from(
+    new Set(
+      [
+        environment.PLUGIN_DATA?.trim(),
+        environment.CLAUDE_PLUGIN_DATA?.trim(),
+        join(home, '.remote-job-monitor'),
+      ]
+        .filter((value): value is string => Boolean(value))
+        .map((value) => resolve(value))
+        .filter((value) => value !== canonical)
+    )
+  );
 }

@@ -119,7 +119,7 @@ The MCP equivalent is `runner_manage(action="migrate-host-key", credentialProfil
 
 ## Configuration migration
 
-Use `RUNBEACON_*` variables. 3.x accepts corresponding `RJM_*` aliases with a deprecation warning; aliases are removed in 4.0. The default data directory migrates atomically from `~/.remote-job-monitor` to `~/.runbeacon` when possible.
+Use `RUNBEACON_*` variables. 3.x accepts corresponding `RJM_*` aliases with a deprecation warning; aliases are removed in 4.0. Runtime state defaults to the stable `~/.runbeacon` directory. `PLUGIN_DATA`, `CLAUDE_PLUGIN_DATA`, and `~/.remote-job-monitor` are one-time credential-profile migration sources and never override the canonical directory. Set `RUNBEACON_DATA_DIR` explicitly for an isolated deployment or test; an explicit override does not import home or plugin-host state.
 
 See [Migration to 3.0](docs/MIGRATION_3.0.md) and [Security migration 2.0](docs/SECURITY_MIGRATION_2.0.md).
 

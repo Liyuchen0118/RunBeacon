@@ -91,6 +91,6 @@ Beta publishes the 3.0.0 npm versions under the `beta` dist-tag and signs the fi
 
 ## Configuration migration
 
-Use `RUNBEACON_*` environment variables. The 3.x coordinator accepts matching `RJM_*` aliases with a variable-name-only warning; 4.0 removes them. The default data directory atomically migrates from `~/.remote-job-monitor` to `~/.runbeacon` when possible.
+Use `RUNBEACON_*` environment variables. The 3.x coordinator accepts matching `RJM_*` aliases with a variable-name-only warning; 4.0 removes them. Runtime state defaults to `~/.runbeacon`. Plugin-host and `~/.remote-job-monitor` credential documents are locked, merged into that canonical store with canonical-wins conflict handling, and retired only after an atomic owner-only write. `RUNBEACON_DATA_DIR` creates an explicit isolated store and disables automatic imports.
 
 See [MIGRATION_3.0.md](MIGRATION_3.0.md) for package, state, host-key algorithm, Runner, and rollback details.
