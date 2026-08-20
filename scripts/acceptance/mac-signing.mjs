@@ -83,6 +83,13 @@ try {
     'echo RUNBEACON_TIMESTAMPED_OK',
     'xcrun notarytool history --keychain-profile "$RUNBEACON_NOTARY_PROFILE" >/dev/null',
     'echo RUNBEACON_NOTARY_OK',
+    'cp "$RUNBEACON_ACCEPTANCE_RUNNER_BINARY" "$rb_tmp/runbeacon-runner"',
+    'codesign --force --options runtime --timestamp --sign "$RUNBEACON_APPLE_SIGNING_IDENTITY" "$rb_tmp/runbeacon-runner"',
+    'codesign --verify --strict --verbose=2 "$rb_tmp/runbeacon-runner"',
+    'ditto -c -k --keepParent "$rb_tmp/runbeacon-runner" "$rb_tmp/runbeacon-runner-notary.zip"',
+    'xcrun notarytool submit "$rb_tmp/runbeacon-runner-notary.zip" --keychain-profile "$RUNBEACON_NOTARY_PROFILE" --wait --output-format json >"$rb_tmp/notary-result.json"',
+    'test "$(plutil -extract status raw -o - "$rb_tmp/notary-result.json")" = Accepted',
+    'echo RUNBEACON_NOTARY_ACCEPTED',
   ].join('\n');
   const jobId = randomUUID();
   const submitted = rpc('submit', {
@@ -93,8 +100,9 @@ try {
     env: {
       RUNBEACON_APPLE_SIGNING_IDENTITY: identity,
       RUNBEACON_NOTARY_PROFILE: notaryProfile,
+      RUNBEACON_ACCEPTANCE_RUNNER_BINARY: installed,
     },
-    timeoutMillis: 10 * 60 * 1_000,
+    timeoutMillis: 20 * 60 * 1_000,
     cancellationMode: 'process_group',
     outputPolicy: {
       mode: 'full',
@@ -134,6 +142,7 @@ try {
       developerIdUntimestamped: text.includes('RUNBEACON_UNTIMESTAMPED_OK'),
       developerIdTimestamped: text.includes('RUNBEACON_TIMESTAMPED_OK'),
       notaryProfile: text.includes('RUNBEACON_NOTARY_OK'),
+      temporaryNotaryAccepted: text.includes('RUNBEACON_NOTARY_ACCEPTED'),
       keychainSecretStayedLocal:
         !/unlock-keychain|keychain-password|\.p8/i.test(command),
     },
