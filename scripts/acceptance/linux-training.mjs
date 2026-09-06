@@ -20,6 +20,8 @@ const temporary = fs.mkdtempSync(
 );
 const buildBinary = path.join(temporary, 'runbeacon-runner');
 const binary = path.join(os.homedir(), '.local', 'bin', 'runbeacon-runner');
+const runtimeDir = resolveRuntimeDir();
+const socket = path.join(runtimeDir, 'runbeacon', 'runner.sock');
 const marker = path.join(temporary, 'execution-count');
 const output =
   process.env.RUNBEACON_ACCEPTANCE_OUTPUT ||
@@ -54,9 +56,25 @@ function run(command, args, options = {}) {
   return result;
 }
 
+function resolveRuntimeDir() {
+  const result = spawnSync('systemctl', ['--user', 'show-environment'], {
+    encoding: 'utf8',
+    maxBuffer: 1 * 1024 * 1024,
+  });
+  if (result.status === 0) {
+    const value = result.stdout
+      .split(/\r?\n/)
+      .find((line) => line.startsWith('XDG_RUNTIME_DIR='))
+      ?.slice('XDG_RUNTIME_DIR='.length)
+      .trim();
+    if (value) return value;
+  }
+  return process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`;
+}
+
 function rpc(method, params = {}) {
   const request = JSON.stringify({ protocolVersion: 1, method, params });
-  const result = run(binary, ['rpc'], {
+  const result = run(binary, ['rpc', '--socket', socket], {
     input: `${request}\n`,
   });
   const response = JSON.parse(result.stdout);
@@ -66,6 +84,33 @@ function rpc(method, params = {}) {
     `${method}: ${JSON.stringify(response.error)}`
   );
   return response.result;
+}
+
+function tryRpc(method, params = {}) {
+  const result = spawnSync(binary, ['rpc', '--socket', socket], {
+    cwd: root,
+    encoding: 'utf8',
+    input: `${JSON.stringify({ protocolVersion: 1, method, params })}\n`,
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 1_000,
+  });
+  if (result.status !== 0) return undefined;
+  try {
+    const response = JSON.parse(result.stdout);
+    return response.ok ? response.result : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function waitForReady(timeoutMillis = 10_000) {
+  const deadline = Date.now() + timeoutMillis;
+  while (Date.now() < deadline) {
+    const ping = tryRpc('ping');
+    if (ping?.protocolVersion === 1 && ping.version === '3.0.0') return ping;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Runner RPC did not become ready at ${socket}`);
 }
 
 function systemctl(...args) {
@@ -114,7 +159,7 @@ try {
     'process',
     'systemd must leave independent supervisors alive when the Runner restarts'
   );
-  const ping = rpc('ping');
+  const ping = await waitForReady();
   assert.equal(ping.protocolVersion, 1);
   assert.equal(ping.version, '3.0.0');
   const stepSeconds = Math.ceil(disconnectMs / 10_000) + 1;
@@ -163,6 +208,7 @@ try {
   await new Promise((resolve) => setTimeout(resolve, disconnectMs));
   systemctl('start', 'runbeacon-runner.service');
   systemctl('is-active', '--quiet', 'runbeacon-runner.service');
+  await waitForReady();
   runnerServiceStopped = false;
   const duplicate = rpc('submit', params);
   assert.equal(duplicate.created, false);

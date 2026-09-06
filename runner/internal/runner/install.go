@@ -107,7 +107,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%s serve
+ExecStart=%s serve --socket %%t/runbeacon/runner.sock
 Restart=on-failure
 RestartSec=2
 KillMode=process
