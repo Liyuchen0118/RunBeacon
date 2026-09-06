@@ -112,7 +112,6 @@ async function waitForReady(timeoutMillis = 10_000) {
   }
   throw new Error(`Runner RPC did not become ready at ${socket}`);
 }
-
 function systemctl(...args) {
   return run('systemctl', ['--user', ...args]);
 }
