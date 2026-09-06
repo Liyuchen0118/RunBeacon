@@ -291,7 +291,7 @@ function acquireMigrationLock(path: string): () => void {
         }
       };
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (!isMigrationLockContention(error)) throw error;
       if (retireStaleLock(path)) continue;
       if (Date.now() >= deadline) {
         throw new Error('RunBeacon credential migration lock is busy');
@@ -299,6 +299,17 @@ function acquireMigrationLock(path: string): () => void {
       sleepSync(25);
     }
   }
+}
+
+function isMigrationLockContention(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === 'EEXIST') return true;
+
+  // Windows can report EPERM instead of EEXIST when another process still
+  // holds an O_EXCL-created file open, and even existsSync can be denied while
+  // that handle is active. Treat it as contention, but still fail closed when
+  // the bounded lock deadline expires.
+  return process.platform === 'win32' && code === 'EPERM';
 }
 
 function retireStaleLock(path: string): boolean {
