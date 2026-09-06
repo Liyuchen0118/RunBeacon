@@ -60,12 +60,40 @@ function rpc(method, params = {}) {
   return response.result;
 }
 
+function tryRpc(method, params = {}) {
+  const result = spawnSync(installed, ['rpc'], {
+    cwd: root,
+    encoding: 'utf8',
+    input: `${JSON.stringify({ protocolVersion: 1, method, params })}\n`,
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 1_000,
+  });
+  if (result.status !== 0) return undefined;
+  try {
+    const response = JSON.parse(result.stdout);
+    return response.ok ? response.result : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function waitForReady(timeoutMillis = 10_000) {
+  const deadline = Date.now() + timeoutMillis;
+  while (Date.now() < deadline) {
+    const ping = tryRpc('ping');
+    if (ping?.protocolVersion === 1 && ping.version === '3.0.0') return ping;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error('Runner LaunchAgent RPC did not become ready');
+}
+
 try {
   run('go', ['build', '-trimpath', '-o', build, './cmd/runbeacon-runner'], {
     cwd: path.join(root, 'runner'),
   });
   run(build, ['install']);
   run('launchctl', ['print', `gui/${process.getuid()}`]);
+  await waitForReady();
   const command = [
     'set -eu',
     'rb_tmp=$(mktemp -d "${TMPDIR:-/tmp}/runbeacon-signing-acceptance.XXXXXX")',
