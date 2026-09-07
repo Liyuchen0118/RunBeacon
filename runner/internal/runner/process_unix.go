@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
@@ -114,3 +115,11 @@ func processExists(pid int) bool {
 }
 
 func currentUserUID() int { return os.Getuid() }
+
+// ProtectSupervisorSignals keeps a durable supervisor alive when systemd
+// stops/restarts the Runner service. The child shell resets these dispositions
+// before executing the user's command so cancellation and timeout signals
+// retain their normal semantics for the process group.
+func ProtectSupervisorSignals() {
+	signal.Ignore(syscall.SIGHUP, syscall.SIGTERM)
+}

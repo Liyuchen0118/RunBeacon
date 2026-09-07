@@ -28,3 +28,5 @@ func processGroupTerminationVerified(int, time.Duration) bool { return false }
 func processExists(int) bool { return false }
 
 func currentUserUID() int { return -1 }
+
+func ProtectSupervisorSignals() {}
