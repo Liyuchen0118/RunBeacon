@@ -75,7 +75,10 @@ func Supervise(jobDir string, spec SupervisorSpec) error {
 	if err := command.Start(); err != nil {
 		return finishSupervisor(jobDir, &job, StateFailed, nil, err.Error(), false)
 	}
-	if _, err := io.WriteString(stdin, spec.Command+"\n"); err != nil {
+	// The supervisor ignores service-stop signals, but the child command must
+	// still receive normal TERM/HUP signals for cancellation and timeout.
+	commandText := "trap - TERM HUP\n" + spec.Command
+	if _, err := io.WriteString(stdin, commandText+"\n"); err != nil {
 		stdin.Close()
 		_ = killProcessGroup(command.Process.Pid)
 		return finishSupervisor(jobDir, &job, StateFailed, nil, err.Error(), false)

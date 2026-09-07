@@ -112,6 +112,7 @@ func supervise(args []string) error {
 	if *jobDir == "" {
 		return errors.New("--job-dir is required")
 	}
+	runner.ProtectSupervisorSignals()
 	var spec runner.SupervisorSpec
 	decoder := json.NewDecoder(io.LimitReader(os.Stdin, runner.MaxRPCBytes))
 	if err := decoder.Decode(&spec); err != nil {
